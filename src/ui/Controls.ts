@@ -3,6 +3,7 @@
 
 import GUI from 'lil-gui';
 import { waterUniforms } from '../sim/passes/water';
+import { erosionUniforms } from '../sim/passes/erosion';
 import type { BrushMode } from '../tools/BrushTool';
 
 export interface BrushSettings {
@@ -18,11 +19,17 @@ export interface WaterSettings {
   rainRate: number;
 }
 
+export interface ErosionSettings {
+  enabled: boolean;
+}
+
 export interface ControlHandles {
   brush: BrushSettings;
   water: WaterSettings;
+  erosion: ErosionSettings;
   onRainChange: () => void;
   onClearWater: () => void;
+  onErosionChange: () => void;
 }
 
 export class Controls {
@@ -43,6 +50,13 @@ export class Controls {
     water.add(waterUniforms.pipeArea, 'value', 0.2, 6, 0.1).name('flow speed');
     water.add(waterUniforms.gravity, 'value', 1, 20, 0.5).name('gravity');
     water.add({ clear: h.onClearWater }, 'clear').name('clear water');
+
+    const ero = this.gui.addFolder('Erosion');
+    ero.add(h.erosion, 'enabled').name('enabled').onChange(h.onErosionChange);
+    ero.add(erosionUniforms.sedimentCapacity, 'value', 0, 2, 0.05).name('capacity (Kc)');
+    ero.add(erosionUniforms.dissolve, 'value', 0, 1, 0.02).name('dissolve (Ks)');
+    ero.add(erosionUniforms.deposit, 'value', 0, 1, 0.02).name('deposit (Kd)');
+    ero.close();
   }
 
   dispose(): void {

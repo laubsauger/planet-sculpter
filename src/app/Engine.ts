@@ -16,13 +16,18 @@ import { PlanetMesh, makeFlatSolidMaterial } from '../planet/PlanetMesh';
 import { buildHeightTexture } from '../planet/heightField';
 import { makeTerrainMaterial } from '../materials/terrainMaterial';
 import { HeightFields, buildSeedCompute } from '../sim/fields';
-import { buildSeamTable } from '../planet/seamTable';
+import { buildSeamTable, type SeamTable } from '../planet/seamTable';
 import { SeamSync } from '../sim/passes/seamCopy';
 import { Simulation } from '../sim/Simulation';
 import { makeWaterMaterial } from '../materials/waterMaterial';
 import { BrushTool } from '../tools/BrushTool';
 import { pickPlanet } from '../tools/picking';
-import { Controls, type BrushSettings, type WaterSettings } from '../ui/Controls';
+import {
+  Controls,
+  type BrushSettings,
+  type WaterSettings,
+  type ErosionSettings,
+} from '../ui/Controls';
 import { Sidebar } from '../ui/Sidebar';
 import { PLANET, SIM, RENDER, FACES } from '../config';
 
@@ -42,6 +47,7 @@ export class Engine {
   heightFields!: HeightFields;
   brush!: BrushTool;
   seamSync!: SeamSync;
+  seamTable!: SeamTable;
   simulation!: Simulation;
   private waterPlanet!: PlanetMesh;
 
@@ -60,6 +66,7 @@ export class Engine {
     target: 0.35,
   };
   readonly waterSettings: WaterSettings = { rainOn: false, rainRate: SIM.rainRate };
+  readonly erosionSettings: ErosionSettings = { enabled: false };
   private controls!: Controls;
   private sidebar!: Sidebar;
 
@@ -111,6 +118,7 @@ export class Engine {
     // terrain material samples the front storage texture, brush stamps it.
     this.heightFields = new HeightFields(PLANET.res);
     this.brush = new BrushTool(this.heightFields.n);
+    this.seamTable = buildSeamTable(PLANET.res);
 
     for (const face of FACES) {
       const seed = buildHeightTexture(face, PLANET.res); // CPU DataTexture
@@ -119,16 +127,15 @@ export class Engine {
       this.renderer.compute(buildSeedCompute(seed.texture, field.main, this.heightFields.n));
       this.brush.register(face, field);
 
-      // fixed binding (canonical main; never rebinds).
-      this.planet.setFaceMaterial(face, makeTerrainMaterial(field.main).material);
+      // fixed binding (canonical main; never rebinds). Seam-aware normals.
+      this.planet.setFaceMaterial(
+        face,
+        makeTerrainMaterial(face, this.heightFields, this.seamTable).material,
+      );
     }
 
     // M3: seam sync across face edges (V5).
-    this.seamSync = new SeamSync(
-      this.heightFields,
-      buildSeamTable(PLANET.res),
-      this.heightFields.n,
-    );
+    this.seamSync = new SeamSync(this.heightFields, this.seamTable, this.heightFields.n);
     this.seamSync.sync(this.renderer); // initial pass
     this.brush.warmup(this.renderer); // V8: compile pipelines up front
 
@@ -139,7 +146,7 @@ export class Engine {
     for (const face of FACES) {
       this.waterPlanet.setFaceMaterial(
         face,
-        makeWaterMaterial(this.heightFields.field(face).main, this.simulation.depthField(face).main),
+        makeWaterMaterial(face, this.heightFields, this.simulation.water, this.seamTable),
       );
     }
     this.scene.add(this.waterPlanet.group);
@@ -148,8 +155,10 @@ export class Engine {
     this.controls = new Controls({
       brush: this.brushSettings,
       water: this.waterSettings,
+      erosion: this.erosionSettings,
       onRainChange: () => this.applyRain(),
       onClearWater: () => this.simulation.clearWater(),
+      onErosionChange: () => this.simulation.setErosion(this.erosionSettings.enabled),
     });
     this.sidebar = new Sidebar({
       brush: this.brushSettings,

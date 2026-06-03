@@ -16,8 +16,10 @@ export interface EdgeSeam {
   nFace: FaceName;
   /** neighbor fixed coordinate is X (true) or Y (false). */
   nFixedIsX: boolean;
-  /** value of the neighbor fixed coordinate (0 or res). */
+  /** value of the neighbor fixed coordinate (0 or res) = the shared edge. */
   nFixedVal: number;
+  /** neighbor fixed coord ONE cell inward (1 or res-1) = the cell beyond our edge. */
+  nInwardVal: number;
   /** neighbor varying coordinate = reverse ? res - i : i. */
   varyReverse: boolean;
 }
@@ -95,7 +97,10 @@ function buildEdge(face: FaceName, edge: EdgeId, res: number): EdgeSeam {
   const slope = (vary2 - vary1) / (i2 - i1);
   const varyReverse = slope < 0;
 
-  return { face, edge, nFace: p1.nFace, nFixedIsX, nFixedVal, varyReverse };
+  // one cell inward from the shared edge (0 -> 1, res -> res-1).
+  const nInwardVal = nFixedVal === 0 ? 1 : nFixedVal - 1;
+
+  return { face, edge, nFace: p1.nFace, nFixedIsX, nFixedVal, nInwardVal, varyReverse };
 }
 
 /** Neighbor texel for face-edge boundary vertex at varying index i. */
