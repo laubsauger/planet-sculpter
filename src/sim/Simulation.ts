@@ -5,7 +5,7 @@
 
 import type { WebGPURenderer } from 'three/webgpu';
 import { FACES, type FaceName } from '../config';
-import { type HeightFields, FieldSet, buildCopyCompute } from './fields';
+import { type HeightFields, FieldSet, buildCopyCompute, buildFillZero } from './fields';
 import { buildAddWater, buildFlux, buildDepth, waterUniforms } from './passes/water';
 import { SeamSync } from './passes/seamCopy';
 import { buildSeamTable } from '../planet/seamTable';
@@ -60,6 +60,18 @@ export class Simulation implements SimHooks {
 
   setRain(rate: number): void {
     waterUniforms.rain.value = rate;
+  }
+
+  /** Reset all water depth + flux to zero. */
+  clearWater(): void {
+    for (const face of FACES) {
+      const d = this.water.field(face);
+      const f = this.flux.field(face);
+      this.renderer.compute(buildFillZero(d.main, d.n));
+      this.renderer.compute(buildFillZero(d.scratch, d.n));
+      this.renderer.compute(buildFillZero(f.main, f.n));
+      this.renderer.compute(buildFillZero(f.scratch, f.n));
+    }
   }
 
   tick(dt: number): void {

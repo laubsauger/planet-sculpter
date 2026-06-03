@@ -97,6 +97,17 @@ export class HeightFields {
   }
 }
 
+/** Fill a storage texture with zero. */
+export function buildFillZero(dst: StorageTexture, n: number) {
+  const N = uint(n);
+  const fn = Fn(() => {
+    const x = instanceIndex.mod(N);
+    const y = instanceIndex.div(N);
+    textureStore(dst, uvec2(x, y), vec4(0, 0, 0, 1)).toWriteOnly();
+  });
+  return fn().compute(n * n);
+}
+
 /** Generic copy compute: src -> dst (full texture). */
 export function buildCopyCompute(src: StorageTexture, dst: StorageTexture, n: number) {
   const N = uint(n);

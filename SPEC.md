@@ -40,6 +40,7 @@ V13: pure math testable w/o GPU: `warp` dir↔(face,u,v) round-trip, `seamTable`
 V14: `material.normalNode` ! view-space (use `normalFlat`|`normalView`). ⊥ world-space normal → lighting swims w/ camera. world normal OK only for scalar slope via `abs(dot(..))`.
 V15: face geom triangle winding ! CCW-from-outside (normal = u×v = +forward). inverted → near faces back-face-culled → see-through planet.
 V16: input-driven GPU work ! bounded/frame. brush coalesced to ≤1 stamp/frame (⊥ per pointermove), cull faces by dot(forward,centerDir)>0.37, seam-sync on pointerup not per-move. else compute queue backlog → fps decays over stroke.
+V17: evap ! subtractive (`d-=ke*dt`, ke>rain) ⊥ multiplicative. uniform rain + mult evap → uniform depth everywhere (water planet). subtractive → flat ground dries, water only in net-inflow basins.
 
 ## §T TASKS
 id|status|task|cites
@@ -60,7 +61,7 @@ T14|.|M5 `sim/passes/{erosion,sedimentAdvect,evaporation}.ts` + tune K|V4,V7
 T15|.|M6 `sim/passes/thermal.ts` slump past talus|V2,V7
 T16|.|M7 `src/tools/{Emitters,climate}.ts` springs/volcano + sea-level/climate uniforms|I.ui
 T17|.|M8 `sim/passes/lava.ts` + `materials/lavaMaterial.ts` flow+cool+glow|V7,V12
-T18|.|M9 polish: water waves, biome bands, debug field view, perf lock 60fps, UI|V10,I.ui
+T18|~|M9 polish. UI DONE EARLY: `ui/Controls.ts` (lil-gui: brush+water params, evap/flow/gravity/rain-intensity, clear-water) + `ui/Sidebar.ts` (glass panel: tool buttons, size/strength sliders, sculpt+rain toggles). REMAIN: water waves, biome bands, debug field view, perf lock 60fps|V10,I.ui
 T19|.|fps counter + per-milestone visual verify|V10
 
 ## §B BUGS
@@ -68,3 +69,4 @@ id|date|cause|fix
 B1|2026-06-03|terrain `normalNode` = world-space cross(dFdx(positionWorld)..) → lighting swam w/ camera, planet looked morphing|V14 ∴ use view-space `normalFlat`; slope via `abs(dot)`
 B2|2026-06-03|face index winding `a,c,b`/`b,c,d` = CW-from-outside → near faces culled → saw through front to far hemisphere (worse on vertical orbit)|V15 ∴ winding `a,b,d`/`a,d,c`
 B3|2026-06-03|brush stamped all 6 faces + full seamSync per pointermove → 24 computes/event, queue backlog, fps decayed over long stroke|V16 ∴ coalesce 1/frame + face-cull + seam-sync on pointerup
+B4|2026-06-03|multiplicative evap `d*=(1-ke*dt)` + uniform rain → uniform equilibrium d=rain/ke everywhere → water planet|V17 ∴ subtractive evap `d-=ke*dt`, ke>rain → flat dries, basins keep water

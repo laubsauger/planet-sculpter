@@ -28,7 +28,10 @@ type ComputeNode = Parameters<WebGPURenderer['compute']>[0];
 /** Shared, tunable sim constants (mutated from UI later). */
 export const waterUniforms = {
   rain: uniform(0),
-  evaporation: uniform(0.04),
+  // SUBTRACTIVE evaporation (units/sec). Low default so rain accumulates and
+  // (later) river sources persist; tune live via the UI. Multiplicative evap
+  // would settle the whole sphere at a uniform depth (water planet).
+  evaporation: uniform(0.0012),
   gravity: uniform(9.81),
   pipeArea: uniform(2), // faster drainage -> water reaches depressions before sheeting
   pipeLength: uniform(1),
@@ -138,7 +141,7 @@ export function buildDepth(
 
     const l2 = waterUniforms.pipeLength.mul(waterUniforms.pipeLength);
     let next = dc.add(waterUniforms.dt.mul(inflow.sub(outflow)).div(l2));
-    next = next.mul(float(1).sub(waterUniforms.evaporation.mul(waterUniforms.dt)));
+    next = next.sub(waterUniforms.evaporation.mul(waterUniforms.dt)); // subtractive
     next = max(next, float(0));
 
     textureStore(dOut, uvec2(x, y), vec4(next, 0, 0, 1)).toWriteOnly();

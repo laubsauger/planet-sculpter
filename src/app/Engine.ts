@@ -20,8 +20,10 @@ import { buildSeamTable } from '../planet/seamTable';
 import { SeamSync } from '../sim/passes/seamCopy';
 import { Simulation } from '../sim/Simulation';
 import { makeWaterMaterial } from '../materials/waterMaterial';
-import { BrushTool, type BrushMode } from '../tools/BrushTool';
+import { BrushTool } from '../tools/BrushTool';
 import { pickPlanet } from '../tools/picking';
+import { Controls, type BrushSettings, type WaterSettings } from '../ui/Controls';
+import { Sidebar } from '../ui/Sidebar';
 import { PLANET, SIM, RENDER, FACES } from '../config';
 
 export interface SimHooks {
@@ -47,9 +49,19 @@ export class Engine {
   private sculptMode = false;
   private brushing = false;
   private brushDirty = false; // a stamp is pending for this frame
-  private brushMode: BrushMode = 'raise';
-  private rainOn = false;
   private readonly ndc = new Vector2();
+
+  // Live-tunable settings (driven by the lil-gui panel + hotkeys).
+  readonly brushSettings: BrushSettings = {
+    mode: 'raise',
+    radius: 0.13,
+    strength: 0.02,
+    rate: 0.4,
+    target: 0.35,
+  };
+  readonly waterSettings: WaterSettings = { rainOn: false, rainRate: SIM.rainRate };
+  private controls!: Controls;
+  private sidebar!: Sidebar;
 
   private sim: SimHooks | null = null;
   private simAccumulator = 0;
@@ -133,6 +145,23 @@ export class Engine {
     this.scene.add(this.waterPlanet.group);
     this.setSim(this.simulation);
 
+    this.controls = new Controls({
+      brush: this.brushSettings,
+      water: this.waterSettings,
+      onRainChange: () => this.applyRain(),
+      onClearWater: () => this.simulation.clearWater(),
+    });
+    this.sidebar = new Sidebar({
+      brush: this.brushSettings,
+      isSculpt: () => this.sculptMode,
+      setSculpt: (on) => this.setSculpt(on),
+      isRain: () => this.waterSettings.rainOn,
+      toggleRain: () => {
+        this.waterSettings.rainOn = !this.waterSettings.rainOn;
+        this.applyRain();
+        this.controls.gui.controllersRecursive().forEach((c) => c.updateDisplay());
+      },
+    });
     this.installInput();
   }
 
@@ -158,13 +187,17 @@ export class Engine {
   private applyBrush(): void {
     const pick = pickPlanet(this.ndc, this.camera, this.planet.group, PLANET.res);
     if (!pick) return;
-    this.brush.stamp(this.renderer, pick.dir, {
-      mode: this.brushMode,
-      radius: 0.13, // chord on unit sphere
-      strength: 0.02,
-      rate: 0.4,
-      target: 0.35,
-    });
+    this.brush.stamp(this.renderer, pick.dir, this.brushSettings);
+  }
+
+  private applyRain(): void {
+    this.simulation.setRain(this.waterSettings.rainOn ? this.waterSettings.rainRate : 0);
+  }
+
+  private setSculpt(on: boolean): void {
+    this.sculptMode = on;
+    this.orbit.controls.enableRotate = !on;
+    this.sidebar?.sync();
   }
 
   private onPointerDown = (e: PointerEvent): void => {
@@ -190,16 +223,17 @@ export class Engine {
   private onKeyDown = (e: KeyboardEvent): void => {
     switch (e.key) {
       case 'g':
-        this.sculptMode = !this.sculptMode;
-        this.orbit.controls.enableRotate = !this.sculptMode;
+        this.setSculpt(!this.sculptMode);
         break;
-      case '1': this.brushMode = 'raise'; break;
-      case '2': this.brushMode = 'lower'; break;
-      case '3': this.brushMode = 'smooth'; break;
-      case '4': this.brushMode = 'flatten'; break;
+      case '1': this.brushSettings.mode = 'raise'; this.sidebar.sync(); break;
+      case '2': this.brushSettings.mode = 'lower'; this.sidebar.sync(); break;
+      case '3': this.brushSettings.mode = 'smooth'; this.sidebar.sync(); break;
+      case '4': this.brushSettings.mode = 'flatten'; this.sidebar.sync(); break;
       case 'r':
-        this.rainOn = !this.rainOn;
-        this.simulation.setRain(this.rainOn ? SIM.rainRate : 0);
+        this.waterSettings.rainOn = !this.waterSettings.rainOn;
+        this.applyRain();
+        this.sidebar.sync();
+        this.controls.gui.controllersRecursive().forEach((c) => c.updateDisplay());
         break;
     }
   };
@@ -247,8 +281,8 @@ export class Engine {
     if (this.hud) {
       this.hud.textContent =
         `fps ${this.fpsEma.toFixed(0)}  ${this.frameMsEma.toFixed(1)}ms\n` +
-        `res ${PLANET.res}  sim ${SIM.ticksPerSecond}/s  rain:${this.rainOn ? 'on' : 'off'} [r]\n` +
-        `[g] ${this.sculptMode ? 'SCULPT' : 'orbit'}  brush:${this.brushMode} [1raise 2lower 3smooth 4flatten]`;
+        `res ${PLANET.res}  sim ${SIM.ticksPerSecond}/s  rain:${this.waterSettings.rainOn ? 'on' : 'off'} [r]\n` +
+        `[g] ${this.sculptMode ? 'SCULPT' : 'orbit'}  brush:${this.brushSettings.mode} [1raise 2lower 3smooth 4flatten]`;
     }
   }
 
