@@ -14,13 +14,15 @@ import { WebGPURenderer } from 'three/webgpu';
 import { OrbitController } from './OrbitController';
 import { PlanetMesh, makeFlatSolidMaterial } from '../planet/PlanetMesh';
 import { buildHeightTexture } from '../planet/heightField';
-import { makeTerrainMaterial, type TerrainMaterial } from '../materials/terrainMaterial';
+import { makeTerrainMaterial } from '../materials/terrainMaterial';
 import { HeightFields, buildSeedCompute } from '../sim/fields';
 import { buildSeamTable } from '../planet/seamTable';
 import { SeamSync } from '../sim/passes/seamCopy';
+import { Simulation } from '../sim/Simulation';
+import { makeWaterMaterial } from '../materials/waterMaterial';
 import { BrushTool, type BrushMode } from '../tools/BrushTool';
 import { pickPlanet } from '../tools/picking';
-import { PLANET, SIM, RENDER, FACES, type FaceName } from '../config';
+import { PLANET, SIM, RENDER, FACES } from '../config';
 
 export interface SimHooks {
   /** One fixed sim tick. No-op until M4. */
@@ -38,12 +40,15 @@ export class Engine {
   heightFields!: HeightFields;
   brush!: BrushTool;
   seamSync!: SeamSync;
-  private readonly terrainMats = new Map<FaceName, TerrainMaterial>();
+  simulation!: Simulation;
+  private waterPlanet!: PlanetMesh;
 
   // Sculpt input state.
   private sculptMode = false;
   private brushing = false;
+  private brushDirty = false; // a stamp is pending for this frame
   private brushMode: BrushMode = 'raise';
+  private rainOn = false;
   private readonly ndc = new Vector2();
 
   private sim: SimHooks | null = null;
@@ -102,9 +107,8 @@ export class Engine {
       this.renderer.compute(buildSeedCompute(seed.texture, field.main, this.heightFields.n));
       this.brush.register(face, field);
 
-      const tm = makeTerrainMaterial(field.main); // fixed binding (canonical)
-      this.terrainMats.set(face, tm);
-      this.planet.setFaceMaterial(face, tm.material);
+      // fixed binding (canonical main; never rebinds).
+      this.planet.setFaceMaterial(face, makeTerrainMaterial(field.main).material);
     }
 
     // M3: seam sync across face edges (V5).
@@ -115,6 +119,20 @@ export class Engine {
     );
     this.seamSync.sync(this.renderer); // initial pass
     this.brush.warmup(this.renderer); // V8: compile pipelines up front
+
+    // M4: hydraulic water sim + water surface meshes.
+    this.simulation = new Simulation(this.renderer, this.heightFields);
+    await this.simulation.warmup();
+    this.waterPlanet = new PlanetMesh(PLANET.res, PLANET.baseRadius, makeFlatSolidMaterial());
+    for (const face of FACES) {
+      this.waterPlanet.setFaceMaterial(
+        face,
+        makeWaterMaterial(this.heightFields.field(face).main, this.simulation.depthField(face).main),
+      );
+    }
+    this.scene.add(this.waterPlanet.group);
+    this.setSim(this.simulation);
+
     this.installInput();
   }
 
@@ -136,6 +154,7 @@ export class Engine {
     this.ndc.set((e.clientX / window.innerWidth) * 2 - 1, -(e.clientY / window.innerHeight) * 2 + 1);
   }
 
+  /** Applied once per frame (coalesced) while dragging — not per pointer event. */
   private applyBrush(): void {
     const pick = pickPlanet(this.ndc, this.camera, this.planet.group, PLANET.res);
     if (!pick) return;
@@ -146,25 +165,26 @@ export class Engine {
       rate: 0.4,
       target: 0.35,
     });
-    // Propagate edited face edges to neighbors so seams stay continuous (V5).
-    this.seamSync.sync(this.renderer);
   }
 
   private onPointerDown = (e: PointerEvent): void => {
     if (!this.sculptMode || e.button !== 0) return;
     this.brushing = true;
     this.setNdc(e);
-    this.applyBrush();
+    this.brushDirty = true;
   };
 
   private onPointerMove = (e: PointerEvent): void => {
     if (!this.brushing) return;
     this.setNdc(e);
-    this.applyBrush();
+    this.brushDirty = true; // coalesced: applied in frame()
   };
 
   private onPointerUp = (): void => {
+    if (!this.brushing) return;
     this.brushing = false;
+    // Seam-sync once at stroke end to clean up any sub-texel edge mismatch.
+    this.seamSync.sync(this.renderer);
   };
 
   private onKeyDown = (e: KeyboardEvent): void => {
@@ -177,6 +197,10 @@ export class Engine {
       case '2': this.brushMode = 'lower'; break;
       case '3': this.brushMode = 'smooth'; break;
       case '4': this.brushMode = 'flatten'; break;
+      case 'r':
+        this.rainOn = !this.rainOn;
+        this.simulation.setRain(this.rainOn ? SIM.rainRate : 0);
+        break;
     }
   };
 
@@ -203,6 +227,13 @@ export class Engine {
       }
     }
 
+    // Coalesced brush: at most one stamp per frame regardless of how many
+    // pointermove events fired -> bounded GPU work, no queue backlog.
+    if (this.brushing && this.brushDirty) {
+      this.applyBrush();
+      this.brushDirty = false;
+    }
+
     this.orbit.update();
     this.renderer.render(this.scene, this.camera);
 
@@ -216,7 +247,7 @@ export class Engine {
     if (this.hud) {
       this.hud.textContent =
         `fps ${this.fpsEma.toFixed(0)}  ${this.frameMsEma.toFixed(1)}ms\n` +
-        `res ${PLANET.res}  sim ${SIM.ticksPerSecond}/s\n` +
+        `res ${PLANET.res}  sim ${SIM.ticksPerSecond}/s  rain:${this.rainOn ? 'on' : 'off'} [r]\n` +
         `[g] ${this.sculptMode ? 'SCULPT' : 'orbit'}  brush:${this.brushMode} [1raise 2lower 3smooth 4flatten]`;
     }
   }

@@ -27,8 +27,14 @@ import {
 import { Vector3 } from 'three';
 import { type FaceField, buildCopyCompute } from '../sim/fields';
 import { faceDirNode } from '../tsl/warpNode';
+import { FACE_BASES } from '../tsl/warp';
 import type { FaceName } from '../config';
 // PickResult no longer needed here — brush is direction-space.
+
+// A face's texels lie within ~54.7deg of its forward axis (cube corner).
+// Stamp a face only if the brush center is within that + a margin -> typically
+// 1-3 faces, not all 6. cos(68deg) ~= 0.37.
+const FACE_CULL_DOT = 0.37;
 
 export type BrushMode = 'raise' | 'lower' | 'smooth' | 'flatten';
 const MODE_CODE: Record<BrushMode, number> = { raise: 0, lower: 0, smooth: 2, flatten: 1 };
@@ -136,7 +142,11 @@ export class BrushTool {
     // lower = negative strength.
     this.uStrength.value = params.mode === 'lower' ? -params.strength : params.strength;
 
-    for (const prog of this.programs.values()) {
+    const c = this.uCenterDir.value;
+    for (const [face, prog] of this.programs) {
+      const fwd = FACE_BASES[face].forward;
+      const dot = fwd[0] * c.x + fwd[1] * c.y + fwd[2] * c.z;
+      if (dot < FACE_CULL_DOT) continue; // brush can't reach this face
       renderer.compute(prog.stamp); // main -> scratch
       renderer.compute(prog.copy); // scratch -> main
     }
