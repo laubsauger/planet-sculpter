@@ -28,9 +28,9 @@ type ComputeNode = Parameters<WebGPURenderer['compute']>[0];
 /** Shared, tunable sim constants (mutated from UI later). */
 export const waterUniforms = {
   rain: uniform(0),
-  evaporation: uniform(0.02),
+  evaporation: uniform(0.04),
   gravity: uniform(9.81),
-  pipeArea: uniform(1),
+  pipeArea: uniform(2), // faster drainage -> water reaches depressions before sheeting
   pipeLength: uniform(1),
   dt: uniform(1 / 60),
 };

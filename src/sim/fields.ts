@@ -58,6 +58,12 @@ export class FaceField {
   }
 }
 
+/** Anything that exposes per-face fields (HeightFields, FieldSet). */
+export interface FieldProvider {
+  readonly n: number;
+  field(face: FaceName): FaceField;
+}
+
 /** A per-face set of one field (scalar or rgba). */
 export class FieldSet {
   readonly fields = new Map<FaceName, FaceField>();

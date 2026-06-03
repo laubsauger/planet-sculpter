@@ -19,7 +19,7 @@ import {
   If,
 } from 'three/tsl';
 import { FACES, type FaceName } from '../../config';
-import type { HeightFields } from '../fields';
+import type { FieldProvider } from '../fields';
 import { buildCopyCompute } from '../fields';
 import { EDGES, type SeamTable, type EdgeId } from '../../planet/seamTable';
 
@@ -27,7 +27,7 @@ type ComputeNode = Parameters<WebGPURenderer['compute']>[0];
 
 function buildSeamProgram(
   face: FaceName,
-  fields: HeightFields,
+  fields: FieldProvider,
   table: SeamTable,
   n: number,
 ): ComputeNode {
@@ -83,7 +83,7 @@ export class SeamSync {
   private readonly seam = new Map<FaceName, ComputeNode>();
   private readonly copy = new Map<FaceName, ComputeNode>();
 
-  constructor(fields: HeightFields, table: SeamTable, n: number) {
+  constructor(fields: FieldProvider, table: SeamTable, n: number) {
     for (const face of FACES) {
       this.seam.set(face, buildSeamProgram(face, fields, table, n));
       const f = fields.field(face);

@@ -18,8 +18,8 @@ import { heightScaleUniform } from './terrainMaterial';
 
 const SHALLOW = vec3(0.30, 0.62, 0.78);
 const DEEP = vec3(0.05, 0.20, 0.42);
-/** below this water depth, fully transparent. */
-const MIN_DEPTH = 0.002;
+/** below this water depth, fully transparent (hides thin sheet film). */
+const MIN_DEPTH = 0.006;
 
 export function makeWaterMaterial(heightTex: Texture, depthTex: Texture): MeshStandardNodeMaterial {
   const b = sampleTex(heightTex, uv()).x;

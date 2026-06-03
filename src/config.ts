@@ -21,8 +21,8 @@ export const SIM = {
   gravity: 9.81,
   pipeArea: 1.0,
   pipeLength: 1.0,
-  rainRate: 0.012,
-  evaporation: 0.015,
+  rainRate: 0.0025,
+  evaporation: 0.04,
   sedimentCapacity: 0.25, // Kc
   dissolve: 0.3, // Ks
   deposit: 0.3, // Kd

@@ -7,6 +7,8 @@ import type { WebGPURenderer } from 'three/webgpu';
 import { FACES, type FaceName } from '../config';
 import { type HeightFields, FieldSet, buildCopyCompute } from './fields';
 import { buildAddWater, buildFlux, buildDepth, waterUniforms } from './passes/water';
+import { SeamSync } from './passes/seamCopy';
+import { buildSeamTable } from '../planet/seamTable';
 import type { SimHooks } from '../app/Engine';
 
 type ComputeNode = Parameters<WebGPURenderer['compute']>[0];
@@ -24,6 +26,8 @@ export class Simulation implements SimHooks {
   readonly water: FieldSet; // depth d
   readonly flux: FieldSet; // rgba L,R,T,B
   private readonly passes = new Map<FaceName, FacePasses>();
+  /** Diffuses water across coincident face-edge cells -> cross-seam flow (V5). */
+  private readonly waterSeam: SeamSync;
 
   constructor(
     private readonly renderer: WebGPURenderer,
@@ -32,6 +36,7 @@ export class Simulation implements SimHooks {
     const n = height.n;
     this.water = new FieldSet(n, false);
     this.flux = new FieldSet(n, true);
+    this.waterSeam = new SeamSync(this.water, buildSeamTable(n - 1), n);
 
     for (const face of FACES) {
       const b = height.field(face).main;
@@ -75,6 +80,8 @@ export class Simulation implements SimHooks {
       r.compute(p.depth);
       r.compute(p.copyD2);
     }
+    // phase 4: diffuse water across face seams (continuity + cross-seam flow).
+    this.waterSeam.sync(r);
   }
 
   async warmup(): Promise<void> {
