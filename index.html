@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Planet Sculptor</title>
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0d12; }
+      #app { width: 100vw; height: 100vh; display: block; }
+      #gate {
+        position: fixed; inset: 0; display: none;
+        align-items: center; justify-content: center;
+        color: #e6e6e6; font: 16px/1.5 system-ui, sans-serif; text-align: center;
+        padding: 2rem;
+      }
+      #hud {
+        position: fixed; top: 8px; left: 8px;
+        color: #9aa4b2; font: 12px/1.4 ui-monospace, monospace;
+        pointer-events: none; white-space: pre;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="app"></canvas>
+    <div id="hud"></div>
+    <div id="gate">
+      <div>
+        <h2>WebGPU required</h2>
+        <p>This experience needs a WebGPU-capable browser (Chrome/Edge 113+, Safari 18+).</p>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

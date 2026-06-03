@@ -1,0 +1,44 @@
+// Global tunables. RES & sim rates adaptive at runtime (see Engine).
+
+export const PLANET = {
+  /** Base sphere radius (world units). Heights stored as offset from this (V6). */
+  baseRadius: 2,
+  /** Per-face grid resolution (verts/texels per edge). Starts low, adaptive up. */
+  res: 256,
+  /** Max vertical displacement of height=1.0 in world units. */
+  heightScale: 0.6,
+} as const;
+
+export const SIM = {
+  /** Fixed sim timestep (s). */
+  dt: 1 / 60,
+  /** Target sim ticks/second (throttled below render; V10). */
+  ticksPerSecond: 30,
+  /** Max sim substeps per frame (anti spiral-of-death; V10). */
+  maxStepsPerFrame: 4,
+
+  // Pipe-model hydraulic constants (Mei et al.). Tuned in M5 (T14).
+  gravity: 9.81,
+  pipeArea: 1.0,
+  pipeLength: 1.0,
+  rainRate: 0.012,
+  evaporation: 0.015,
+  sedimentCapacity: 0.25, // Kc
+  dissolve: 0.3, // Ks
+  deposit: 0.3, // Kd
+  /** Thermal talus angle range (rad) by hardness 0..1. */
+  talusMin: 0.45,
+  talusMax: 0.9,
+} as const;
+
+export const RENDER = {
+  /** Target frames/second (V10). */
+  targetFps: 60,
+  /** Frame-time budget (ms) before adaptive downscale. */
+  frameBudgetMs: 1000 / 60,
+} as const;
+
+/** 6 cube faces, fixed index order. Used everywhere (warp, seams, textures). */
+export const FACES = ['px', 'nx', 'py', 'ny', 'pz', 'nz'] as const;
+export type FaceName = (typeof FACES)[number];
+export const FACE_COUNT = 6;
