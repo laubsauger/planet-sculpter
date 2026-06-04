@@ -38,8 +38,6 @@ export const erosionUniforms = {
   dt: uniform(1 / 60),
 };
 
-const EPS = 1e-6;
-
 function xy(n: number) {
   const N = uint(n);
   const x = instanceIndex.mod(N);
@@ -69,9 +67,10 @@ export function buildVelocity(
     const Bt = textureLoad(f, ivec2(ix, ym)).z; // bottom neighbor's T (into us +y)
     const Tb = textureLoad(f, ivec2(ix, yp)).w; // top neighbor's B (into us -y)
 
-    const dc = max(textureLoad(d, ivec2(ix, iy)).x, float(EPS));
-    const vx = Lr.sub(self.x).add(self.y.sub(Rl)).mul(0.5).div(dc);
-    const vy = Bt.sub(self.w).add(self.z.sub(Tb)).mul(0.5).div(dc);
+    // divide by a MIN depth (not EPS) so thin films don't produce huge speeds.
+    const dc = max(textureLoad(d, ivec2(ix, iy)).x, float(0.02));
+    const vx = Lr.sub(self.x).add(self.y.sub(Rl)).mul(0.5).div(dc).max(float(-3)).min(float(3));
+    const vy = Bt.sub(self.w).add(self.z.sub(Tb)).mul(0.5).div(dc).max(float(-3)).min(float(3));
 
     textureStore(velOut, uvec2(x, y), vec4(vx, vy, 0, 1)).toWriteOnly();
   });
@@ -105,20 +104,23 @@ export function buildErosion(
     // terrain tilt from bedrock gradient.
     const dbx = textureLoad(b, ivec2(xp, iy)).x.sub(textureLoad(b, ivec2(xm, iy)).x).mul(0.5);
     const dby = textureLoad(b, ivec2(ix, yp)).x.sub(textureLoad(b, ivec2(ix, ym)).x).mul(0.5);
-    const tilt = length(vec2(dbx, dby));
-    const sinTilt = max(tilt, u.minSlope.toVar());
-
-    const speed = length(vec2(v.x, v.y));
-    const hasWater = dc.greaterThan(float(EPS)).select(float(1), float(0));
+    // clamp tilt so steep gradients can't make capacity blow up.
+    const tilt = length(vec2(dbx, dby)).min(float(0.5));
+    const sinTilt = max(tilt, u.minSlope);
+    const speed = length(vec2(v.x, v.y)).min(float(3));
+    // only erode/deposit where there is meaningful water.
+    const hasWater = dc.greaterThan(float(0.004)).select(float(1), float(0));
     const capacity = u.sedimentCapacity.mul(sinTilt).mul(speed).mul(hasWater);
 
-    // s < C -> erode bedrock into sediment; s > C -> deposit.
-    const erode = max(float(0), capacity.sub(sc)).mul(u.dissolve);
-    const dep = max(float(0), sc.sub(capacity)).mul(u.deposit);
-    const bNew = bc.sub(erode).add(dep);
-    const sNew = max(float(0), sc.add(erode).sub(dep));
+    // s < C -> erode bedrock into sediment; s > C -> deposit. Cap per-step
+    // change (CAP) so the bedrock can't run away to infinity.
+    const CAP = float(0.004);
+    const erode = max(float(0), capacity.sub(sc)).mul(u.dissolve).min(CAP);
+    const dep = max(float(0), sc.sub(capacity)).mul(u.deposit).min(CAP);
+    const bNew = max(bc.sub(erode).add(dep), float(0));
+    const sNew = max(float(0), sc.add(erode).sub(dep)).min(float(2));
 
-    textureStore(bOut, uvec2(x, y), vec4(max(bNew, float(0)), 0, 0, 1)).toWriteOnly();
+    textureStore(bOut, uvec2(x, y), vec4(bNew, 0, 0, 1)).toWriteOnly();
     textureStore(sOut, uvec2(x, y), vec4(sNew, 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(n * n) as ComputeNode;

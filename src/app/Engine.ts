@@ -15,11 +15,14 @@ import { OrbitController } from './OrbitController';
 import { PlanetMesh, makeFlatSolidMaterial } from '../planet/PlanetMesh';
 import { buildHeightTexture } from '../planet/heightField';
 import { makeTerrainMaterial } from '../materials/terrainMaterial';
-import { HeightFields, buildSeedCompute } from '../sim/fields';
+import { HeightFields, FieldSet, buildSeedCompute } from '../sim/fields';
 import { buildSeamTable, type SeamTable } from '../planet/seamTable';
 import { SeamSync } from '../sim/passes/seamCopy';
+import { NormalBaker } from '../sim/passes/normals';
 import { Simulation } from '../sim/Simulation';
 import { makeWaterMaterial } from '../materials/waterMaterial';
+import { textureLoad } from 'three/tsl';
+import type { SampleFace } from '../tsl/surface';
 import { BrushTool } from '../tools/BrushTool';
 import { pickPlanet } from '../tools/picking';
 import {
@@ -49,6 +52,8 @@ export class Engine {
   seamSync!: SeamSync;
   seamTable!: SeamTable;
   simulation!: Simulation;
+  private terrainNormals!: FieldSet;
+  private terrainBaker!: NormalBaker;
   private waterPlanet!: PlanetMesh;
 
   // Sculpt input state.
@@ -119,6 +124,10 @@ export class Engine {
     this.heightFields = new HeightFields(PLANET.res);
     this.brush = new BrushTool(this.heightFields.n);
     this.seamTable = buildSeamTable(PLANET.res);
+    this.terrainNormals = new FieldSet(this.heightFields.n, true);
+
+    const sampleTerrain: SampleFace = (f, coord) =>
+      textureLoad(this.heightFields.field(f).main, coord).x;
 
     for (const face of FACES) {
       const seed = buildHeightTexture(face, PLANET.res); // CPU DataTexture
@@ -127,16 +136,25 @@ export class Engine {
       this.renderer.compute(buildSeedCompute(seed.texture, field.main, this.heightFields.n));
       this.brush.register(face, field);
 
-      // fixed binding (canonical main; never rebinds). Seam-aware normals.
+      // cheap material: center displacement + sampled baked normal.
       this.planet.setFaceMaterial(
         face,
-        makeTerrainMaterial(face, this.heightFields, this.seamTable).material,
+        makeTerrainMaterial(face, field.main, this.terrainNormals.field(face).main).material,
       );
     }
 
     // M3: seam sync across face edges (V5).
     this.seamSync = new SeamSync(this.heightFields, this.seamTable, this.heightFields.n);
     this.seamSync.sync(this.renderer); // initial pass
+
+    // bake terrain normals from the seeded heights (perf: off the fragment path).
+    this.terrainBaker = new NormalBaker(
+      sampleTerrain,
+      this.seamTable,
+      this.terrainNormals,
+      this.heightFields.n,
+    );
+    this.terrainBaker.bake(this.renderer);
     this.brush.warmup(this.renderer); // V8: compile pipelines up front
 
     // M4: hydraulic water sim + water surface meshes.
@@ -146,7 +164,12 @@ export class Engine {
     for (const face of FACES) {
       this.waterPlanet.setFaceMaterial(
         face,
-        makeWaterMaterial(face, this.heightFields, this.simulation.water, this.seamTable),
+        makeWaterMaterial(
+          face,
+          this.heightFields.field(face).main,
+          this.simulation.water.field(face).main,
+          this.simulation.waterNormals.field(face).main,
+        ),
       );
     }
     this.scene.add(this.waterPlanet.group);
@@ -197,6 +220,7 @@ export class Engine {
     const pick = pickPlanet(this.ndc, this.camera, this.planet.group, PLANET.res);
     if (!pick) return;
     this.brush.stamp(this.renderer, pick.dir, this.brushSettings);
+    this.terrainBaker.bake(this.renderer); // height changed -> rebake normals
   }
 
   private applyRain(): void {
@@ -268,6 +292,8 @@ export class Engine {
       if (this.simAccumulator > this.simInterval * SIM.maxStepsPerFrame) {
         this.simAccumulator = 0; // drop backlog rather than spiral
       }
+      // erosion mutates bedrock -> rebake terrain normals.
+      if (steps > 0 && this.erosionSettings.enabled) this.terrainBaker.bake(this.renderer);
     }
 
     // Coalesced brush: at most one stamp per frame regardless of how many

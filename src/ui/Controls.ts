@@ -46,7 +46,7 @@ export class Controls {
     const water = this.gui.addFolder('Water');
     water.add(h.water, 'rainOn').name('rain').onChange(h.onRainChange);
     water.add(h.water, 'rainRate', 0, 0.02, 0.0005).name('rain intensity').onChange(h.onRainChange);
-    water.add(waterUniforms.evaporation, 'value', 0, 0.01, 0.0001).name('evaporation');
+    water.add(waterUniforms.loss, 'value', 0, 0.01, 0.0001).name('evaporation');
     water.add(waterUniforms.pipeArea, 'value', 0.2, 6, 0.1).name('flow speed');
     water.add(waterUniforms.gravity, 'value', 1, 20, 0.5).name('gravity');
     water.add({ clear: h.onClearWater }, 'clear').name('clear water');

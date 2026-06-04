@@ -6,10 +6,13 @@
 import type { WebGPURenderer } from 'three/webgpu';
 import { FACES, type FaceName } from '../config';
 import { type HeightFields, FieldSet, buildCopyCompute, buildFillZero } from './fields';
-import { buildAddWater, buildFlux, buildDepth, waterUniforms } from './passes/water';
+import { buildAddSource, buildFlux, buildDepth, waterUniforms } from './passes/water';
 import { buildVelocity, buildErosion, buildAdvect, erosionUniforms } from './passes/erosion';
 import { SeamSync } from './passes/seamCopy';
+import { NormalBaker } from './passes/normals';
 import { buildSeamTable, type SeamTable } from '../planet/seamTable';
+import { textureLoad } from 'three/tsl';
+import type { SampleFace } from '../tsl/surface';
 import type { SimHooks } from '../app/Engine';
 
 type ComputeNode = Parameters<WebGPURenderer['compute']>[0];
@@ -36,6 +39,8 @@ export class Simulation implements SimHooks {
   readonly flux: FieldSet; // rgba L,R,T,B
   readonly sediment: FieldSet; // suspended sediment s
   readonly velocity: FieldSet; // rgba (vx,vy)
+  readonly waterNormals: FieldSet; // baked object-space normals of (b+d)
+  private readonly waterBaker: NormalBaker;
   erosionEnabled = false;
   private readonly passes = new Map<FaceName, FacePasses>();
   /** Diffuses fields across coincident face-edge cells -> cross-seam (V5). */
@@ -57,6 +62,11 @@ export class Simulation implements SimHooks {
     this.heightSeam = new SeamSync(this.height, table, n);
     this.sedimentSeam = new SeamSync(this.sediment, table, n);
 
+    this.waterNormals = new FieldSet(n, true);
+    const sampleWater: SampleFace = (f, coord) =>
+      textureLoad(height.field(f).main, coord).x.add(textureLoad(this.water.field(f).main, coord).x);
+    this.waterBaker = new NormalBaker(sampleWater, table, this.waterNormals, n);
+
     for (const face of FACES) {
       const b = height.field(face);
       const d = this.water.field(face);
@@ -64,11 +74,11 @@ export class Simulation implements SimHooks {
       const s = this.sediment.field(face);
       const vel = this.velocity.field(face);
       this.passes.set(face, {
-        addWater: buildAddWater(d.main, d.scratch, n),
+        addWater: buildAddSource(d.main, d.scratch, n, waterUniforms),
         copyD1: buildCopyCompute(d.scratch, d.main, n) as ComputeNode,
-        flux: buildFlux(b.main, d.main, f.main, f.scratch, n),
+        flux: buildFlux(b.main, d.main, f.main, f.scratch, n, waterUniforms),
         copyF: buildCopyCompute(f.scratch, f.main, n) as ComputeNode,
-        depth: buildDepth(d.main, f.main, d.scratch, n),
+        depth: buildDepth(d.main, f.main, d.scratch, n, waterUniforms),
         copyD2: buildCopyCompute(d.scratch, d.main, n) as ComputeNode,
         velocity: buildVelocity(f.main, d.main, vel.scratch, n),
         copyVel: buildCopyCompute(vel.scratch, vel.main, n) as ComputeNode,
@@ -87,7 +97,7 @@ export class Simulation implements SimHooks {
   }
 
   setRain(rate: number): void {
-    waterUniforms.rain.value = rate;
+    waterUniforms.source.value = rate;
   }
 
   /** Reset all water depth + flux to zero. */
@@ -144,6 +154,9 @@ export class Simulation implements SimHooks {
       this.heightSeam.sync(r); // erosion modified bedrock -> keep seams continuous
       this.sedimentSeam.sync(r);
     }
+
+    // phase 6: rebake water-surface normals (water changed this tick).
+    this.waterBaker.bake(r);
   }
 
   setErosion(on: boolean): void {
@@ -160,5 +173,6 @@ export class Simulation implements SimHooks {
       r.compute(p.depth);
       r.compute(p.copyD2);
     }
+    this.waterBaker.bake(r);
   }
 }

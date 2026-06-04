@@ -1,11 +1,10 @@
-// Water surface material (M4). Analytic seam-aware displaced surface at (b + d)
-// with smooth cross-face normals. Depth-tinted, hidden where dry.
+// Water surface material (M4). Cheap: center displacement at (b+d) + baked
+// normal. Depth-tinted, hidden where dry.
 
+import type { Texture } from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
 import { texture as sampleTex, textureLoad, uv, mix, smoothstep, vec3 } from 'three/tsl';
-import { computeSurface, type SampleFace } from '../tsl/surface';
-import type { HeightFields, FieldSet } from '../sim/fields';
-import type { SeamTable } from '../planet/seamTable';
+import { bakedSurface } from '../tsl/surface';
 import type { FaceName } from '../config';
 
 const SHALLOW = vec3(0.30, 0.62, 0.78);
@@ -15,15 +14,16 @@ const MIN_DEPTH = 0.004;
 
 export function makeWaterMaterial(
   face: FaceName,
-  height: HeightFields,
-  water: FieldSet,
-  table: SeamTable,
+  heightTex: Texture,
+  depthTex: Texture,
+  normalTex: Texture,
 ): MeshStandardNodeMaterial {
-  // surface height = bedrock + water column (both seam-aware, texel-exact).
-  const sample: SampleFace = (f, coord) =>
-    textureLoad(height.field(f).main, coord).x.add(textureLoad(water.field(f).main, coord).x);
-  const s = computeSurface(face, sample, table);
-  const d = sampleTex(water.field(face).main, uv()).x;
+  const s = bakedSurface(
+    face,
+    (coord) => textureLoad(heightTex, coord).x.add(textureLoad(depthTex, coord).x),
+    normalTex,
+  );
+  const d = sampleTex(depthTex, uv()).x;
 
   const col = mix(SHALLOW, DEEP, smoothstep(0.0, 0.15, d));
   const opacity = smoothstep(MIN_DEPTH, MIN_DEPTH * 3, d).mul(0.85);

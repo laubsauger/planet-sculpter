@@ -1,13 +1,12 @@
-// Terrain node material (T8). Analytic seam-aware displaced surface (smooth
-// normals continuous across faces -> no panel seams / seam lines), biome color
-// by height + slope. One material per face.
+// Terrain node material (T8). Cheap: texel-exact center displacement + normal
+// sampled from a pre-baked normal texture (seam-continuous). Biome color by
+// height + slope. One material per face.
 
+import type { Texture } from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
 import { textureLoad, mix, smoothstep, vec3 } from 'three/tsl';
-import { computeSurface, type SampleFace } from '../tsl/surface';
+import { bakedSurface } from '../tsl/surface';
 import { heightScaleUniform } from '../tsl/heightScale';
-import type { HeightFields } from '../sim/fields';
-import type { SeamTable } from '../planet/seamTable';
 import type { FaceName } from '../config';
 
 export { heightScaleUniform };
@@ -23,11 +22,10 @@ export interface TerrainMaterial {
 
 export function makeTerrainMaterial(
   face: FaceName,
-  height: HeightFields,
-  table: SeamTable,
+  heightTex: Texture,
+  normalTex: Texture,
 ): TerrainMaterial {
-  const sample: SampleFace = (f, coord) => textureLoad(height.field(f).main, coord).x;
-  const s = computeSurface(face, sample, table);
+  const s = bakedSurface(face, (coord) => textureLoad(heightTex, coord).x, normalTex);
   const h = s.height;
 
   let col = mix(SAND, GRASS, smoothstep(0.10, 0.18, h));

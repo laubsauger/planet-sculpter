@@ -3,8 +3,9 @@
 export const PLANET = {
   /** Base sphere radius (world units). Heights stored as offset from this (V6). */
   baseRadius: 2,
-  /** Per-face grid resolution (verts/texels per edge). Starts low, adaptive up. */
-  res: 256,
+  /** Per-face grid resolution (verts/texels per edge). Normals are baked to a
+   *  texture (compute) so the fragment cost is res-independent. */
+  res: 512,
   /** Max vertical displacement of height=1.0 in world units. */
   heightScale: 0.6,
 } as const;
