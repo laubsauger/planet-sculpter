@@ -48,6 +48,7 @@ export class Simulation implements SimHooks {
   readonly sediment: FieldSet; // suspended sediment s
   readonly loose: FieldSet; // soft material (soil/sand) thickness atop hard rock
   readonly hardness: FieldSet; // static per-cell erosion-resistance variation
+  readonly rainfall: FieldSet; // static regional rainfall map (climate zones)
   readonly velocity: FieldSet; // rgba (vx,vy)
   readonly waterNormals: FieldSet; // baked object-space normals of (b+d)
   private readonly waterBaker: NormalBaker;
@@ -74,6 +75,7 @@ export class Simulation implements SimHooks {
     this.sediment = new FieldSet(n, false);
     this.loose = new FieldSet(n, false);
     this.hardness = new FieldSet(n, false);
+    this.rainfall = new FieldSet(n, false);
     this.velocity = new FieldSet(n, true);
     this.waterSeamFlux = new SeamFlux(height, this.water, table, n, waterUniforms);
     this.waterSeam = new SeamSync(this.water, table, n);
@@ -98,6 +100,7 @@ export class Simulation implements SimHooks {
           f.main,
           b.main,
           this.waterSource.field(face).main,
+          this.rainfall.field(face).main,
           d.scratch,
           n,
           waterUniforms,
@@ -201,10 +204,8 @@ export class Simulation implements SimHooks {
     // continuity -> no water-surface seam, mirrors terrain's b sync).
     this.waterSeamFlux.sync(r);
     this.waterSeam.sync(r);
-    if (doErosion) {
-      this.heightSeam.sync(r); // only the visible (geometric) seam needs syncing
-      this.terrainChanged = true;
-    }
+    this.heightSeam.sync(r); // always keep bedrock edge continuous (cheap)
+    if (doErosion) this.terrainChanged = true;
 
     // phase 6: rebake water-surface normals (throttled).
     if (this.tickCount % 3 === 0) this.waterBaker.bake(r);

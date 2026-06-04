@@ -42,22 +42,29 @@ function valueNoise(x: number, y: number, z: number): number {
 }
 
 function fbm(dir: Vec3): number {
+  // Ridged multifractal: sharp mountain ridges where terrain is high, smoother
+  // lowlands -> steep/interesting in parts, not uniformly smooth.
   let amp = 0.5;
-  let freq = 1.7;
+  let freq = 1.6;
   let sum = 0;
   let norm = 0;
+  let weight = 1;
+  // fewer octaves + faster amplitude falloff -> ridges without 1-texel spikes.
   for (let o = 0; o < 5; o++) {
-    sum += amp * valueNoise(dir[0] * freq, dir[1] * freq, dir[2] * freq);
+    const nv = valueNoise(dir[0] * freq, dir[1] * freq, dir[2] * freq);
+    let signal = 1 - Math.abs(nv * 2 - 1); // ridge: peak at nv=0.5
+    signal = signal * signal * 0.6 + signal * 0.4; // softer sharpen
+    signal *= weight;
+    sum += signal * amp;
     norm += amp;
+    weight = Math.min(1, signal * 1.2);
     amp *= 0.5;
     freq *= 2.0;
   }
   let h = sum / norm; // [0,1]
-  // continents: flatten lowlands, but boost a few dramatic peaks/mountains.
-  h = Math.pow(h, 1.5);
-  // gentle ridge boost on the high end for mountains (not spiky).
-  const ridge = Math.max(0, h - 0.5) * 0.6;
-  h = Math.min(1, h + ridge * ridge);
+  // blend ridged with a smooth base -> interesting but not spiky/overdone.
+  h = Math.pow(h, 1.15);
+  h = h * 0.7 + valueNoise(dir[0] * 1.8 + 50, dir[1] * 1.8, dir[2] * 1.8 - 50) * 0.3;
   return h;
 }
 
@@ -118,6 +125,35 @@ export function buildHeightTexture(face: FaceName, res: number): HeightTexture {
 }
 
 /**
+ * Regional rainfall map [0..1] from low-frequency noise: large wet regions
+ * (where rain falls) and dry regions (deserts) -> rain in certain parts, not
+ * others. Multiplied by the global rain rate (which can cycle over time).
+ */
+export function buildRainfallTexture(face: FaceName, res: number): HeightTexture {
+  const n = res + 1;
+  const data = new Float32Array(n * n);
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      const u = -1 + (2 * i) / res;
+      const v = -1 + (2 * j) / res;
+      const dir = faceUVToDir(face, u, v);
+      // low frequency -> big climate zones.
+      const a = valueNoise(dir[0] * 1.4 + 30, dir[1] * 1.4 - 12, dir[2] * 1.4 + 7);
+      const b = valueNoise(dir[0] * 2.8 - 4, dir[1] * 2.8 + 9, dir[2] * 2.8 - 2);
+      const t = a * 0.7 + b * 0.3;
+      data[j * n + i] = Math.max(0, Math.min(1, (t - 0.32) * 2.6)); // wet zones vs dry
+    }
+  }
+  const texture = new DataTexture(data, n, n, RedFormat, FloatType);
+  texture.magFilter = LinearFilter;
+  texture.minFilter = LinearFilter;
+  texture.wrapS = ClampToEdgeWrapping;
+  texture.wrapT = ClampToEdgeWrapping;
+  texture.needsUpdate = true;
+  return { face, texture, data, n };
+}
+
+/**
  * Per-cell erosion-resistance multiplier (~[0.45, 1.75]) from higher-frequency
  * noise. Spatial variation breaks sheet-flow symmetry: softer cells erode
  * faster -> flow concentrates -> channels/canyons form (feedback).
@@ -130,8 +166,9 @@ export function buildHardnessTexture(face: FaceName, res: number): HeightTexture
       const u = -1 + (2 * i) / res;
       const v = -1 + (2 * j) / res;
       const dir = faceUVToDir(face, u, v);
-      const t = fbm([dir[0] * 2.6 - 5.2, dir[1] * 2.6 + 3.7, dir[2] * 2.6 - 1.9] as Vec3);
-      data[j * n + i] = 0.45 + t * 1.3;
+      // higher frequency -> finer resistance variation -> finer, branchier channels.
+      const t = fbm([dir[0] * 5.5 - 5.2, dir[1] * 5.5 + 3.7, dir[2] * 5.5 - 1.9] as Vec3);
+      data[j * n + i] = 0.4 + t * 1.5;
     }
   }
   const texture = new DataTexture(data, n, n, RedFormat, FloatType);

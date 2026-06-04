@@ -61,7 +61,7 @@ export class LavaSim {
       this.passes.set(face, {
         flux: buildFlux(b.main, lv.main, f.main, f.scratch, n, lavaUniforms),
         copyFlux: buildCopyCompute(f.scratch, f.main, n) as ComputeNode,
-        update: buildFluidUpdate(lv.main, f.main, b.main, src, lv.scratch, n, lavaUniforms, false),
+        update: buildFluidUpdate(lv.main, f.main, b.main, src, src, lv.scratch, n, lavaUniforms, false),
         copyLava: buildCopyCompute(lv.scratch, lv.main, n) as ComputeNode,
         cool: buildLavaCool(lv.main, ht.main, b.main, src, lv.scratch, ht.scratch, b.scratch, n),
         copyLava3: buildCopyCompute(lv.scratch, lv.main, n) as ComputeNode,

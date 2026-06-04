@@ -40,13 +40,15 @@ export function makeTerrainMaterial(
   const looseRatio = textureLoad(looseTex, coord).x.div(LOOSE_FULL).min(float(1));
 
   // loose (soft) surface color by elevation: sand -> grass -> alpine -> rock -> snow.
-  let loose = mix(SAND, GRASS, smoothstep(0.05, 0.14, h));
-  loose = mix(loose, DEEP_GRASS, smoothstep(0.18, 0.34, h));
-  loose = mix(loose, ROCK_BROWN, smoothstep(0.42, 0.6, h));
-  loose = mix(loose, SNOW, smoothstep(0.66, 0.78, h));
+  // tighter bands -> more distinct material zones.
+  let loose = mix(SAND, GRASS, smoothstep(0.06, 0.11, h));
+  loose = mix(loose, DEEP_GRASS, smoothstep(0.2, 0.3, h));
+  loose = mix(loose, ROCK_BROWN, smoothstep(0.44, 0.54, h));
+  loose = mix(loose, SNOW, smoothstep(0.66, 0.74, h));
 
-  // hard grey rock shows where loose is thin OR the slope is steep (no snow on cliffs).
-  const exposure = max(float(1).sub(looseRatio), smoothstep(0.55, 0.85, s.slope)).min(float(1));
+  // hard grey rock shows where loose is thin OR slope is even moderately steep
+  // (so cliffs/ridges read as bare rock -> materials stand out).
+  const exposure = max(float(1).sub(looseRatio), smoothstep(0.32, 0.6, s.slope)).min(float(1));
   let col = mix(loose, ROCK_GREY, exposure);
 
   // coastline: sandy beach band around sea level; darken submerged terrain.

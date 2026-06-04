@@ -21,6 +21,8 @@ import {
   vec4,
   max,
   min,
+  mix,
+  smoothstep,
   uniform,
 } from 'three/tsl';
 
@@ -56,7 +58,7 @@ export type FluidUniforms = ReturnType<typeof makeFluidUniforms>;
 /** Water instance. Very low evaporation so river flow survives and travels;
  *  damping 0.6 = flux tracks head directly (smooth gradient flow, little
  *  sloshing -> clean velocity field for erosion). Raise loss for rain use. */
-export const waterUniforms = makeFluidUniforms({ loss: 0.0005, pipeArea: 4, damping: 0.88 });
+export const waterUniforms = makeFluidUniforms({ loss: 0.0003, pipeArea: 4, damping: 0.88 });
 
 const EPS = 1e-6;
 
@@ -178,6 +180,7 @@ export function buildFluidUpdate(
   f: StorageTexture,
   b: StorageTexture,
   source: StorageTexture,
+  rainfall: StorageTexture,
   dOut: StorageTexture,
   n: number,
   p: FluidUniforms,
@@ -206,12 +209,18 @@ export function buildFluidUpdate(
 
     const l2 = p.pipeLength.mul(p.pipeLength);
     const emit = textureLoad(source, ivec2(ix, iy)).x;
+    // regional rain = global rate * local rainfall map (wet/dry climate zones).
+    const rain = p.source.mul(textureLoad(rainfall, ivec2(ix, iy)).x);
     let next: any = inflow.sub(outflow).mul(p.dt).div(l2).add(dc); // flow
     next = next.sub(p.loss.mul(p.dt)); // evap / cooling
-    next = next.add(p.source.add(emit).mul(p.dt)); // rain + emitter source
+    next = next.add(rain.add(emit).mul(p.dt)); // regional rain + emitter source
     if (useSea) {
-      const need = textureLoad(b, ivec2(ix, iy)).x.mul(-1).add(seaLevelUniform).max(float(0));
-      next = next.max(need); // maintain sea level
+      const below = textureLoad(b, ivec2(ix, iy)).x.mul(-1).add(seaLevelUniform); // seaLevel - b
+      const need = below.max(float(0));
+      // deep-ocean cells pull toward EXACTLY sea level (one global level -> no
+      // per-face cube); shore/rivers keep the free sim. smoothstep ramps with depth.
+      const ocean = smoothstep(0.0, 0.05, below).mul(0.7);
+      next = mix(next.max(need), need, ocean);
     }
     next = max(next, float(0));
     textureStore(dOut, uvec2(x, y), vec4(next, 0, 0, 1)).toWriteOnly();

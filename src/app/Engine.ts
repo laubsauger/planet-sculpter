@@ -13,7 +13,12 @@ import {
 import { WebGPURenderer } from 'three/webgpu';
 import { OrbitController } from './OrbitController';
 import { PlanetMesh, makeFlatSolidMaterial } from '../planet/PlanetMesh';
-import { buildHeightTexture, buildLooseTexture, buildHardnessTexture } from '../planet/heightField';
+import {
+  buildHeightTexture,
+  buildLooseTexture,
+  buildHardnessTexture,
+  buildRainfallTexture,
+} from '../planet/heightField';
 import { makeTerrainMaterial } from '../materials/terrainMaterial';
 import { HeightFields, FieldSet, buildSeedCompute } from '../sim/fields';
 import { buildSeamTable, type SeamTable } from '../planet/seamTable';
@@ -23,6 +28,8 @@ import { Simulation } from '../sim/Simulation';
 import { LavaSim } from '../sim/LavaSim';
 import { makeWaterMaterial } from '../materials/waterMaterial';
 import { makeLavaMaterial } from '../materials/lavaMaterial';
+import { makeDebugMaterial } from '../materials/debugMaterial';
+import type { Material } from 'three';
 import { textureLoad } from 'three/tsl';
 import type { SampleFace } from '../tsl/surface';
 import { BrushTool } from '../tools/BrushTool';
@@ -35,7 +42,7 @@ import {
   type ErosionSettings,
 } from '../ui/Controls';
 import { Sidebar } from '../ui/Sidebar';
-import { PLANET, SIM, RENDER, FACES } from '../config';
+import { PLANET, SIM, RENDER, FACES, type FaceName } from '../config';
 
 export interface SimHooks {
   /** One fixed sim tick. No-op until M4. */
@@ -55,7 +62,7 @@ export class Engine {
   emitter!: EmitterTool;
   private riverMode = false;
   // small footprint (near point source) + modest rate -> a stream, not a dome.
-  readonly riverSettings = { rate: 0.02, radius: 0.012 };
+  readonly riverSettings = { rate: 0.04, radius: 0.008 };
   seamSync!: SeamSync;
   seamTable!: SeamTable;
   simulation!: Simulation;
@@ -64,6 +71,9 @@ export class Engine {
   private volcanoMode = false;
   private terrainNormals!: FieldSet;
   private terrainBaker!: NormalBaker;
+  private readonly terrainMats = new Map<FaceName, Material>();
+  private readonly debugMats = new Map<FaceName, Material>();
+  private debugOn = false;
   private waterPlanet!: PlanetMesh;
   private lavaPlanet!: PlanetMesh;
 
@@ -155,18 +165,31 @@ export class Engine {
       this.renderer.compute(
         buildSeedCompute(buildHardnessTexture(face, PLANET.res).texture, this.simulation.hardness.field(face).main, n),
       );
+      this.renderer.compute(
+        buildSeedCompute(buildRainfallTexture(face, PLANET.res).texture, this.simulation.rainfall.field(face).main, n),
+      );
       this.brush.register(face, field);
 
       // cheap material: displacement + baked normal + material (rock/soil) color.
-      this.planet.setFaceMaterial(
+      const terrainMat = makeTerrainMaterial(
         face,
-        makeTerrainMaterial(
+        field.main,
+        this.simulation.loose.field(face).main,
+        this.terrainNormals.field(face).main,
+      ).material;
+      this.terrainMats.set(face, terrainMat);
+      this.debugMats.set(
+        face,
+        makeDebugMaterial(
           face,
           field.main,
-          this.simulation.loose.field(face).main,
           this.terrainNormals.field(face).main,
-        ).material,
+          this.simulation.water.field(face).main,
+          this.simulation.sediment.field(face).main,
+          this.simulation.loose.field(face).main,
+        ),
       );
+      this.planet.setFaceMaterial(face, terrainMat);
     }
 
     // M3: seam sync across face edges (V5).
@@ -335,6 +358,13 @@ export class Engine {
         this.sidebar.sync();
         this.controls.gui.controllersRecursive().forEach((c) => c.updateDisplay());
         break;
+      case 'v':
+        // debug field view: R=sediment, G=loose, B=water.
+        this.debugOn = !this.debugOn;
+        for (const f of FACES) {
+          this.planet.setFaceMaterial(f, (this.debugOn ? this.debugMats : this.terrainMats).get(f)!);
+        }
+        break;
     }
   };
 
@@ -346,6 +376,14 @@ export class Engine {
     if (this.lastTime === 0) this.lastTime = time;
     const dt = Math.min((time - this.lastTime) / 1000, 0.1);
     this.lastTime = time;
+
+    // climate cycle: when rain is on, the global rate ebbs/flows slowly (wet &
+    // dry seasons); combined with the regional rainfall map -> rain shifts over
+    // time and falls in some regions more than others.
+    if (this.waterSettings.rainOn) {
+      const pulse = 0.45 + 0.55 * Math.max(0, Math.sin(time * 0.00012));
+      this.simulation.setRain(this.waterSettings.rainRate * pulse);
+    }
 
     // Decoupled fixed-step sim (V10), capped (anti spiral-of-death).
     if (this.sim) {
@@ -387,7 +425,7 @@ export class Engine {
       this.hud.textContent =
         `fps ${this.fpsEma.toFixed(0)}  ${this.frameMsEma.toFixed(1)}ms\n` +
         `res ${PLANET.res}  sim ${SIM.ticksPerSecond}/s  rain:${this.waterSettings.rainOn ? 'on' : 'off'} [r]\n` +
-        `[g] ${this.sculptMode ? 'SCULPT' : 'orbit'}  brush:${this.brushSettings.mode} [1raise 2lower 3smooth 4flatten]`;
+        `[g] ${this.sculptMode ? 'SCULPT' : 'orbit'}  brush:${this.brushSettings.mode} [1raise 2lower 3smooth 4flatten]  [v]debug${this.debugOn ? '*' : ''}`;
     }
   }
 

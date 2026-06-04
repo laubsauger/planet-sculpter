@@ -24,27 +24,30 @@ import {
   length,
   uniform,
 } from 'three/tsl';
+import { seamHeight, type SampleFace } from '../../tsl/surface';
+import type { SeamTable } from '../../planet/seamTable';
+import type { FaceName } from '../../config';
 
 type ComputeNode = Parameters<WebGPURenderer['compute']>[0];
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 export const erosionUniforms = {
-  sedimentCapacity: uniform(0.25), // Kc
-  dissolve: uniform(0.12), // Ks
-  deposit: uniform(0.07), // Kd — lower so rivers don't dam themselves with deposits
-  minSlope: uniform(0.02),
+  sedimentCapacity: uniform(0.4), // Kc — more carving capacity (deeper channels)
+  dissolve: uniform(0.18), // Ks
+  deposit: uniform(0.06), // Kd — low so rivers don't dam themselves
+  minSlope: uniform(0.015),
   advectScale: uniform(1.0),
-  /** min flow speed to erode; below this water only deposits. Low so moving
-   *  rivers carve channels (self-deepen) instead of depositing/damming. */
-  erodeSpeedMin: uniform(0.4),
+  /** min flow speed to erode; low so even slow river flow carves a channel. */
+  erodeSpeedMin: uniform(0.22),
   /** erodibility of exposed hard rock (loose = 1). lower = more resistant. */
   rockErodibility: uniform(0.18),
   /** loose-layer thickness at which the surface is "fully soft". */
   looseFull: uniform(0.02),
   /** thermal slump: height diff above which material slides to lower neighbors. */
-  talus: uniform(0.006),
-  thermalRate: uniform(0.8),
+  talus: uniform(0.004),
+  /** low -> channels stay sharp/narrow (less smoothing fighting channelization). */
+  thermalRate: uniform(0.3),
   dt: uniform(1 / 60),
 };
 
@@ -106,6 +109,9 @@ export function buildErosion(
   looseOut: StorageTexture,
   sOut: StorageTexture,
   n: number,
+  face: FaceName,
+  table: SeamTable,
+  sampleB: SampleFace,
 ): ComputeNode {
   const res = n - 1;
   const u = erosionUniforms;
@@ -122,12 +128,18 @@ export function buildErosion(
     const dc = textureLoad(d, ivec2(ix, iy)).x;
     const v = textureLoad(vel, ivec2(ix, iy));
 
-    const dbx = textureLoad(b, ivec2(xp, iy)).x.sub(textureLoad(b, ivec2(xm, iy)).x).mul(0.5);
-    const dby = textureLoad(b, ivec2(ix, yp)).x.sub(textureLoad(b, ivec2(ix, ym)).x).mul(0.5);
+    // cross-seam b gradient (clamped self-self at borders would give ~0 tilt ->
+    // border doesn't erode -> raised ridge along the seam, B10).
+    const dbx = seamHeight(face, sampleB, table, ix.add(1), iy)
+      .sub(seamHeight(face, sampleB, table, ix.sub(1), iy))
+      .mul(0.5);
+    const dby = seamHeight(face, sampleB, table, ix, iy.add(1))
+      .sub(seamHeight(face, sampleB, table, ix, iy.sub(1)))
+      .mul(0.5);
     const tilt = length(vec2(dbx, dby)).min(float(0.5));
     const sinTilt = max(tilt, u.minSlope);
     const speed = length(vec2(v.x, v.y)).min(float(3));
-    const hasWater = dc.greaterThan(float(0.01)).select(float(1), float(0));
+    const hasWater = dc.greaterThan(float(0.003)).select(float(1), float(0)); // thin steep flow still erodes
     const capacity = u.sedimentCapacity.mul(sinTilt).mul(speed).mul(hasWater);
     // don't carve a pit at a spring head (high outflow there reads as fast flow).
     const notSource = textureLoad(source, ivec2(ix, iy)).x.lessThan(float(0.0001)).select(float(1), float(0));
@@ -137,8 +149,13 @@ export function buildErosion(
     // per-cell resistance variation -> symmetry breaking -> channels/canyons.
     const hard = textureLoad(hardness, ivec2(ix, iy)).x;
 
-    const CAP = float(0.0006);
-    const erodeGate = speed.greaterThan(u.erodeSpeedMin).select(float(1), float(0)).mul(notSource);
+    const CAP = float(0.001); // allow deeper per-step carving -> channel feedback
+    const mask = borderMask(ix, iy, res); // don't carve the seam band (wrong neighbors)
+    const erodeGate = speed
+      .greaterThan(u.erodeSpeedMin)
+      .select(float(1), float(0))
+      .mul(notSource)
+      .mul(mask);
     // erosion scaled by material softness * local resistance variation.
     const erode = max(float(0), capacity.sub(sc))
       .mul(u.dissolve)
@@ -146,12 +163,12 @@ export function buildErosion(
       .mul(hard)
       .mul(erodeGate)
       .min(CAP);
-    const dep = max(float(0), sc.sub(capacity)).mul(u.deposit).min(CAP);
+    const dep = max(float(0), sc.sub(capacity)).mul(u.deposit).mul(mask).min(CAP);
 
-    const bNew = max(bc.sub(erode).add(dep), float(0));
+    const bNew: any = max(bc.sub(erode).add(dep), float(0));
     // loose: erosion removes loose first (then bites rock); deposition adds loose.
-    const looseNew = max(lc.sub(erode), float(0)).add(dep);
-    const sNew = max(float(0), sc.add(erode).sub(dep)).min(float(2));
+    const looseNew: any = max(lc.sub(erode), float(0)).add(dep);
+    const sNew: any = max(float(0), sc.add(erode).sub(dep)).min(float(2));
 
     textureStore(bOut, uvec2(x, y), vec4(bNew, 0, 0, 1)).toWriteOnly();
     textureStore(looseOut, uvec2(x, y), vec4(looseNew, 0, 0, 1)).toWriteOnly();
@@ -210,7 +227,8 @@ export function buildThermal(b: StorageTexture, bOut: StorageTexture, n: number)
       net = net.sub(max(float(0), c.sub(nb).sub(u.talus)));
       net = net.add(max(float(0), nb.sub(c).sub(u.talus)));
     }
-    const bNew = max(c.add(net.mul(u.thermalRate).mul(0.25)), float(0));
+    const mask = borderMask(ix, iy, res); // don't slump the seam band (wrong neighbors)
+    const bNew = max(c.add(net.mul(u.thermalRate).mul(0.25).mul(mask)), float(0));
     textureStore(bOut, uvec2(x, y), vec4(bNew, 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(n * n) as ComputeNode;
