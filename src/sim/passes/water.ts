@@ -217,9 +217,10 @@ export function buildFluidUpdate(
     if (useSea) {
       const below = textureLoad(b, ivec2(ix, iy)).x.mul(-1).add(seaLevelUniform); // seaLevel - b
       const need = below.max(float(0));
-      // deep-ocean cells pull toward EXACTLY sea level (one global level -> no
-      // per-face cube); shore/rivers keep the free sim. smoothstep ramps with depth.
-      const ocean = smoothstep(0.0, 0.05, below).mul(0.7);
+      // deep-ocean cells pinned almost exactly to sea level (one global flat
+      // level -> no per-face cube / streaks); only shallow shore/rivers keep the
+      // free sim. ramp quickly with depth.
+      const ocean = smoothstep(0.0, 0.03, below).mul(0.95);
       next = mix(next.max(need), need, ocean);
     }
     next = max(next, float(0));

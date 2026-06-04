@@ -69,19 +69,26 @@ export function buildVelocity(
   const res = n - 1;
   const fn = Fn(() => {
     const { x, y, ix, iy } = xy(n);
-    const xm = clampI(ix.sub(1), res);
-    const xp = clampI(ix.add(1), res);
-    const ym = clampI(iy.sub(1), res);
-    const yp = clampI(iy.add(1), res);
+    // border cells have no valid intra-face neighbor across the seam (clamped
+    // flux -> ~0 velocity -> they under-erode -> symmetric ridge along the seam
+    // heightSeam can't flatten). Sample the velocity stencil one cell INWARD at
+    // borders so the border inherits the first-interior flow (flow continues
+    // across the seam). Interior cells unchanged.
+    const cx = ix.toFloat().max(float(1)).min(float(res - 1)).toInt();
+    const cy = iy.toFloat().max(float(1)).min(float(res - 1)).toInt();
+    const xm = clampI(cx.sub(1), res);
+    const xp = clampI(cx.add(1), res);
+    const ym = clampI(cy.sub(1), res);
+    const yp = clampI(cy.add(1), res);
 
-    const self = textureLoad(f, ivec2(ix, iy));
-    const Lr = textureLoad(f, ivec2(xm, iy)).y; // left neighbor's R (into us +x)
-    const Rl = textureLoad(f, ivec2(xp, iy)).x; // right neighbor's L (into us -x)
-    const Bt = textureLoad(f, ivec2(ix, ym)).z; // bottom neighbor's T (into us +y)
-    const Tb = textureLoad(f, ivec2(ix, yp)).w; // top neighbor's B (into us -y)
+    const self = textureLoad(f, ivec2(cx, cy));
+    const Lr = textureLoad(f, ivec2(xm, cy)).y; // left neighbor's R (into us +x)
+    const Rl = textureLoad(f, ivec2(xp, cy)).x; // right neighbor's L (into us -x)
+    const Bt = textureLoad(f, ivec2(cx, ym)).z; // bottom neighbor's T (into us +y)
+    const Tb = textureLoad(f, ivec2(cx, yp)).w; // top neighbor's B (into us -y)
 
     // divide by a MIN depth (not EPS) so thin films don't produce huge speeds.
-    const dc = max(textureLoad(d, ivec2(ix, iy)).x, float(0.02));
+    const dc = max(textureLoad(d, ivec2(cx, cy)).x, float(0.02));
     const vx = Lr.sub(self.x).add(self.y.sub(Rl)).mul(0.5).div(dc).max(float(-3)).min(float(3));
     const vy = Bt.sub(self.w).add(self.z.sub(Tb)).mul(0.5).div(dc).max(float(-3)).min(float(3));
 
@@ -113,14 +120,9 @@ export function buildErosion(
   table: SeamTable,
   sampleB: SampleFace,
 ): ComputeNode {
-  const res = n - 1;
   const u = erosionUniforms;
   const fn = Fn(() => {
     const { x, y, ix, iy } = xy(n);
-    const xm = clampI(ix.sub(1), res);
-    const xp = clampI(ix.add(1), res);
-    const ym = clampI(iy.sub(1), res);
-    const yp = clampI(iy.add(1), res);
 
     const bc = textureLoad(b, ivec2(ix, iy)).x;
     const lc = textureLoad(loose, ivec2(ix, iy)).x.min(bc); // loose <= total
@@ -150,12 +152,7 @@ export function buildErosion(
     const hard = textureLoad(hardness, ivec2(ix, iy)).x;
 
     const CAP = float(0.001); // allow deeper per-step carving -> channel feedback
-    const mask = borderMask(ix, iy, res); // don't carve the seam band (wrong neighbors)
-    const erodeGate = speed
-      .greaterThan(u.erodeSpeedMin)
-      .select(float(1), float(0))
-      .mul(notSource)
-      .mul(mask);
+    const erodeGate = speed.greaterThan(u.erodeSpeedMin).select(float(1), float(0)).mul(notSource);
     // erosion scaled by material softness * local resistance variation.
     const erode = max(float(0), capacity.sub(sc))
       .mul(u.dissolve)
@@ -163,7 +160,7 @@ export function buildErosion(
       .mul(hard)
       .mul(erodeGate)
       .min(CAP);
-    const dep = max(float(0), sc.sub(capacity)).mul(u.deposit).mul(mask).min(CAP);
+    const dep = max(float(0), sc.sub(capacity)).mul(u.deposit).min(CAP);
 
     const bNew: any = max(bc.sub(erode).add(dep), float(0));
     // loose: erosion removes loose first (then bites rock); deposition adds loose.
@@ -177,23 +174,24 @@ export function buildErosion(
   return fn().compute(n * n) as ComputeNode;
 }
 
-/** Semi-Lagrangian advection of sediment along velocity (nearest backtrace). */
+/** Semi-Lagrangian advection of sediment along velocity (nearest backtrace).
+ *  Backtrace is <1 cell/step, so a one-cell-out cross-seam sample (seamHeight)
+ *  lets sediment leave across face edges instead of clamping + piling there. */
 export function buildAdvect(
-  s: StorageTexture,
   vel: StorageTexture,
   sOut: StorageTexture,
   n: number,
+  face: FaceName,
+  table: SeamTable,
+  sampleS: SampleFace,
 ): ComputeNode {
-  const res = n - 1;
   const fn = Fn(() => {
     const { x, y, ix, iy } = xy(n);
     const v = textureLoad(vel, ivec2(ix, iy));
     const step = erosionUniforms.dt.mul(erosionUniforms.advectScale);
-    const bx = ix.toFloat().sub(v.x.mul(step));
-    const by = iy.toFloat().sub(v.y.mul(step));
-    const sx = bx.max(float(0)).min(float(res)).toInt();
-    const sy = by.max(float(0)).min(float(res)).toInt();
-    const sVal = textureLoad(s, ivec2(sx, sy)).x;
+    const bx = ix.toFloat().sub(v.x.mul(step)).round().toInt();
+    const by = iy.toFloat().sub(v.y.mul(step)).round().toInt();
+    const sVal = seamHeight(face, sampleS, table, bx, by);
     textureStore(sOut, uvec2(x, y), vec4(sVal, 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(n * n) as ComputeNode;
@@ -204,31 +202,31 @@ export function buildAdvect(
  * talus angle slides to lower neighbors -> smooths spikes/noise. Symmetric
  * pair exchange (conservative). Run each erosion tick.
  */
-export function buildThermal(b: StorageTexture, bOut: StorageTexture, n: number): ComputeNode {
-  const res = n - 1;
+export function buildThermal(
+  b: StorageTexture,
+  bOut: StorageTexture,
+  n: number,
+  face: FaceName,
+  table: SeamTable,
+  sampleB: SampleFace,
+): ComputeNode {
   const u = erosionUniforms;
   const fn = Fn(() => {
     const { x, y, ix, iy } = xy(n);
-    const xm = clampI(ix.sub(1), res);
-    const xp = clampI(ix.add(1), res);
-    const ym = clampI(iy.sub(1), res);
-    const yp = clampI(iy.add(1), res);
-
     const c = textureLoad(b, ivec2(ix, iy)).x;
+    // cross-seam neighbors so the border slumps consistently (no seam ridge).
     const nbs = [
-      textureLoad(b, ivec2(xm, iy)).x,
-      textureLoad(b, ivec2(xp, iy)).x,
-      textureLoad(b, ivec2(ix, ym)).x,
-      textureLoad(b, ivec2(ix, yp)).x,
+      seamHeight(face, sampleB, table, ix.sub(1), iy),
+      seamHeight(face, sampleB, table, ix.add(1), iy),
+      seamHeight(face, sampleB, table, ix, iy.sub(1)),
+      seamHeight(face, sampleB, table, ix, iy.add(1)),
     ];
     let net: any = float(0);
     for (const nb of nbs) {
-      // self higher than nb beyond talus -> self gives; nb higher -> self receives.
       net = net.sub(max(float(0), c.sub(nb).sub(u.talus)));
       net = net.add(max(float(0), nb.sub(c).sub(u.talus)));
     }
-    const mask = borderMask(ix, iy, res); // don't slump the seam band (wrong neighbors)
-    const bNew = max(c.add(net.mul(u.thermalRate).mul(0.25).mul(mask)), float(0));
+    const bNew = max(c.add(net.mul(u.thermalRate).mul(0.25)), float(0));
     textureStore(bOut, uvec2(x, y), vec4(bNew, 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(n * n) as ComputeNode;

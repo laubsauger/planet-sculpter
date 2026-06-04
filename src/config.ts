@@ -5,7 +5,7 @@ export const PLANET = {
   baseRadius: 2,
   /** Per-face grid resolution (verts/texels per edge). Normals are baked to a
    *  texture (compute) so the fragment cost is res-independent; sim cost ~res². */
-  res: 640,
+  res: 768,
   /** Max vertical displacement of height=1.0 in world units. Middle ground:
    *  pronounced mountains/canyons that read well, still a clear sphere. */
   heightScale: 0.48,

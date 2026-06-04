@@ -22,7 +22,7 @@ import {
 import { makeTerrainMaterial } from '../materials/terrainMaterial';
 import { HeightFields, FieldSet, buildSeedCompute } from '../sim/fields';
 import { buildSeamTable, type SeamTable } from '../planet/seamTable';
-import { SeamSync } from '../sim/passes/seamCopy';
+import { SeamSync, NormalSeamSync } from '../sim/passes/seamCopy';
 import { NormalBaker } from '../sim/passes/normals';
 import { Simulation } from '../sim/Simulation';
 import { LavaSim } from '../sim/LavaSim';
@@ -64,6 +64,7 @@ export class Engine {
   // small footprint (near point source) + modest rate -> a stream, not a dome.
   readonly riverSettings = { rate: 0.04, radius: 0.008 };
   seamSync!: SeamSync;
+  private normalSeam!: NormalSeamSync;
   seamTable!: SeamTable;
   simulation!: Simulation;
   lavaSim!: LavaSim;
@@ -74,6 +75,7 @@ export class Engine {
   private readonly terrainMats = new Map<FaceName, Material>();
   private readonly debugMats = new Map<FaceName, Material>();
   private debugOn = false;
+  private bakeCounter = 0;
   private waterPlanet!: PlanetMesh;
   private lavaPlanet!: PlanetMesh;
 
@@ -203,7 +205,9 @@ export class Engine {
       this.terrainNormals,
       this.heightFields.n,
     );
+    this.normalSeam = new NormalSeamSync(this.terrainNormals, this.seamTable, this.heightFields.n);
     this.terrainBaker.bake(this.renderer);
+    this.normalSeam.sync(this.renderer); // seamless shading across face edges
     this.brush.warmup(this.renderer); // V8: compile pipelines up front
 
     await this.simulation.warmup();
@@ -311,6 +315,7 @@ export class Engine {
     }
     this.brush.stamp(this.renderer, pick.dir, this.brushSettings);
     this.terrainBaker.bake(this.renderer); // height changed -> rebake normals
+    this.normalSeam.sync(this.renderer);
   }
 
   private applyRain(): void {
@@ -398,9 +403,14 @@ export class Engine {
       if (this.simAccumulator > this.simInterval * SIM.maxStepsPerFrame) {
         this.simAccumulator = 0; // drop backlog rather than spiral
       }
-      // rebake terrain normals when erosion or lava changed bedrock.
+      // rebake terrain normals when bedrock changed (throttled: the bake is the
+      // heaviest erosion-tick cost; normals lag a frame, fine for gradual change).
       if (this.simulation.terrainChanged || this.lavaSim.terrainChanged) {
-        this.terrainBaker.bake(this.renderer);
+        this.bakeCounter = (this.bakeCounter + 1) % 2;
+        if (this.bakeCounter === 0) {
+          this.terrainBaker.bake(this.renderer);
+          this.normalSeam.sync(this.renderer);
+        }
       }
     }
 

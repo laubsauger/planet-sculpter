@@ -14,7 +14,7 @@ import {
   buildThermal,
   erosionUniforms,
 } from './passes/erosion';
-import { SeamSync } from './passes/seamCopy';
+import { SeamSync, NormalSeamSync } from './passes/seamCopy';
 import { SeamFlux } from './passes/seamFlux';
 import { NormalBaker } from './passes/normals';
 import { buildSeamTable, type SeamTable } from '../planet/seamTable';
@@ -52,6 +52,7 @@ export class Simulation implements SimHooks {
   readonly velocity: FieldSet; // rgba (vx,vy)
   readonly waterNormals: FieldSet; // baked object-space normals of (b+d)
   private readonly waterBaker: NormalBaker;
+  private readonly waterNormalSeam: NormalSeamSync;
   erosionEnabled = false;
   private readonly passes = new Map<FaceName, FacePasses>();
   /** Cross-seam water flux (flow across faces) + edge averaging (exact edge
@@ -59,6 +60,8 @@ export class Simulation implements SimHooks {
   private readonly waterSeamFlux: SeamFlux;
   private readonly waterSeam: SeamSync;
   private readonly heightSeam: SeamSync;
+  private readonly looseSeam: SeamSync;
+  private readonly sedimentSeam: SeamSync;
   private tickCount = 0;
   /** true on ticks where erosion mutated bedrock (Engine rebakes normals then). */
   terrainChanged = false;
@@ -77,14 +80,18 @@ export class Simulation implements SimHooks {
     this.hardness = new FieldSet(n, false);
     this.rainfall = new FieldSet(n, false);
     this.velocity = new FieldSet(n, true);
-    this.waterSeamFlux = new SeamFlux(height, this.water, table, n, waterUniforms);
+    this.waterSeamFlux = new SeamFlux(height, this.water, this.sediment, table, n, waterUniforms);
     this.waterSeam = new SeamSync(this.water, table, n);
     this.heightSeam = new SeamSync(this.height, table, n);
+    this.looseSeam = new SeamSync(this.loose, table, n);
+    this.sedimentSeam = new SeamSync(this.sediment, table, n);
 
     this.waterNormals = new FieldSet(n, true);
+    const sampleB: SampleFace = (f, coord) => textureLoad(height.field(f).main, coord).x;
     const sampleWater: SampleFace = (f, coord) =>
       textureLoad(height.field(f).main, coord).x.add(textureLoad(this.water.field(f).main, coord).x);
     this.waterBaker = new NormalBaker(sampleWater, table, this.waterNormals, n);
+    this.waterNormalSeam = new NormalSeamSync(this.waterNormals, table, n);
 
     for (const face of FACES) {
       const b = height.field(face);
@@ -121,6 +128,9 @@ export class Simulation implements SimHooks {
           this.loose.field(face).scratch,
           s.scratch,
           n,
+          face,
+          table,
+          sampleB,
         ),
         copyB: buildCopyCompute(b.scratch, b.main, n) as ComputeNode,
         copyLoose: buildCopyCompute(
@@ -129,9 +139,11 @@ export class Simulation implements SimHooks {
           n,
         ) as ComputeNode,
         copyS1: buildCopyCompute(s.scratch, s.main, n) as ComputeNode,
-        advect: buildAdvect(s.main, vel.main, s.scratch, n),
+        advect: buildAdvect(vel.main, s.scratch, n, face, table, (f, coord) =>
+          textureLoad(this.sediment.field(f).main, coord).x,
+        ),
         copyS2: buildCopyCompute(s.scratch, s.main, n) as ComputeNode,
-        thermal: buildThermal(b.main, b.scratch, n),
+        thermal: buildThermal(b.main, b.scratch, n, face, table, sampleB),
       });
     }
   }
@@ -164,8 +176,8 @@ export class Simulation implements SimHooks {
     this.terrainChanged = false;
     // erosion is gradual -> run it (and its bedrock/sediment seam syncs) every
     // 3rd tick for perf; scale its dt up so erosion speed stays consistent.
-    const doErosion = this.erosionEnabled && this.tickCount % 3 === 0;
-    erosionUniforms.dt.value = dt * 3;
+    const doErosion = this.erosionEnabled && this.tickCount % 4 === 0;
+    erosionUniforms.dt.value = dt * 4;
 
     // water (every tick for responsive flow): flux, then fused
     // flow+loss+source+sea-fill update.
@@ -204,11 +216,19 @@ export class Simulation implements SimHooks {
     // continuity -> no water-surface seam, mirrors terrain's b sync).
     this.waterSeamFlux.sync(r);
     this.waterSeam.sync(r);
-    this.heightSeam.sync(r); // always keep bedrock edge continuous (cheap)
-    if (doErosion) this.terrainChanged = true;
+    if (doErosion) {
+      this.heightSeam.sync(r); // bedrock changed -> keep edge continuous
+      this.looseSeam.sync(r); // keep loose-material (color) continuous across seams
+      this.sedimentSeam.sync(r); // suspended sediment can't cross seam in advect ->
+      // edge-average it so it doesn't pile up + deposit a ridge along the seam.
+      this.terrainChanged = true;
+    }
 
     // phase 6: rebake water-surface normals (throttled).
-    if (this.tickCount % 3 === 0) this.waterBaker.bake(r);
+    if (this.tickCount % 3 === 0) {
+      this.waterBaker.bake(r);
+      this.waterNormalSeam.sync(r);
+    }
   }
 
   setErosion(on: boolean): void {
@@ -224,5 +244,6 @@ export class Simulation implements SimHooks {
       r.compute(p.copyD);
     }
     this.waterBaker.bake(r);
+    this.waterNormalSeam.sync(r);
   }
 }

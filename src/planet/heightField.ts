@@ -41,6 +41,12 @@ function valueNoise(x: number, y: number, z: number): number {
   return lerp(y0, y1, w);
 }
 
+/** clamped smoothstep on a pre-normalized t. */
+function smoothStep01(t: number): number {
+  const x = Math.max(0, Math.min(1, t));
+  return x * x * (3 - 2 * x);
+}
+
 function fbm(dir: Vec3): number {
   // Ridged multifractal: sharp mountain ridges where terrain is high, smoother
   // lowlands -> steep/interesting in parts, not uniformly smooth.
@@ -62,10 +68,19 @@ function fbm(dir: Vec3): number {
     freq *= 2.0;
   }
   let h = sum / norm; // [0,1]
-  // blend ridged with a smooth base -> interesting but not spiky/overdone.
   h = Math.pow(h, 1.15);
-  h = h * 0.7 + valueNoise(dir[0] * 1.8 + 50, dir[1] * 1.8, dir[2] * 1.8 - 50) * 0.3;
-  return h;
+  h = h * 0.82 + valueNoise(dir[0] * 1.8 + 50, dir[1] * 1.8, dir[2] * 1.8 - 50) * 0.18;
+
+  // Regional ruggedness: more & wider mountain ranges (lower threshold) breaking
+  // up the grasslands; plains still flatter.
+  const typeN = valueNoise(dir[0] * 0.75 + 20, dir[1] * 0.75 - 15, dir[2] * 0.75 + 8);
+  const rugged = smoothStep01((typeN - 0.28) / 0.45); // 0 plains .. 1 mountains
+  h = h * (0.58 + 0.55 * rugged);
+
+  // lift the highest peaks higher (snow-capped) without raising lowlands.
+  h = h + Math.max(0, h - 0.5) * 0.55;
+
+  return Math.max(0, Math.min(1, h));
 }
 
 export interface HeightTexture {
@@ -166,9 +181,12 @@ export function buildHardnessTexture(face: FaceName, res: number): HeightTexture
       const u = -1 + (2 * i) / res;
       const v = -1 + (2 * j) / res;
       const dir = faceUVToDir(face, u, v);
-      // higher frequency -> finer resistance variation -> finer, branchier channels.
-      const t = fbm([dir[0] * 5.5 - 5.2, dir[1] * 5.5 + 3.7, dir[2] * 5.5 - 1.9] as Vec3);
-      data[j * n + i] = 0.4 + t * 1.5;
+      // higher frequency + more contrast -> finer, sharper channel nucleation
+      // so rivers concentrate into narrow paths instead of a wide bias.
+      const t = valueNoise(dir[0] * 7 - 5.2, dir[1] * 7 + 3.7, dir[2] * 7 - 1.9);
+      const t2 = valueNoise(dir[0] * 14 + 2, dir[1] * 14 - 8, dir[2] * 14 + 5);
+      const r = t * 0.65 + t2 * 0.35;
+      data[j * n + i] = 0.25 + Math.pow(r, 1.4) * 1.7; // wider, sharper resistance range
     }
   }
   const texture = new DataTexture(data, n, n, RedFormat, FloatType);
