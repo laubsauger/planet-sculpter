@@ -24,6 +24,8 @@ import {
   uniform,
 } from 'three/tsl';
 
+import { seaLevelUniform } from '../../tsl/heightScale';
+
 type ComputeNode = Parameters<WebGPURenderer['compute']>[0];
 
 /** Tunable constants for one fluid (water or lava). source=uniform add rate,
@@ -34,6 +36,7 @@ export function makeFluidUniforms(o: {
   gravity?: number;
   pipeArea?: number;
   pipeLength?: number;
+  damping?: number;
 }) {
   return {
     source: uniform(o.source ?? 0),
@@ -41,6 +44,8 @@ export function makeFluidUniforms(o: {
     gravity: uniform(o.gravity ?? 9.81),
     pipeArea: uniform(o.pipeArea ?? 1),
     pipeLength: uniform(o.pipeLength ?? 1),
+    // flux momentum retained per step (<1). Lower = waves settle faster.
+    damping: uniform(o.damping ?? 0.88),
     dt: uniform(1 / 60),
   };
 }
@@ -48,8 +53,10 @@ export function makeFluidUniforms(o: {
 /** Type carries the rich TSL node methods (.mul etc.) via inference. */
 export type FluidUniforms = ReturnType<typeof makeFluidUniforms>;
 
-/** Water instance. Low loss so rain accumulates; pipeArea 2 = brisk drainage. */
-export const waterUniforms = makeFluidUniforms({ loss: 0.0012, pipeArea: 2 });
+/** Water instance. Very low evaporation so river flow survives and travels;
+ *  damping 0.6 = flux tracks head directly (smooth gradient flow, little
+ *  sloshing -> clean velocity field for erosion). Raise loss for rain use. */
+export const waterUniforms = makeFluidUniforms({ loss: 0.0005, pipeArea: 4, damping: 0.88 });
 
 const EPS = 1e-6;
 
@@ -68,17 +75,39 @@ function clamp(i: any, res: number): any {
   return i.toFloat().max(float(0)).min(float(res)).toInt();
 }
 
-/** d += source*dt (uniform add: rain / vent baseline). */
+/** Maintain a global sea: where bedrock is below sea level, ensure water fills
+ *  up to it (oceans persist against evaporation; rivers add on top). The fluid
+ *  water is the ONLY water — no separate ocean mesh. */
+export function buildSeaFill(
+  b: StorageTexture,
+  d: StorageTexture,
+  dOut: StorageTexture,
+  n: number,
+): ComputeNode {
+  const fn = Fn(() => {
+    const { x, y, ix, iy } = coords(n);
+    const bc = textureLoad(b, ivec2(ix, iy)).x;
+    const dc = textureLoad(d, ivec2(ix, iy)).x;
+    const need = bc.mul(-1).add(seaLevelUniform).max(float(0)); // seaLevel - b, >=0
+    const next: any = need.max(dc);
+    textureStore(dOut, uvec2(x, y), vec4(next, 0, 0, 1)).toWriteOnly();
+  });
+  return fn().compute(n * n) as ComputeNode;
+}
+
+/** d += (uniform source [rain] + per-texel source map [emitters]) * dt. */
 export function buildAddSource(
   d: StorageTexture,
   dOut: StorageTexture,
+  sourceMap: StorageTexture,
   n: number,
   p: FluidUniforms,
 ): ComputeNode {
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(n);
     const cur = textureLoad(d, ivec2(ix, iy)).x;
-    const next = cur.add(p.source.mul(p.dt));
+    const emit = textureLoad(sourceMap, ivec2(ix, iy)).x;
+    const next = cur.add(p.source.add(emit).mul(p.dt));
     textureStore(dOut, uvec2(x, y), vec4(next, 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(n * n) as ComputeNode;
@@ -110,10 +139,11 @@ export function buildFlux(
 
     const k = p.dt.mul(p.pipeArea).mul(p.gravity).div(p.pipeLength);
 
-    let fL = max(float(0), prev.x.add(k.mul(hc.sub(surf(xm, iy)))));
-    let fR = max(float(0), prev.y.add(k.mul(hc.sub(surf(xp, iy)))));
-    let fT = max(float(0), prev.z.add(k.mul(hc.sub(surf(ix, yp)))));
-    let fB = max(float(0), prev.w.add(k.mul(hc.sub(surf(ix, ym)))));
+    // damped flux accumulator: retained momentum decays each step -> no endless sloshing.
+    let fL = max(float(0), prev.x.mul(p.damping).add(k.mul(hc.sub(surf(xm, iy)))));
+    let fR = max(float(0), prev.y.mul(p.damping).add(k.mul(hc.sub(surf(xp, iy)))));
+    let fT = max(float(0), prev.z.mul(p.damping).add(k.mul(hc.sub(surf(ix, yp)))));
+    let fB = max(float(0), prev.w.mul(p.damping).add(k.mul(hc.sub(surf(ix, ym)))));
 
     // Seal face borders: no flux into a wall (clamped neighbor would otherwise
     // read self -> phantom flux -> non-conservation -> water explosion).
@@ -133,6 +163,58 @@ export function buildFlux(
       uvec2(x, y),
       vec4(fL.mul(scale), fR.mul(scale), fT.mul(scale), fB.mul(scale)),
     ).toWriteOnly();
+  });
+  return fn().compute(n * n) as ComputeNode;
+}
+
+/**
+ * Fused fluid update (perf): flow (inflow-outflow) + loss + source(+emitter) +
+ * optional sea-fill, in ONE pass. Replaces addSource+depth+seaFill (3 passes +
+ * 3 copies) with 1 pass + 1 copy — no read/write hazard, fully equivalent.
+ * Source is added at end-of-tick (available to next tick's flux).
+ */
+export function buildFluidUpdate(
+  d: StorageTexture,
+  f: StorageTexture,
+  b: StorageTexture,
+  source: StorageTexture,
+  dOut: StorageTexture,
+  n: number,
+  p: FluidUniforms,
+  useSea: boolean,
+): ComputeNode {
+  const res = n - 1;
+  const fn = Fn(() => {
+    const { x, y, ix, iy } = coords(n);
+    const xm = clamp(ix.sub(1), res);
+    const xp = clamp(ix.add(1), res);
+    const ym = clamp(iy.sub(1), res);
+    const yp = clamp(iy.add(1), res);
+
+    const dc = textureLoad(d, ivec2(ix, iy)).x;
+    const self = textureLoad(f, ivec2(ix, iy));
+    const outflow = self.x.add(self.y).add(self.z).add(self.w);
+    const mL = ix.greaterThan(int(0)).select(float(1), float(0));
+    const mR = ix.lessThan(int(res)).select(float(1), float(0));
+    const mT = iy.lessThan(int(res)).select(float(1), float(0));
+    const mB = iy.greaterThan(int(0)).select(float(1), float(0));
+    const inflow = textureLoad(f, ivec2(xm, iy))
+      .y.mul(mL)
+      .add(textureLoad(f, ivec2(xp, iy)).x.mul(mR))
+      .add(textureLoad(f, ivec2(ix, yp)).w.mul(mT))
+      .add(textureLoad(f, ivec2(ix, ym)).z.mul(mB));
+
+    const l2 = p.pipeLength.mul(p.pipeLength);
+    const emit = textureLoad(source, ivec2(ix, iy)).x;
+    let next: any = inflow.sub(outflow).mul(p.dt).div(l2).add(dc); // flow
+    next = next.sub(p.loss.mul(p.dt)); // evap / cooling
+    next = next.add(p.source.add(emit).mul(p.dt)); // rain + emitter source
+    if (useSea) {
+      const need = textureLoad(b, ivec2(ix, iy)).x.mul(-1).add(seaLevelUniform).max(float(0));
+      next = next.max(need); // maintain sea level
+    }
+    next = max(next, float(0));
+    textureStore(dOut, uvec2(x, y), vec4(next, 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(n * n) as ComputeNode;
 }

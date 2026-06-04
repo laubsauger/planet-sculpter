@@ -6,15 +6,18 @@ export const PLANET = {
   /** Per-face grid resolution (verts/texels per edge). Normals are baked to a
    *  texture (compute) so the fragment cost is res-independent. */
   res: 512,
-  /** Max vertical displacement of height=1.0 in world units. */
-  heightScale: 0.6,
+  /** Max vertical displacement of height=1.0 in world units. Middle ground:
+   *  pronounced mountains/canyons that read well, still a clear sphere. */
+  heightScale: 0.55,
+  /** Sea level in stored-height units [0..1]: terrain below is underwater. */
+  seaLevel: 0.24,
 } as const;
 
 export const SIM = {
   /** Fixed sim timestep (s). */
   dt: 1 / 60,
   /** Target sim ticks/second (throttled below render; V10). */
-  ticksPerSecond: 30,
+  ticksPerSecond: 20,
   /** Max sim substeps per frame (anti spiral-of-death; V10). */
   maxStepsPerFrame: 4,
 

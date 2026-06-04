@@ -13,17 +13,20 @@ import {
 import { WebGPURenderer } from 'three/webgpu';
 import { OrbitController } from './OrbitController';
 import { PlanetMesh, makeFlatSolidMaterial } from '../planet/PlanetMesh';
-import { buildHeightTexture } from '../planet/heightField';
+import { buildHeightTexture, buildLooseTexture, buildHardnessTexture } from '../planet/heightField';
 import { makeTerrainMaterial } from '../materials/terrainMaterial';
 import { HeightFields, FieldSet, buildSeedCompute } from '../sim/fields';
 import { buildSeamTable, type SeamTable } from '../planet/seamTable';
 import { SeamSync } from '../sim/passes/seamCopy';
 import { NormalBaker } from '../sim/passes/normals';
 import { Simulation } from '../sim/Simulation';
+import { LavaSim } from '../sim/LavaSim';
 import { makeWaterMaterial } from '../materials/waterMaterial';
+import { makeLavaMaterial } from '../materials/lavaMaterial';
 import { textureLoad } from 'three/tsl';
 import type { SampleFace } from '../tsl/surface';
 import { BrushTool } from '../tools/BrushTool';
+import { EmitterTool } from '../tools/Emitters';
 import { pickPlanet } from '../tools/picking';
 import {
   Controls,
@@ -49,12 +52,20 @@ export class Engine {
   planet!: PlanetMesh;
   heightFields!: HeightFields;
   brush!: BrushTool;
+  emitter!: EmitterTool;
+  private riverMode = false;
+  // small footprint (near point source) + modest rate -> a stream, not a dome.
+  readonly riverSettings = { rate: 0.02, radius: 0.012 };
   seamSync!: SeamSync;
   seamTable!: SeamTable;
   simulation!: Simulation;
+  lavaSim!: LavaSim;
+  private volcanoEmitter!: EmitterTool;
+  private volcanoMode = false;
   private terrainNormals!: FieldSet;
   private terrainBaker!: NormalBaker;
   private waterPlanet!: PlanetMesh;
+  private lavaPlanet!: PlanetMesh;
 
   // Sculpt input state.
   private sculptMode = false;
@@ -129,17 +140,32 @@ export class Engine {
     const sampleTerrain: SampleFace = (f, coord) =>
       textureLoad(this.heightFields.field(f).main, coord).x;
 
+    // Sim owns the loose-material field; create it before terrain materials so
+    // they can sample it for material coloring.
+    this.simulation = new Simulation(this.renderer, this.heightFields);
+    const n = this.heightFields.n;
+
     for (const face of FACES) {
-      const seed = buildHeightTexture(face, PLANET.res); // CPU DataTexture
       const field = this.heightFields.field(face);
-      // First compute pass: copy seed -> canonical storage texture.
-      this.renderer.compute(buildSeedCompute(seed.texture, field.main, this.heightFields.n));
+      // seed bedrock height + an uneven initial loose (soil/sand) layer.
+      this.renderer.compute(buildSeedCompute(buildHeightTexture(face, PLANET.res).texture, field.main, n));
+      this.renderer.compute(
+        buildSeedCompute(buildLooseTexture(face, PLANET.res).texture, this.simulation.loose.field(face).main, n),
+      );
+      this.renderer.compute(
+        buildSeedCompute(buildHardnessTexture(face, PLANET.res).texture, this.simulation.hardness.field(face).main, n),
+      );
       this.brush.register(face, field);
 
-      // cheap material: center displacement + sampled baked normal.
+      // cheap material: displacement + baked normal + material (rock/soil) color.
       this.planet.setFaceMaterial(
         face,
-        makeTerrainMaterial(face, field.main, this.terrainNormals.field(face).main).material,
+        makeTerrainMaterial(
+          face,
+          field.main,
+          this.simulation.loose.field(face).main,
+          this.terrainNormals.field(face).main,
+        ).material,
       );
     }
 
@@ -157,8 +183,6 @@ export class Engine {
     this.terrainBaker.bake(this.renderer);
     this.brush.warmup(this.renderer); // V8: compile pipelines up front
 
-    // M4: hydraulic water sim + water surface meshes.
-    this.simulation = new Simulation(this.renderer, this.heightFields);
     await this.simulation.warmup();
     this.waterPlanet = new PlanetMesh(PLANET.res, PLANET.baseRadius, makeFlatSolidMaterial());
     for (const face of FACES) {
@@ -173,20 +197,52 @@ export class Engine {
       );
     }
     this.scene.add(this.waterPlanet.group);
+    this.emitter = new EmitterTool(this.simulation.waterSource, this.heightFields.n);
+
+    // M8: lava sim + emissive lava meshes + volcano emitter.
+    this.lavaSim = new LavaSim(this.renderer, this.heightFields, this.seamTable);
+    this.lavaPlanet = new PlanetMesh(PLANET.res, PLANET.baseRadius, makeFlatSolidMaterial());
+    for (const face of FACES) {
+      this.lavaPlanet.setFaceMaterial(
+        face,
+        makeLavaMaterial(
+          face,
+          this.heightFields.field(face).main,
+          this.lavaSim.lava.field(face).main,
+          this.lavaSim.heat.field(face).main,
+          this.terrainNormals.field(face).main,
+        ),
+      );
+    }
+    this.scene.add(this.lavaPlanet.group);
+    this.volcanoEmitter = new EmitterTool(this.lavaSim.lavaSource, this.heightFields.n);
+
     this.setSim(this.simulation);
 
     this.controls = new Controls({
       brush: this.brushSettings,
       water: this.waterSettings,
+      river: this.riverSettings,
       erosion: this.erosionSettings,
       onRainChange: () => this.applyRain(),
       onClearWater: () => this.simulation.clearWater(),
+      onClearSources: () => this.emitter.clear(this.renderer),
       onErosionChange: () => this.simulation.setErosion(this.erosionSettings.enabled),
     });
     this.sidebar = new Sidebar({
       brush: this.brushSettings,
       isSculpt: () => this.sculptMode,
       setSculpt: (on) => this.setSculpt(on),
+      isRiver: () => this.riverMode,
+      setRiver: (on) => {
+        this.riverMode = on;
+        if (on) this.volcanoMode = false;
+      },
+      isVolcano: () => this.volcanoMode,
+      setVolcano: (on) => {
+        this.volcanoMode = on;
+        if (on) this.riverMode = false;
+      },
       isRain: () => this.waterSettings.rainOn,
       toggleRain: () => {
         this.waterSettings.rainOn = !this.waterSettings.rainOn;
@@ -219,6 +275,17 @@ export class Engine {
   private applyBrush(): void {
     const pick = pickPlanet(this.ndc, this.camera, this.planet.group, PLANET.res);
     if (!pick) return;
+    if (this.riverMode) {
+      // place/extend a continuous river source (persists, emits each tick).
+      this.emitter.stamp(this.renderer, pick.dir, this.riverSettings.rate, this.riverSettings.radius);
+      return;
+    }
+    if (this.volcanoMode) {
+      // place a volcano vent: continuous hot lava source.
+      this.volcanoEmitter.stamp(this.renderer, pick.dir, 0.05, 0.014);
+      this.lavaSim.active = true;
+      return;
+    }
     this.brush.stamp(this.renderer, pick.dir, this.brushSettings);
     this.terrainBaker.bake(this.renderer); // height changed -> rebake normals
   }
@@ -285,15 +352,18 @@ export class Engine {
       this.simAccumulator += dt;
       let steps = 0;
       while (this.simAccumulator >= this.simInterval && steps < SIM.maxStepsPerFrame) {
-        this.sim.tick(SIM.dt);
+        this.sim.tick(this.simInterval); // real-time step (was SIM.dt -> 1/3 speed)
+        this.lavaSim.tick(this.simInterval);
         this.simAccumulator -= this.simInterval;
         steps++;
       }
       if (this.simAccumulator > this.simInterval * SIM.maxStepsPerFrame) {
         this.simAccumulator = 0; // drop backlog rather than spiral
       }
-      // erosion mutates bedrock -> rebake terrain normals.
-      if (steps > 0 && this.erosionSettings.enabled) this.terrainBaker.bake(this.renderer);
+      // rebake terrain normals when erosion or lava changed bedrock.
+      if (this.simulation.terrainChanged || this.lavaSim.terrainChanged) {
+        this.terrainBaker.bake(this.renderer);
+      }
     }
 
     // Coalesced brush: at most one stamp per frame regardless of how many

@@ -99,11 +99,16 @@ export class HeightFields {
 
 /** Fill a storage texture with zero. */
 export function buildFillZero(dst: StorageTexture, n: number) {
+  return buildFillValue(dst, n, 0);
+}
+
+/** Fill a storage texture's .x with a constant. */
+export function buildFillValue(dst: StorageTexture, n: number, value: number) {
   const N = uint(n);
   const fn = Fn(() => {
     const x = instanceIndex.mod(N);
     const y = instanceIndex.div(N);
-    textureStore(dst, uvec2(x, y), vec4(0, 0, 0, 1)).toWriteOnly();
+    textureStore(dst, uvec2(x, y), vec4(value, 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(n * n);
 }

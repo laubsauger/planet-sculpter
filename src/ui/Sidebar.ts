@@ -9,6 +9,10 @@ export interface SidebarHandles {
   brush: BrushSettings;
   isSculpt(): boolean;
   setSculpt(on: boolean): void;
+  isRiver(): boolean;
+  setRiver(on: boolean): void;
+  isVolcano(): boolean;
+  setVolcano(on: boolean): void;
   isRain(): boolean;
   toggleRain(): void;
 }
@@ -81,6 +85,8 @@ export class Sidebar {
   private toolBtns = new Map<BrushMode, HTMLButtonElement>();
   private sculptToggle!: HTMLDivElement;
   private rainToggle!: HTMLDivElement;
+  private riverBtn!: HTMLButtonElement;
+  private volcanoBtn!: HTMLButtonElement;
 
   constructor(private readonly h: SidebarHandles) {
     const style = document.createElement('style');
@@ -110,15 +116,47 @@ export class Sidebar {
       btn.innerHTML = `<svg viewBox="0 0 20 20">${t.icon}</svg><span>${t.label}</span>`;
       btn.onclick = () => {
         this.h.brush.mode = t.mode;
-        if (!this.h.isSculpt()) {
-          this.h.setSculpt(true);
-        }
+        this.h.setRiver(false);
+        this.h.setVolcano(false);
+        if (!this.h.isSculpt()) this.h.setSculpt(true);
         this.sync();
       };
       grid.appendChild(btn);
       this.toolBtns.set(t.mode, btn);
     }
     this.el.appendChild(grid);
+
+    // river-source tool (full-width)
+    this.riverBtn = document.createElement('button');
+    this.riverBtn.className = 'ps-tool';
+    this.riverBtn.style.flexDirection = 'row';
+    this.riverBtn.style.justifyContent = 'center';
+    this.riverBtn.style.gap = '6px';
+    this.riverBtn.style.marginTop = '6px';
+    this.riverBtn.innerHTML =
+      `<svg viewBox="0 0 20 20" style="width:16px;height:16px"><path d="M3 5 q4 4 8 0 t6 2 v3 q-3 2 -6 0 t-8 0 Z" fill="currentColor"/></svg><span>River source</span>`;
+    this.riverBtn.onclick = () => {
+      this.h.setRiver(true);
+      if (!this.h.isSculpt()) this.h.setSculpt(true);
+      this.sync();
+    };
+    this.el.appendChild(this.riverBtn);
+
+    // volcano tool (full-width)
+    this.volcanoBtn = document.createElement('button');
+    this.volcanoBtn.className = 'ps-tool';
+    this.volcanoBtn.style.flexDirection = 'row';
+    this.volcanoBtn.style.justifyContent = 'center';
+    this.volcanoBtn.style.gap = '6px';
+    this.volcanoBtn.style.marginTop = '6px';
+    this.volcanoBtn.innerHTML =
+      `<svg viewBox="0 0 20 20" style="width:16px;height:16px"><path d="M7 4 h6 l4 12 H3 Z" fill="currentColor"/><path d="M8 4 l2 -2 l2 2" fill="none" stroke="#ff7a3c" stroke-width="2"/></svg><span>Volcano</span>`;
+    this.volcanoBtn.onclick = () => {
+      this.h.setVolcano(true);
+      if (!this.h.isSculpt()) this.h.setSculpt(true);
+      this.sync();
+    };
+    this.el.appendChild(this.volcanoBtn);
 
     // brush sliders
     const h2b = document.createElement('h2');
@@ -190,9 +228,14 @@ export class Sidebar {
 
   /** Reflect external state changes (hotkeys). */
   sync(): void {
+    const river = this.h.isRiver();
+    const volcano = this.h.isVolcano();
+    const sculptBrush = this.h.isSculpt() && !river && !volcano;
     for (const [mode, btn] of this.toolBtns) {
-      btn.classList.toggle('active', this.h.isSculpt() && this.h.brush.mode === mode);
+      btn.classList.toggle('active', sculptBrush && this.h.brush.mode === mode);
     }
+    this.riverBtn.classList.toggle('active', this.h.isSculpt() && river);
+    this.volcanoBtn.classList.toggle('active', this.h.isSculpt() && volcano);
     this.sculptToggle.classList.toggle('on', this.h.isSculpt());
     this.rainToggle.classList.toggle('on', this.h.isRain());
   }

@@ -29,7 +29,7 @@ V2: ⊥ read & write same StorageTexture in one pass. neighbor-dependent passes 
 V3: sim reads via `textureLoad(tex,ivec2)`, writes via `textureStore(tex,ivec2,val)`. ⊥ one StorageTexture bound both in one computeNode.
 V4: flux pass ! scale-clamp K so outflow ≤ available water. clamp `d≥0` & `s≥0`. → no explode/negative.
 V5: face tex alloc `(RES+2)²` w/ 1-texel apron. seamCopy pass each tick syncs aprons of changed fields (b,d,s min) → water/sediment cross seams & ⊥ vertex cracks.
-V6: height stored as offset from base radius (`r32float`). radius added only @ vertex stage → float precision.
+V6: height stored as offset from base radius (`r32float`). radius added only @ vertex stage → float precision. ∴ gravity = radial-to-core implicitly: flux flows high→low (b+d) radial height. ⊥ world-axis gravity.
 V7: sim pass order fixed: addWater→flux→waterDepth+velocity→erosion/deposition→sedimentAdvect→evaporation→thermal→seamCopy.
 V8: `await renderer.init()` before any render/compute. warm-up each compute pipeline once @ startup → no first-use hitch.
 V9: `Fn`/node graphs built once, reused. ⊥ rebuild per frame → no pipeline recompile stall.
@@ -45,7 +45,8 @@ V18: material height sampling ! texel-exact `textureLoad(ivec2(round(uv*res)))`,
 V19: fluid sim ! conserve mass. face borders sealed (flux & inflow=0 at walls) — clamped neighbor read at border = self → phantom inflow → explosion. cross-face via conservative seam diffusion. total = ∫source - ∫loss.
 V20: fluid solver reusable: `makeFluidUniforms()` + `buildAddSource/buildFlux/buildDepth(...,p)` parameterized. water & lava share solver; differ by consts (pipeArea=visc, loss=evap/cool, source) + terrain coupling (erode vs solidify, separate pass).
 V21: erosion ! bounded: v ÷ min-depth (⊥ ÷~0) & clamp ±3; tilt≤0.5, speed≤3; gate by water d>0.004; cap erode/dep per step. else bedrock→∞.
-V22: surface normals BAKED to texture via compute (`sim/passes/normals.ts` NormalBaker) on change (brush/erosion/water tick), material samples (`bakedSurface`). fragment cost res-independent. res=512.
+V22: surface normals BAKED to texture via compute (`sim/passes/normals.ts` NormalBaker) on change (brush/erosion/water tick), material samples (`bakedSurface`). fragment cost res-independent. res=512. normal = cross(displaced neighbor positions), cross-seam neighbor uses NEIGHBOR face dir → seamless flat+sloped. ⊥ radial+tangent form (breaks sloped seams, B9).
+V23: terrain = 2 layers: hard rock + `loose` (soil/sand) on top. b=total height (unchanged for flux/render). erosion: softness = max(rockErodibility, loose/looseFull); erode removes loose first then rock; ALL deposit → loose. loose seeded w/ own fbm (varied). color: rock(grey) where loose thin|steep, soil/grass/sand/snow where loose.
 
 ## §T TASKS
 id|status|task|cites
@@ -60,12 +61,12 @@ T8|x|M1 `src/materials/terrainMaterial.ts` displace + flat normals + biome graph
 T9|x|M2 `src/tools/picking.ts` ray→sphere→(face,u,v)→texel|C
 T10|x|M2 `src/tools/BrushTool.ts` GPU stamp raise/lower/smooth/flatten. DIRECTION-space (center=sphere dir, all faces stamped, `tsl/warpNode.ts` faceDirNode V1) → paints across seams, no crease|V1,V3,V9
 T11|x|M3 `src/planet/seamTable.ts` 24-edge map (auto-derived, 8 tests) + `sim/passes/seamCopy.ts` (avg shared-edge texels, 3-way corners). Fields refactored to canonical `main`+`scratch` (read main→write scratch→copy back), ⊥ swap/rebind|V5,V13
-T12|x|M4 `sim/passes/water.ts` (addWater+flux+depth, pipe-model Mei et al., scale-clamp V4) + `materials/waterMaterial.ts` (surface b+d, depth-tint, transparent). cross-seam flow ⊥ yet (no apron, borders=walls)→M5|V2,V3,V4,V7
+T12|x|M4 `sim/passes/water.ts` pipe-model (Mei) addSource+flux+depth, scale-clamp V4, flux damping (settle), borders sealed (conserve V19). cross-seam via `passes/seamFlux.ts` (surface-diff exchange → continuous water surface + flow across faces). `materials/waterMaterial.ts` depth-tint + baked normal|V2,V3,V4,V7,V19
 T13|x|M4 `src/sim/Simulation.ts` pass order addWater→flux→depth+evap, canonical main→scratch→copy (⊥ swap)|V2,V7
-T14|~|M5 `sim/passes/erosion.ts` (velocity+erode/deposit+advect) wired in Simulation behind toggle + GUI Kc/Ks/Kd. b&s seam-synced/tick. UNVERIFIED visually, needs tuning|V4,V7
-T15|.|M6 `sim/passes/thermal.ts` slump past talus|V2,V7
-T16|.|M7 `src/tools/{Emitters,climate}.ts` springs/volcano + sea-level/climate uniforms|I.ui
-T17|.|M8 lava: REUSE `passes/water.ts` fluid solver via `makeFluidUniforms` (high visc, vent source, cooling loss) + new cool→solidify-to-bedrock pass + heat field + `materials/lavaMaterial.ts` emissive glow|V7,V12,V20
+T14|x|M5 `sim/passes/erosion.ts` velocity+erode/deposit+advect. clamped (V21), flow-gated (only fast water erodes; slow deposits→fills pools). toggle + GUI|V4,V7,V21
+T15|x|M6 thermal slump `buildThermal` in `erosion.ts` (material steeper than talus → lower neighbors, conservative). smooths spikes. runs each erosion tick|V2,V7
+T16|x|M7 river springs (`tools/Emitters.ts`, sidebar River tool) + SEA LEVEL (`planet/SeaMesh.ts` ocean icosphere @ baseR+seaLevel*heightScale, GUI slider, terrain beach/coastline + submerged darkening). climate temperature → later w/ biomes|I.ui
+T17|x|M8 lava: `sim/LavaSim.ts` reuses fluid solver (`makeFluidUniforms` viscous, vent source) + `passes/lava.ts` cool→solidify-to-bedrock + heat. `materials/lavaMaterial.ts` ember→white-hot emissive. Volcano sidebar tool. Throttled 3rd tick (freq only, ⊥ dt-scale=unstable)|V7,V12,V20
 T18|~|M9 polish. DONE EARLY: `ui/Controls.ts` (lil-gui) + `ui/Sidebar.ts` (glass tool panel). PERF: baked normals (V22) → res 512. REMAIN: water waves, biome bands, debug field view, verify 60fps lock|V10,V22,I.ui
 T19|.|fps counter + per-milestone visual verify|V10
 
@@ -79,3 +80,4 @@ B5|2026-06-03|screen-space `normalFlat` computed per face-mesh → hard shading 
 B6|2026-06-03|material sampled height by uv+NearestFilter on (res+1) tex → vertex k drifts to texel k±1 near edges → geometric groove along seams|V18 ∴ sample by exact int texel `textureLoad(round(uv*res))`, seam-aware neighbor read across edges
 B7|2026-06-04|flux/depth border neighbor reads clamped to self → each face edge cell counts own flux as inflow → phantom water, brief rain → huge oceans|V19 ∴ seal borders (flux & inflow=0 at walls), cross-face via seam diffusion
 B8|2026-06-04|erosion: velocity = flux/depth w/ depth~0 → huge speed → unbounded erode/deposit → bedrock→∞ (vertices streak to infinity)|V21 ∴ clamp v (÷min-depth, ±3), clamp tilt/speed, gate by water, cap erode/dep per step
+B9|2026-06-04|baked normal via radial+tangent (Dc - Tu*slope) fixed flat-water seam but per-face Tu/Tv mismatch reintroduced seam on SLOPED terrain|V22 ∴ normal = cross of displaced neighbor positions (neighbor face dir), seamless flat+sloped, ~9 faceDirNode (1 neighbor/offset)

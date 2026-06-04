@@ -6,7 +6,7 @@
 import type { WebGPURenderer } from 'three/webgpu';
 import { Fn, instanceIndex, textureStore, uvec2, uint, int, vec4 } from 'three/tsl';
 import { FACES, type FaceName } from '../../config';
-import { makePosAt, objNormalAt, type SampleFace } from '../../tsl/surface';
+import { objNormalAt, type SampleFace } from '../../tsl/surface';
 import type { SeamTable } from '../../planet/seamTable';
 import type { FieldSet } from '../fields';
 
@@ -19,11 +19,10 @@ function buildNormalCompute(
   out: Parameters<typeof textureStore>[0],
   n: number,
 ): ComputeNode {
-  const posAt = makePosAt(face, sample, table);
   const fn = Fn(() => {
     const x = instanceIndex.mod(uint(n));
     const y = instanceIndex.div(uint(n));
-    const objN = objNormalAt(posAt, int(x), int(y));
+    const objN = objNormalAt(face, sample, table, int(x), int(y));
     textureStore(out, uvec2(x, y), vec4(objN, 1)).toWriteOnly();
   });
   return fn().compute(n * n) as ComputeNode;

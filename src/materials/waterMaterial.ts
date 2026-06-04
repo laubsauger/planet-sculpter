@@ -1,16 +1,15 @@
-// Water surface material (M4). Cheap: center displacement at (b+d) + baked
-// normal. Depth-tinted, hidden where dry.
+// Water surface material (M4). Baked-normal surface at (b+d). Color by water
+// DEPTH: shallow = turquoise, deep = deep blue. Hidden where dry.
 
 import type { Texture } from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
-import { texture as sampleTex, textureLoad, uv, mix, smoothstep, vec3 } from 'three/tsl';
+import { textureLoad, ivec2, uv, mix, smoothstep, vec3 } from 'three/tsl';
 import { bakedSurface } from '../tsl/surface';
-import type { FaceName } from '../config';
+import { PLANET, type FaceName } from '../config';
 
-const SHALLOW = vec3(0.30, 0.62, 0.78);
-const DEEP = vec3(0.05, 0.20, 0.42);
-/** below this water depth, fully transparent. */
-const MIN_DEPTH = 0.004;
+const SHALLOW = vec3(0.28, 0.66, 0.74); // turquoise
+const DEEP = vec3(0.03, 0.16, 0.42); // deep blue
+const MIN_DEPTH = 0.003;
 
 export function makeWaterMaterial(
   face: FaceName,
@@ -18,15 +17,21 @@ export function makeWaterMaterial(
   depthTex: Texture,
   normalTex: Texture,
 ): MeshStandardNodeMaterial {
+  const res = PLANET.res;
+  const cx = uv().x.mul(res).add(0.5).floor().toInt();
+  const cy = uv().y.mul(res).add(0.5).floor().toInt();
+  const coord = ivec2(cx, cy);
+
   const s = bakedSurface(
     face,
-    (coord) => textureLoad(heightTex, coord).x.add(textureLoad(depthTex, coord).x),
+    (c) => textureLoad(heightTex, c).x.add(textureLoad(depthTex, c).x),
     normalTex,
   );
-  const d = sampleTex(depthTex, uv()).x;
+  // exact texel depth (texture(uv) on r32float storage is unreliable).
+  const d = textureLoad(depthTex, coord).x;
 
-  const col = mix(SHALLOW, DEEP, smoothstep(0.0, 0.15, d));
-  const opacity = smoothstep(MIN_DEPTH, MIN_DEPTH * 3, d).mul(0.85);
+  const col = mix(SHALLOW, DEEP, smoothstep(0.004, 0.06, d));
+  const opacity = smoothstep(MIN_DEPTH, MIN_DEPTH * 3, d).mul(0.88);
 
   const mat = new MeshStandardNodeMaterial({ roughness: 0.5, metalness: 0, transparent: true });
   mat.positionNode = s.position;
