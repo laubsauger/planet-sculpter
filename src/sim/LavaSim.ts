@@ -43,6 +43,7 @@ export class LavaSim {
     private readonly renderer: WebGPURenderer,
     height: HeightFields,
     table: SeamTable,
+    cellArea: FieldSet,
   ) {
     const n = height.n;
     this.lava = new FieldSet(n, false);
@@ -58,10 +59,11 @@ export class LavaSim {
       const src = this.lavaSource.field(face).main;
       const ht = this.heat.field(face);
       const f = this.flux.field(face);
+      const area = cellArea.field(face).main;
       this.passes.set(face, {
-        flux: buildFlux(b.main, lv.main, f.main, f.scratch, n, lavaUniforms),
+        flux: buildFlux(b.main, lv.main, f.main, f.scratch, n, lavaUniforms, area),
         copyFlux: buildCopyCompute(f.scratch, f.main, n) as ComputeNode,
-        update: buildFluidUpdate(lv.main, f.main, b.main, src, src, lv.scratch, n, lavaUniforms, false),
+        update: buildFluidUpdate(lv.main, f.main, b.main, src, src, lv.scratch, n, lavaUniforms, false, area),
         copyLava: buildCopyCompute(lv.scratch, lv.main, n) as ComputeNode,
         cool: buildLavaCool(lv.main, ht.main, b.main, src, lv.scratch, ht.scratch, b.scratch, n),
         copyLava3: buildCopyCompute(lv.scratch, lv.main, n) as ComputeNode,

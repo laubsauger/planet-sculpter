@@ -29,6 +29,7 @@ export function makeTerrainMaterial(
   heightTex: Texture,
   looseTex: Texture,
   normalTex: Texture,
+  vizTex: Texture,
 ): TerrainMaterial {
   const res = PLANET.res;
   const cx = uv().x.mul(res).add(0.5).floor().toInt();
@@ -56,6 +57,15 @@ export function makeTerrainMaterial(
   col = mix(col, SAND, smoothstep(0.05, 0.0, above.abs()).mul(0.7));
   const wet = smoothstep(0.0, -0.05, above); // 1 below sea level
   col = col.mul(mix(float(1), float(0.5), wet));
+
+  // From-Dust style activity tint (V35): fresh erosion = dark wet-earth streaks,
+  // fresh deposition = light sediment fans. Decays in the sim (erosionViz).
+  const vizD = textureLoad(vizTex, coord);
+  // only strong fresh activity tints (avoid washing the whole surface).
+  const eroded = smoothstep(0.25, 1.0, vizD.x);
+  const deposited = smoothstep(0.25, 1.0, vizD.y);
+  col = mix(col, vec3(0.3, 0.22, 0.16), eroded.mul(0.3)); // dark fresh-cut earth
+  col = mix(col, vec3(0.78, 0.72, 0.56), deposited.mul(0.28)); // pale sediment fan
 
   const mat = new MeshStandardNodeMaterial({ roughness: 0.95, metalness: 0 });
   mat.positionNode = s.position;

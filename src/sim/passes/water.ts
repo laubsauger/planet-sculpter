@@ -60,6 +60,10 @@ export type FluidUniforms = ReturnType<typeof makeFluidUniforms>;
  *  sloshing -> clean velocity field for erosion). Raise loss for rain use. */
 export const waterUniforms = makeFluidUniforms({ loss: 0.0003, pipeArea: 4, damping: 0.88 });
 
+/** Sediment-driven viscosity (V34): muddy water flows slower. effectiveFlowRate
+ *  = flowRate / (1 + conc*mud), clamped. 0 = off. */
+export const mudViscosityFactor = uniform(0); // disabled: was stalling rivers (muddy->slow->evaporate->fizzle)
+
 const EPS = 1e-6;
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -97,6 +101,26 @@ export function buildSeaFill(
   return fn().compute(n * n) as ComputeNode;
 }
 
+/** Combine bedrock + water depth (vol/area) into a single surface-height tex.
+ *  Lets the water normal bake sample ONE texture per face (b+water+area = 3/face
+ *  blew past the 16 sampled-texture compute limit across 5 cross-seam faces). */
+export function buildSurfaceCombine(
+  b: StorageTexture,
+  d: StorageTexture,
+  area: StorageTexture,
+  out: StorageTexture,
+  n: number,
+): ComputeNode {
+  const fn = Fn(() => {
+    const { x, y, ix, iy } = coords(n);
+    const surf = textureLoad(b, ivec2(ix, iy)).x.add(
+      textureLoad(d, ivec2(ix, iy)).x.div(max(textureLoad(area, ivec2(ix, iy)).x, float(EPS))),
+    );
+    textureStore(out, uvec2(x, y), vec4(surf, 0, 0, 1)).toWriteOnly();
+  });
+  return fn().compute(n * n) as ComputeNode;
+}
+
 /** d += (uniform source [rain] + per-texel source map [emitters]) * dt. */
 export function buildAddSource(
   d: StorageTexture,
@@ -123,6 +147,8 @@ export function buildFlux(
   fOut: StorageTexture,
   n: number,
   p: FluidUniforms,
+  area: StorageTexture,
+  sediment?: StorageTexture,
 ): ComputeNode {
   const res = n - 1;
   const fn = Fn(() => {
@@ -132,14 +158,24 @@ export function buildFlux(
     const ym = clamp(iy.sub(1), res);
     const yp = clamp(iy.add(1), res);
 
+    // d is VOLUME; surface = bedrock + depth, depth = vol/area (V31).
     const surf = (cx: any, cy: any) =>
-      textureLoad(b, ivec2(cx, cy)).x.add(textureLoad(d, ivec2(cx, cy)).x);
+      textureLoad(b, ivec2(cx, cy)).x.add(
+        textureLoad(d, ivec2(cx, cy)).x.div(max(textureLoad(area, ivec2(cx, cy)).x, float(EPS))),
+      );
 
     const hc = surf(ix, iy);
-    const dc = textureLoad(d, ivec2(ix, iy)).x;
+    const dc = textureLoad(d, ivec2(ix, iy)).x; // volume available this step
     const prev = textureLoad(fPrev, ivec2(ix, iy));
 
-    const k = p.dt.mul(p.pipeArea).mul(p.gravity).div(p.pipeLength);
+    let k: any = p.dt.mul(p.pipeArea).mul(p.gravity).div(p.pipeLength);
+    // V34: muddy water (high sediment concentration) flows slower -> deltas /
+    // viscous basins. visc clamped so it can't fully freeze flow.
+    if (sediment) {
+      const conc = textureLoad(sediment, ivec2(ix, iy)).x.div(max(dc, float(EPS)));
+      const visc = float(1).add(conc.mul(mudViscosityFactor)).min(float(8));
+      k = k.div(visc);
+    }
 
     // damped flux accumulator: retained momentum decays each step -> no endless sloshing.
     let fL = max(float(0), prev.x.mul(p.damping).add(k.mul(hc.sub(surf(xm, iy)))));
@@ -185,6 +221,7 @@ export function buildFluidUpdate(
   n: number,
   p: FluidUniforms,
   useSea: boolean,
+  area: StorageTexture,
 ): ComputeNode {
   const res = n - 1;
   const fn = Fn(() => {
@@ -208,15 +245,18 @@ export function buildFluidUpdate(
       .add(textureLoad(f, ivec2(ix, ym)).z.mul(mB));
 
     const l2 = p.pipeLength.mul(p.pipeLength);
+    // d is VOLUME. flow delta is already volume (flux*dt); loss/rain/source are
+    // depth rates -> multiply by cell area to get volume (V31).
+    const areaC = max(textureLoad(area, ivec2(ix, iy)).x, float(EPS));
     const emit = textureLoad(source, ivec2(ix, iy)).x;
     // regional rain = global rate * local rainfall map (wet/dry climate zones).
     const rain = p.source.mul(textureLoad(rainfall, ivec2(ix, iy)).x);
-    let next: any = inflow.sub(outflow).mul(p.dt).div(l2).add(dc); // flow
-    next = next.sub(p.loss.mul(p.dt)); // evap / cooling
-    next = next.add(rain.add(emit).mul(p.dt)); // regional rain + emitter source
+    let next: any = inflow.sub(outflow).mul(p.dt).div(l2).add(dc); // flow (volume)
+    next = next.sub(p.loss.mul(p.dt).mul(areaC)); // evap / cooling (depth->vol)
+    next = next.add(rain.add(emit).mul(p.dt).mul(areaC)); // rain + emitter (depth->vol)
     if (useSea) {
       const below = textureLoad(b, ivec2(ix, iy)).x.mul(-1).add(seaLevelUniform); // seaLevel - b
-      const need = below.max(float(0));
+      const need = below.max(float(0)).mul(areaC); // VOLUME needed to reach sea level
       // deep-ocean cells pinned almost exactly to sea level (one global flat
       // level -> no per-face cube / streaks); only shallow shore/rivers keep the
       // free sim. ramp quickly with depth.

@@ -181,12 +181,14 @@ export function buildHardnessTexture(face: FaceName, res: number): HeightTexture
       const u = -1 + (2 * i) / res;
       const v = -1 + (2 * j) / res;
       const dir = faceUVToDir(face, u, v);
-      // higher frequency + more contrast -> finer, sharper channel nucleation
-      // so rivers concentrate into narrow paths instead of a wide bias.
+      // MULTI-SCALE erodibility (higher = softer): large resistant REGIONS that
+      // rivers must wind around + mid + fine variation for channel nucleation.
+      // Strong contrast so flow deflects naturally instead of shooting straight.
+      const lo = valueNoise(dir[0] * 2.5 + 13, dir[1] * 2.5 - 6, dir[2] * 2.5 + 21); // big zones
       const t = valueNoise(dir[0] * 7 - 5.2, dir[1] * 7 + 3.7, dir[2] * 7 - 1.9);
       const t2 = valueNoise(dir[0] * 14 + 2, dir[1] * 14 - 8, dir[2] * 14 + 5);
-      const r = t * 0.65 + t2 * 0.35;
-      data[j * n + i] = 0.25 + Math.pow(r, 1.4) * 1.7; // wider, sharper resistance range
+      const r = lo * 0.45 + t * 0.37 + t2 * 0.18;
+      data[j * n + i] = 0.12 + Math.pow(r, 1.9) * 2.5; // wide [~0.12, ~2.6], sharp contrast
     }
   }
   const texture = new DataTexture(data, n, n, RedFormat, FloatType);

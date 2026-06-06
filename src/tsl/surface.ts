@@ -15,6 +15,7 @@ import {
   normalize,
   modelViewMatrix,
   textureLoad,
+  If,
 } from 'three/tsl';
 import type { Texture } from 'three';
 import { faceDirNode } from './warpNode';
@@ -47,7 +48,10 @@ export function seamHeight(
   const res = PLANET.res;
   const R = int(res);
   const Z = int(0);
-  const hSelf = sample(face, ivec2(tx.max(Z).min(R), ty.max(Z).min(R)));
+  // interior/border split (T27, V32): `If` (real control flow) so interior
+  // cells skip the cross-seam neighbor textureLoad entirely. `select` evaluated
+  // both branches -> every cell paid the seam cost.
+  const h = sample(face, ivec2(tx.max(Z).min(R), ty.max(Z).min(R))).toVar();
 
   const nH = (edge: EdgeId, vary: any) => {
     const seam = table[face][edge];
@@ -57,10 +61,18 @@ export function seamHeight(
     return sample(seam.nFace, ivec2(nx, ny));
   };
 
-  let h = tx.lessThan(Z).select(nH(0 as EdgeId, ty), hSelf);
-  h = tx.greaterThan(R).select(nH(1 as EdgeId, ty), h);
-  h = ty.lessThan(Z).select(nH(2 as EdgeId, tx), h);
-  h = ty.greaterThan(R).select(nH(3 as EdgeId, tx), h);
+  If(tx.lessThan(Z), () => {
+    h.assign(nH(0 as EdgeId, ty));
+  });
+  If(tx.greaterThan(R), () => {
+    h.assign(nH(1 as EdgeId, ty));
+  });
+  If(ty.lessThan(Z), () => {
+    h.assign(nH(2 as EdgeId, tx));
+  });
+  If(ty.greaterThan(R), () => {
+    h.assign(nH(3 as EdgeId, tx));
+  });
   return h;
 }
 
@@ -98,11 +110,26 @@ export function objNormalAt(
     return faceDirNode(seam.nFace, u, v).mul(baseR.add(h.mul(s)));
   };
 
+  // interior/border split (T27, V32): `If` so interior cells compute only the
+  // 5 same-face positions; the neighbor-face `faceDirNode` (expensive) runs only
+  // on the 4 edges. `select` used to eval both -> ~9 faceDirNode every cell.
   const pc = selfPos(cx, cy);
-  const pXp = cx.add(1).greaterThan(R).select(neighborPos(1 as EdgeId, cy), selfPos(cx.add(1), cy));
-  const pXm = cx.sub(1).lessThan(Z).select(neighborPos(0 as EdgeId, cy), selfPos(cx.sub(1), cy));
-  const pYp = cy.add(1).greaterThan(R).select(neighborPos(3 as EdgeId, cx), selfPos(cx, cy.add(1)));
-  const pYm = cy.sub(1).lessThan(Z).select(neighborPos(2 as EdgeId, cx), selfPos(cx, cy.sub(1)));
+  const pXp = selfPos(cx.add(1), cy).toVar();
+  If(cx.add(1).greaterThan(R), () => {
+    pXp.assign(neighborPos(1 as EdgeId, cy));
+  });
+  const pXm = selfPos(cx.sub(1), cy).toVar();
+  If(cx.sub(1).lessThan(Z), () => {
+    pXm.assign(neighborPos(0 as EdgeId, cy));
+  });
+  const pYp = selfPos(cx, cy.add(1)).toVar();
+  If(cy.add(1).greaterThan(R), () => {
+    pYp.assign(neighborPos(3 as EdgeId, cx));
+  });
+  const pYm = selfPos(cx, cy.sub(1)).toVar();
+  If(cy.sub(1).lessThan(Z), () => {
+    pYm.assign(neighborPos(2 as EdgeId, cx));
+  });
 
   const outward = normalize(pc);
   let n = normalize(cross(pXp.sub(pXm), pYp.sub(pYm)));

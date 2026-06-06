@@ -22,7 +22,7 @@ import {
   If,
 } from 'three/tsl';
 import { FACES, type FaceName } from '../../config';
-import { type HeightFields, type FieldSet, buildCopyCompute } from '../fields';
+import { type FieldSet, buildCopyCompute } from '../fields';
 import { EDGES, type SeamTable, type EdgeId } from '../../planet/seamTable';
 import type { FluidUniforms } from './water';
 
@@ -34,7 +34,7 @@ const EPS = 1e-6;
 
 function buildSeamFlux(
   face: FaceName,
-  height: HeightFields,
+  surface: FieldSet,
   water: FieldSet,
   sediment: FieldSet,
   table: SeamTable,
@@ -42,7 +42,9 @@ function buildSeamFlux(
   p: FluidUniforms,
 ): ComputeNode {
   const res = n - 1;
-  const selfB = height.field(face).main;
+  // surface = b + depth (vol/area) precomputed -> 3 tex/face (surface,vol,sed)
+  // instead of 4 (b,vol,sed,area); 4×5 cross-seam faces = 20 > 16 limit.
+  const selfSurf = surface.field(face).main;
   const selfD = water.field(face).main;
   const selfS = sediment.field(face).main;
   const dOut = water.field(face).scratch;
@@ -55,9 +57,10 @@ function buildSeamFlux(
     const ix = int(x);
     const iy = int(y);
 
-    const dc: any = textureLoad(selfD, ivec2(ix, iy)).x.toVar();
-    const sc: any = textureLoad(selfS, ivec2(ix, iy)).x.toVar();
-    const surfC = textureLoad(selfB, ivec2(ix, iy)).x.add(dc);
+    // d/s are VOLUME/MASS. surface precomputed (b + vol/area); conc = mass/vol.
+    const dc: any = textureLoad(selfD, ivec2(ix, iy)).x.toVar(); // volume
+    const sc: any = textureLoad(selfS, ivec2(ix, iy)).x.toVar(); // mass
+    const surfC = textureLoad(selfSurf, ivec2(ix, iy)).x;
     // suspended sediment concentration (per unit water) carried by the flow.
     const cC = sc.div(max(dc, float(EPS)));
     const rate = p.pipeArea.mul(p.gravity).div(p.pipeLength);
@@ -66,7 +69,7 @@ function buildSeamFlux(
 
     for (const edge of EDGES) {
       const seam = table[face][edge as EdgeId];
-      const nbB = height.field(seam.nFace).main;
+      const nbSurf = surface.field(seam.nFace).main;
       const nbD = water.field(seam.nFace).main;
       const nbS = sediment.field(seam.nFace).main;
 
@@ -83,10 +86,10 @@ function buildSeamFlux(
       const bx = seam.nFixedIsX ? int(seam.nInwardVal) : varyI;
       const by = seam.nFixedIsX ? varyI : int(seam.nInwardVal);
 
-      const ndH = textureLoad(nbD, ivec2(bx, by)).x;
-      const surfN = textureLoad(nbB, ivec2(bx, by)).x.add(ndH);
+      const ndH = textureLoad(nbD, ivec2(bx, by)).x; // neighbor volume
+      const surfN = textureLoad(nbSurf, ivec2(bx, by)).x;
       // outflow if our surface is higher; clamp so we don't drain >half of ours
-      // or pull >half of the neighbor's water.
+      // or pull >half of the neighbor's water (volume clamps).
       const qDt = surfC.sub(surfN).mul(rate).mul(p.dt).max(ndH.mul(-0.5)).min(dc.mul(0.5));
       // sediment rides with the water: leaving water (qDt>0) carries OUR
       // concentration; arriving water (qDt<0) carries the NEIGHBOR's. Without
@@ -116,7 +119,7 @@ export class SeamFlux {
   private readonly copy: ComputeNode[] = [];
 
   constructor(
-    height: HeightFields,
+    surface: FieldSet,
     water: FieldSet,
     sediment: FieldSet,
     table: SeamTable,
@@ -124,7 +127,7 @@ export class SeamFlux {
     p: FluidUniforms,
   ) {
     for (const face of FACES) {
-      this.flux.set(face, buildSeamFlux(face, height, water, sediment, table, n, p));
+      this.flux.set(face, buildSeamFlux(face, surface, water, sediment, table, n, p));
       const w = water.field(face);
       const s = sediment.field(face);
       this.copy.push(buildCopyCompute(w.scratch, w.main, n) as ComputeNode);

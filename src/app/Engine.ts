@@ -9,7 +9,13 @@ import {
   HemisphereLight,
   Color,
   Vector2,
+  Mesh,
+  SphereGeometry,
 } from 'three';
+import { makeAtmosphereMaterial } from '../materials/atmosphereMaterial';
+import { makeCloudMaterial } from '../materials/cloudMaterial';
+import { makeRainMaterial } from '../materials/rainMaterial';
+import { storminess } from '../materials/cloudMaterial';
 import { WebGPURenderer } from 'three/webgpu';
 import { OrbitController } from './OrbitController';
 import { PlanetMesh, makeFlatSolidMaterial } from '../planet/PlanetMesh';
@@ -19,8 +25,9 @@ import {
   buildHardnessTexture,
   buildRainfallTexture,
 } from '../planet/heightField';
+import { buildCellAreaTexture } from '../planet/cellArea';
 import { makeTerrainMaterial } from '../materials/terrainMaterial';
-import { HeightFields, FieldSet, buildSeedCompute } from '../sim/fields';
+import { HeightFields, FieldSet, buildSeedCompute, buildFillZero } from '../sim/fields';
 import { buildSeamTable, type SeamTable } from '../planet/seamTable';
 import { SeamSync, NormalSeamSync } from '../sim/passes/seamCopy';
 import { NormalBaker } from '../sim/passes/normals';
@@ -28,7 +35,8 @@ import { Simulation } from '../sim/Simulation';
 import { LavaSim } from '../sim/LavaSim';
 import { makeWaterMaterial } from '../materials/waterMaterial';
 import { makeLavaMaterial } from '../materials/lavaMaterial';
-import { makeDebugMaterial } from '../materials/debugMaterial';
+import { makeDebugMaterial, debugModeUniform, DEBUG_MODES } from '../materials/debugMaterial';
+import { lightingSettings, sunDirUniform, sunDirection } from '../tsl/lighting';
 import type { Material } from 'three';
 import { textureLoad } from 'three/tsl';
 import type { SampleFace } from '../tsl/surface';
@@ -62,7 +70,7 @@ export class Engine {
   emitter!: EmitterTool;
   private riverMode = false;
   // small footprint (near point source) + modest rate -> a stream, not a dome.
-  readonly riverSettings = { rate: 0.04, radius: 0.008 };
+  readonly riverSettings = { rate: 0.04, radius: 0.003 };
   seamSync!: SeamSync;
   private normalSeam!: NormalSeamSync;
   seamTable!: SeamTable;
@@ -75,6 +83,7 @@ export class Engine {
   private readonly terrainMats = new Map<FaceName, Material>();
   private readonly debugMats = new Map<FaceName, Material>();
   private debugOn = false;
+  private debugMode = 0;
   private bakeCounter = 0;
   private waterPlanet!: PlanetMesh;
   private lavaPlanet!: PlanetMesh;
@@ -122,17 +131,67 @@ export class Engine {
     window.addEventListener('resize', this.onResize);
   }
 
+  private sun!: DirectionalLight;
+  private fillLight!: DirectionalLight;
+  private skyLight!: HemisphereLight;
+
   private addLights(): void {
-    const sun = new DirectionalLight(0xfff2e0, 2.2);
-    sun.position.set(3, 4, 2);
-    this.scene.add(sun);
+    this.sun = new DirectionalLight(0xfff2e0, lightingSettings.sunIntensity);
+    this.scene.add(this.sun);
     // Fill from the opposite side so the dark hemisphere stays readable.
-    const fill = new DirectionalLight(0x88a0c0, 0.6);
-    fill.position.set(-3, -1.5, -2);
-    this.scene.add(fill);
-    const sky = new HemisphereLight(0x9fc5ff, 0x3a2f25, 0.6);
-    this.scene.add(sky);
+    this.fillLight = new DirectionalLight(0x88a0c0, lightingSettings.fill);
+    this.scene.add(this.fillLight);
+    this.skyLight = new HemisphereLight(0x9fc5ff, 0x3a2f25, lightingSettings.ambient);
+    this.scene.add(this.skyLight);
+    this.applyLighting();
+
+    // atmosphere halo shell (T21): above the highest peaks, additive limb glow.
+    const atmo = new Mesh(
+      new SphereGeometry(PLANET.baseRadius + 0.7, 64, 48),
+      makeAtmosphereMaterial(),
+    );
+    atmo.renderOrder = 10; // after opaque terrain + water
+    this.scene.add(atmo);
+
+    // cloud shell (T22): just above the peaks, below the atmosphere halo.
+    const clouds = new Mesh(
+      new SphereGeometry(PLANET.baseRadius + 0.55, 96, 64),
+      makeCloudMaterial(),
+    );
+    clouds.renderOrder = 9; // after water, before atmosphere
+    this.scene.add(clouds);
+
+    // rain veil (T23): below clouds, above surface; visible under storm cores.
+    const rain = new Mesh(
+      new SphereGeometry(PLANET.baseRadius + 0.32, 96, 64),
+      makeRainMaterial(),
+    );
+    rain.renderOrder = 8;
+    this.scene.add(rain);
+    // these shells run noise shaders per-fragment over the whole screen every
+    // frame -> heavy. let them be toggled off for perf (key 'w' / GUI).
+    this.weatherMeshes = [atmo, clouds, rain];
+    this.setWeather(this.weatherOn);
   }
+
+  private weatherMeshes: Mesh[] = [];
+  private weatherOn = true;
+
+  setWeather = (on: boolean): void => {
+    this.weatherOn = on;
+    for (const m of this.weatherMeshes) m.visible = on;
+  };
+
+  /** Push lightingSettings to the three lights + the sun-direction uniform. */
+  applyLighting = (): void => {
+    const dir = sunDirection(lightingSettings); // toward sun
+    this.sun.position.copy(dir).multiplyScalar(10);
+    this.sun.intensity = lightingSettings.sunIntensity;
+    this.fillLight.position.copy(dir).multiplyScalar(-10);
+    this.fillLight.intensity = lightingSettings.fill;
+    this.skyLight.intensity = lightingSettings.ambient;
+    sunDirUniform.value.set(dir.x, dir.y, dir.z);
+  };
 
   async init(): Promise<void> {
     await this.renderer.init();
@@ -170,6 +229,12 @@ export class Engine {
       this.renderer.compute(
         buildSeedCompute(buildRainfallTexture(face, PLANET.res).texture, this.simulation.rainfall.field(face).main, n),
       );
+      this.renderer.compute(
+        buildSeedCompute(buildCellAreaTexture(face, PLANET.res).texture, this.simulation.cellArea.field(face).main, n),
+      );
+      // zero the erosion-viz field (uninitialized storage = random tint -> washed
+      // out / flickering terrain before any erosion).
+      this.renderer.compute(buildFillZero(this.simulation.erosionViz.field(face).main, n));
       this.brush.register(face, field);
 
       // cheap material: displacement + baked normal + material (rock/soil) color.
@@ -178,6 +243,7 @@ export class Engine {
         field.main,
         this.simulation.loose.field(face).main,
         this.terrainNormals.field(face).main,
+        this.simulation.erosionViz.field(face).main,
       ).material;
       this.terrainMats.set(face, terrainMat);
       this.debugMats.set(
@@ -189,6 +255,9 @@ export class Engine {
           this.simulation.water.field(face).main,
           this.simulation.sediment.field(face).main,
           this.simulation.loose.field(face).main,
+          this.simulation.velocity.field(face).main,
+          this.simulation.cellArea.field(face).main,
+          this.simulation.erosionViz.field(face).main,
         ),
       );
       this.planet.setFaceMaterial(face, terrainMat);
@@ -220,6 +289,8 @@ export class Engine {
           this.heightFields.field(face).main,
           this.simulation.water.field(face).main,
           this.simulation.waterNormals.field(face).main,
+          this.simulation.cellArea.field(face).main,
+          this.simulation.velocity.field(face).main,
         ),
       );
     }
@@ -227,7 +298,7 @@ export class Engine {
     this.emitter = new EmitterTool(this.simulation.waterSource, this.heightFields.n);
 
     // M8: lava sim + emissive lava meshes + volcano emitter.
-    this.lavaSim = new LavaSim(this.renderer, this.heightFields, this.seamTable);
+    this.lavaSim = new LavaSim(this.renderer, this.heightFields, this.seamTable, this.simulation.cellArea);
     this.lavaPlanet = new PlanetMesh(PLANET.res, PLANET.baseRadius, makeFlatSolidMaterial());
     for (const face of FACES) {
       this.lavaPlanet.setFaceMaterial(
@@ -255,6 +326,7 @@ export class Engine {
       onClearWater: () => this.simulation.clearWater(),
       onClearSources: () => this.emitter.clear(this.renderer),
       onErosionChange: () => this.simulation.setErosion(this.erosionSettings.enabled),
+      onLightingChange: this.applyLighting,
     });
     this.sidebar = new Sidebar({
       brush: this.brushSettings,
@@ -363,13 +435,19 @@ export class Engine {
         this.sidebar.sync();
         this.controls.gui.controllersRecursive().forEach((c) => c.updateDisplay());
         break;
-      case 'v':
-        // debug field view: R=sediment, G=loose, B=water.
-        this.debugOn = !this.debugOn;
+      case 'w':
+        this.setWeather(!this.weatherOn); // toggle weather shells (perf)
+        break;
+      case 'v': {
+        // cycle debug modes: off -> waterDepth -> flowSpeed -> ... -> off.
+        this.debugMode = (this.debugMode + 1) % DEBUG_MODES.length;
+        this.debugOn = this.debugMode !== 0;
+        debugModeUniform.value = this.debugMode;
         for (const f of FACES) {
           this.planet.setFaceMaterial(f, (this.debugOn ? this.debugMats : this.terrainMats).get(f)!);
         }
         break;
+      }
     }
   };
 
@@ -385,10 +463,16 @@ export class Engine {
     // climate cycle: when rain is on, the global rate ebbs/flows slowly (wet &
     // dry seasons); combined with the regional rainfall map -> rain shifts over
     // time and falls in some regions more than others.
-    if (this.waterSettings.rainOn) {
-      const pulse = 0.45 + 0.55 * Math.max(0, Math.sin(time * 0.00012));
-      this.simulation.setRain(this.waterSettings.rainRate * pulse);
-    }
+    // base climate rain (toggle) + storm rain: storms always add rain (localized
+    // by the rainfall map) so the rain veil under storm clouds matches actual sim
+    // rainfall (V26, coherent via storminess).
+    // rain toggle is the master switch (so water can be fully turned off). when
+    // on: climate pulse + storm contribution (localized by rainfall map).
+    const pulse = 0.45 + 0.55 * Math.max(0, Math.sin(time * 0.00012));
+    const rate = this.waterSettings.rainOn
+      ? this.waterSettings.rainRate * pulse + storminess.value * SIM.rainRate * 1.5
+      : 0;
+    this.simulation.setRain(rate);
 
     // Decoupled fixed-step sim (V10), capped (anti spiral-of-death).
     if (this.sim) {
@@ -434,8 +518,8 @@ export class Engine {
     if (this.hud) {
       this.hud.textContent =
         `fps ${this.fpsEma.toFixed(0)}  ${this.frameMsEma.toFixed(1)}ms\n` +
-        `res ${PLANET.res}  sim ${SIM.ticksPerSecond}/s  rain:${this.waterSettings.rainOn ? 'on' : 'off'} [r]\n` +
-        `[g] ${this.sculptMode ? 'SCULPT' : 'orbit'}  brush:${this.brushSettings.mode} [1raise 2lower 3smooth 4flatten]  [v]debug${this.debugOn ? '*' : ''}`;
+        `res ${PLANET.res}  sim ${SIM.ticksPerSecond}/s  rain:${this.waterSettings.rainOn ? 'on' : 'off'} [r]  weather:${this.weatherOn ? 'on' : 'off'} [w]\n` +
+        `[g] ${this.sculptMode ? 'SCULPT' : 'orbit'}  brush:${this.brushSettings.mode} [1raise 2lower 3smooth 4flatten]  [v]debug:${DEBUG_MODES[this.debugMode]}`;
     }
   }
 

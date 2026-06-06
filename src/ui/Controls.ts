@@ -4,6 +4,11 @@
 import GUI from 'lil-gui';
 import { waterUniforms } from '../sim/passes/water';
 import { erosionUniforms } from '../sim/passes/erosion';
+import { lightingSettings } from '../tsl/lighting';
+import { flowVizStrength } from '../materials/waterMaterial';
+import { cloudCoverage, cloudOpacity, cloudScale, windSpeed, storminess } from '../materials/cloudMaterial';
+import { atmosphereStrength } from '../materials/atmosphereMaterial';
+import { rainStrength } from '../materials/rainMaterial';
 import { setSeaLevel } from '../tsl/heightScale';
 import { PLANET } from '../config';
 import type { BrushMode } from '../tools/BrushTool';
@@ -39,6 +44,7 @@ export interface ControlHandles {
   onClearWater: () => void;
   onClearSources: () => void;
   onErosionChange: () => void;
+  onLightingChange: () => void;
 }
 
 export class Controls {
@@ -61,7 +67,7 @@ export class Controls {
     water.add(waterUniforms.gravity, 'value', 1, 20, 0.5).name('gravity');
     water.add(waterUniforms.damping, 'value', 0.5, 0.99, 0.01).name('damping');
     water.add(h.river, 'rate', 0.002, 0.1, 0.002).name('river rate');
-    water.add(h.river, 'radius', 0.02, 0.2, 0.005).name('river radius');
+    water.add(h.river, 'radius', 0.002, 0.05, 0.001).name('river radius');
     water.add({ clear: h.onClearWater }, 'clear').name('clear water');
     water.add({ clear: h.onClearSources }, 'clear').name('clear river sources');
 
@@ -75,7 +81,33 @@ export class Controls {
     ero.add(erosionUniforms.thermalRate, 'value', 0, 1, 0.05).name('thermal rate');
     ero.add(erosionUniforms.rockErodibility, 'value', 0.02, 1, 0.02).name('rock erodibility');
     ero.add(erosionUniforms.looseFull, 'value', 0.005, 0.1, 0.005).name('loose cover depth');
+    ero.add(erosionUniforms.channelFocus, 'value', 0, 1, 0.02).name('channel focus');
+    ero.add(erosionUniforms.channelDischarge, 'value', 0.002, 0.06, 0.002).name('channel discharge');
+    ero.add(erosionUniforms.flowInertia, 'value', 0, 0.95, 0.02).name('flow inertia (meander)');
+    ero.add(erosionUniforms.lateralErosion, 'value', 0, 2, 0.05).name('lateral erosion');
+    ero.add(erosionUniforms.strataFreq, 'value', 10, 120, 5).name('rock layers (freq)');
+    ero.add(erosionUniforms.strataStrength, 'value', 0, 1, 0.05).name('rock layer hardness');
+    ero.add(erosionUniforms.seamSmooth, 'value', 0, 1, 0.05).name('seam smoothing');
     ero.close();
+
+    const light = this.gui.addFolder('Lighting');
+    light.add(lightingSettings, 'azimuth', -Math.PI, Math.PI, 0.02).name('sun azimuth').onChange(h.onLightingChange);
+    light.add(lightingSettings, 'elevation', -1.4, 1.4, 0.02).name('sun elevation').onChange(h.onLightingChange);
+    light.add(lightingSettings, 'sunIntensity', 0, 4, 0.05).name('sun intensity').onChange(h.onLightingChange);
+    light.add(lightingSettings, 'fill', 0, 1.5, 0.05).name('fill').onChange(h.onLightingChange);
+    light.add(lightingSettings, 'ambient', 0, 1.5, 0.05).name('dark-side fill').onChange(h.onLightingChange);
+    light.close();
+
+    const weather = this.gui.addFolder('Weather');
+    weather.add(storminess, 'value', 0, 1, 0.02).name('storminess');
+    weather.add(cloudCoverage, 'value', 0, 1, 0.02).name('cloud coverage');
+    weather.add(cloudOpacity, 'value', 0, 1, 0.02).name('cloud opacity');
+    weather.add(cloudScale, 'value', 1, 10, 0.5).name('cloud scale');
+    weather.add(windSpeed, 'value', 0, 0.03, 0.001).name('wind speed');
+    weather.add(rainStrength, 'value', 0, 1, 0.02).name('rain');
+    weather.add(atmosphereStrength, 'value', 0, 3, 0.05).name('atmosphere');
+    weather.add(flowVizStrength, 'value', 0, 1, 0.02).name('water flow streaks');
+    weather.close();
   }
 
   dispose(): void {
