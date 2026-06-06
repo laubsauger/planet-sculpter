@@ -58,7 +58,7 @@ export type FluidUniforms = ReturnType<typeof makeFluidUniforms>;
 /** Water instance. Very low evaporation so river flow survives and travels;
  *  damping 0.6 = flux tracks head directly (smooth gradient flow, little
  *  sloshing -> clean velocity field for erosion). Raise loss for rain use. */
-export const waterUniforms = makeFluidUniforms({ loss: 0.0003, pipeArea: 4, damping: 0.88 });
+export const waterUniforms = makeFluidUniforms({ loss: 0.0003, pipeArea: 4, damping: 0.62 });
 
 /** Sediment-driven viscosity (V34): muddy water flows slower. effectiveFlowRate
  *  = flowRate / (1 + conc*mud), clamped. 0 = off. */

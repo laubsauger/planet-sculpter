@@ -27,7 +27,6 @@ import {
   smoothstep,
   mix,
   sin,
-  min,
 } from 'three/tsl';
 import { seamHeight, type SampleFace } from '../../tsl/surface';
 import type { SeamTable } from '../../planet/seamTable';
@@ -72,8 +71,6 @@ export const erosionUniforms = {
    *  downcut/widening) -> terraced canyons. freq = layer count over height range. */
   strataFreq: uniform(55),
   strataStrength: uniform(0.75),
-  /** cross-seam C1 smoothing strength in the seam band (kills the erosion crease). */
-  seamSmooth: uniform(0.8),
   /** viz texture decay/tick: fresh erode/deposit streaks fade over ~tens of ticks. */
   vizDecay: uniform(0.95),
   /** still water settles suspended sediment -> muddy lakes clear, beds build (V35). */
@@ -275,48 +272,6 @@ export function buildErosion(
     textureStore(looseOut, uvec2(x, y), vec4(looseNew, 0, 0, 1)).toWriteOnly();
     textureStore(vizOut, uvec2(x, y), vec4(vizR, vizG, 0, 1)).toWriteOnly();
     textureStore(sOut, uvec2(x, y), vec4(sNew, 0, 0, 1)).toWriteOnly();
-  });
-  return fn().compute(n * n) as ComputeNode;
-}
-
-/**
- * Cross-seam C1 continuity (the apron's effect without resizing textures).
- * Independent per-face erosion makes the bedrock SLOPE diverge at a shared edge
- * -> a crease (the persistent "seam"). heightSeam only matches the edge VALUE,
- * not the slope. Here: in a narrow band along each face edge, diffuse b toward
- * the average of its CROSS-SEAM neighbors (seamHeight, verified mapping) so the
- * surface meets smoothly across the seam. Gated to the band (interior skipped ->
- * cheap). Strongest at the edge, fading out by `band` cells.
- */
-export function buildSeamSmooth(
-  b: StorageTexture,
-  bOut: StorageTexture,
-  n: number,
-  face: FaceName,
-  table: SeamTable,
-  sampleB: SampleFace,
-): ComputeNode {
-  const res = n - 1;
-  const band = 4.0; // wider -> cross-seam influence diffuses further from the edge
-  const fn = Fn(() => {
-    const { x, y, ix, iy } = xy(n);
-    const c = textureLoad(b, ivec2(ix, iy)).x;
-    const bNew: any = c.toVar();
-    const edist = min(
-      min(ix.toFloat(), float(res).sub(ix.toFloat())),
-      min(iy.toFloat(), float(res).sub(iy.toFloat())),
-    );
-    If(edist.lessThan(float(band)), () => {
-      const avg = seamHeight(face, sampleB, table, ix.sub(1), iy)
-        .add(seamHeight(face, sampleB, table, ix.add(1), iy))
-        .add(seamHeight(face, sampleB, table, ix, iy.sub(1)))
-        .add(seamHeight(face, sampleB, table, ix, iy.add(1)))
-        .mul(0.25);
-      // weight: 1 at the edge -> 0 at `band` cells in, scaled by seamSmooth.
-      const w = smoothstep(float(band), float(0), edist).mul(erosionUniforms.seamSmooth);
-      bNew.assign(mix(c, avg, w));
-    });
-    textureStore(bOut, uvec2(x, y), vec4(bNew, 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(n * n) as ComputeNode;
 }

@@ -5,7 +5,6 @@ import GUI from 'lil-gui';
 import { waterUniforms } from '../sim/passes/water';
 import { erosionUniforms } from '../sim/passes/erosion';
 import { lightingSettings } from '../tsl/lighting';
-import { flowVizStrength } from '../materials/waterMaterial';
 import { cloudCoverage, cloudOpacity, cloudScale, windSpeed, storminess } from '../materials/cloudMaterial';
 import { atmosphereStrength } from '../materials/atmosphereMaterial';
 import { rainStrength } from '../materials/rainMaterial';
@@ -87,7 +86,6 @@ export class Controls {
     ero.add(erosionUniforms.lateralErosion, 'value', 0, 2, 0.05).name('lateral erosion');
     ero.add(erosionUniforms.strataFreq, 'value', 10, 120, 5).name('rock layers (freq)');
     ero.add(erosionUniforms.strataStrength, 'value', 0, 1, 0.05).name('rock layer hardness');
-    ero.add(erosionUniforms.seamSmooth, 'value', 0, 1, 0.05).name('seam smoothing');
     ero.close();
 
     const light = this.gui.addFolder('Lighting');
@@ -106,7 +104,6 @@ export class Controls {
     weather.add(windSpeed, 'value', 0, 0.03, 0.001).name('wind speed');
     weather.add(rainStrength, 'value', 0, 1, 0.02).name('rain');
     weather.add(atmosphereStrength, 'value', 0, 3, 0.05).name('atmosphere');
-    weather.add(flowVizStrength, 'value', 0, 1, 0.02).name('water flow streaks');
     weather.close();
   }
 

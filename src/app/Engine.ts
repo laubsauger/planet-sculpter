@@ -29,7 +29,7 @@ import { buildCellAreaTexture } from '../planet/cellArea';
 import { makeTerrainMaterial } from '../materials/terrainMaterial';
 import { HeightFields, FieldSet, buildSeedCompute, buildFillZero } from '../sim/fields';
 import { buildSeamTable, type SeamTable } from '../planet/seamTable';
-import { SeamSync, NormalSeamSync } from '../sim/passes/seamCopy';
+import { SeamSync, NormalSeamSync, NormalBandSmooth } from '../sim/passes/seamCopy';
 import { NormalBaker } from '../sim/passes/normals';
 import { Simulation } from '../sim/Simulation';
 import { LavaSim } from '../sim/LavaSim';
@@ -73,6 +73,7 @@ export class Engine {
   readonly riverSettings = { rate: 0.04, radius: 0.003 };
   seamSync!: SeamSync;
   private normalSeam!: NormalSeamSync;
+  private normalBand!: NormalBandSmooth;
   seamTable!: SeamTable;
   simulation!: Simulation;
   lavaSim!: LavaSim;
@@ -84,6 +85,7 @@ export class Engine {
   private readonly debugMats = new Map<FaceName, Material>();
   private debugOn = false;
   private debugMode = 0;
+  private simPaused = false; // 'p' — freeze sim (diagnostic: sim vs render cost)
   private bakeCounter = 0;
   private waterPlanet!: PlanetMesh;
   private lavaPlanet!: PlanetMesh;
@@ -175,7 +177,7 @@ export class Engine {
   }
 
   private weatherMeshes: Mesh[] = [];
-  private weatherOn = true;
+  private weatherOn = false; // off by default: full-screen noise shells are heavy; opt in with 'w'
 
   setWeather = (on: boolean): void => {
     this.weatherOn = on;
@@ -219,7 +221,9 @@ export class Engine {
     for (const face of FACES) {
       const field = this.heightFields.field(face);
       // seed bedrock height + an uneven initial loose (soil/sand) layer.
-      this.renderer.compute(buildSeedCompute(buildHeightTexture(face, PLANET.res).texture, field.main, n));
+      const ht = buildHeightTexture(face, PLANET.res);
+      this.heightData.set(face, ht.data); // keep CPU copy for pick refinement
+      this.renderer.compute(buildSeedCompute(ht.texture, field.main, n));
       this.renderer.compute(
         buildSeedCompute(buildLooseTexture(face, PLANET.res).texture, this.simulation.loose.field(face).main, n),
       );
@@ -275,8 +279,10 @@ export class Engine {
       this.heightFields.n,
     );
     this.normalSeam = new NormalSeamSync(this.terrainNormals, this.seamTable, this.heightFields.n);
+    this.normalBand = new NormalBandSmooth(this.terrainNormals, this.heightFields.n);
     this.terrainBaker.bake(this.renderer);
-    this.normalSeam.sync(this.renderer); // seamless shading across face edges
+    this.normalBand.sync(this.renderer); // smooth shading crease in the seam band
+    this.normalSeam.sync(this.renderer); // then lock the exact edge cross-seam
     this.brush.warmup(this.renderer); // V8: compile pipelines up front
 
     await this.simulation.warmup();
@@ -290,7 +296,6 @@ export class Engine {
           this.simulation.water.field(face).main,
           this.simulation.waterNormals.field(face).main,
           this.simulation.cellArea.field(face).main,
-          this.simulation.velocity.field(face).main,
         ),
       );
     }
@@ -387,6 +392,7 @@ export class Engine {
     }
     this.brush.stamp(this.renderer, pick.dir, this.brushSettings);
     this.terrainBaker.bake(this.renderer); // height changed -> rebake normals
+    this.normalBand.sync(this.renderer);
     this.normalSeam.sync(this.renderer);
   }
 
@@ -438,6 +444,9 @@ export class Engine {
       case 'w':
         this.setWeather(!this.weatherOn); // toggle weather shells (perf)
         break;
+      case 'p':
+        this.simPaused = !this.simPaused; // freeze sim (diagnostic)
+        break;
       case 'v': {
         // cycle debug modes: off -> waterDepth -> flowSpeed -> ... -> off.
         this.debugMode = (this.debugMode + 1) % DEBUG_MODES.length;
@@ -475,7 +484,7 @@ export class Engine {
     this.simulation.setRain(rate);
 
     // Decoupled fixed-step sim (V10), capped (anti spiral-of-death).
-    if (this.sim) {
+    if (this.sim && !this.simPaused) {
       this.simAccumulator += dt;
       let steps = 0;
       while (this.simAccumulator >= this.simInterval && steps < SIM.maxStepsPerFrame) {
@@ -493,6 +502,7 @@ export class Engine {
         this.bakeCounter = (this.bakeCounter + 1) % 2;
         if (this.bakeCounter === 0) {
           this.terrainBaker.bake(this.renderer);
+          this.normalBand.sync(this.renderer);
           this.normalSeam.sync(this.renderer);
         }
       }
@@ -518,7 +528,7 @@ export class Engine {
     if (this.hud) {
       this.hud.textContent =
         `fps ${this.fpsEma.toFixed(0)}  ${this.frameMsEma.toFixed(1)}ms\n` +
-        `res ${PLANET.res}  sim ${SIM.ticksPerSecond}/s  rain:${this.waterSettings.rainOn ? 'on' : 'off'} [r]  weather:${this.weatherOn ? 'on' : 'off'} [w]\n` +
+        `res ${PLANET.res}  sim ${SIM.ticksPerSecond}/s  rain:${this.waterSettings.rainOn ? 'on' : 'off'} [r]  weather:${this.weatherOn ? 'on' : 'off'} [w]  sim:${this.simPaused ? 'PAUSED' : 'on'} [p]\n` +
         `[g] ${this.sculptMode ? 'SCULPT' : 'orbit'}  brush:${this.brushSettings.mode} [1raise 2lower 3smooth 4flatten]  [v]debug:${DEBUG_MODES[this.debugMode]}`;
     }
   }

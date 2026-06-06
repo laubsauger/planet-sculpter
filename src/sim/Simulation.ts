@@ -12,10 +12,9 @@ import {
   buildErosion,
   buildAdvect,
   buildThermal,
-  buildSeamSmooth,
   erosionUniforms,
 } from './passes/erosion';
-import { SeamSync, NormalSeamSync } from './passes/seamCopy';
+import { SeamSync, NormalSeamSync, NormalBandSmooth, VelocityMagSeam } from './passes/seamCopy';
 import { SeamFlux } from './passes/seamFlux';
 import { NormalBaker } from './passes/normals';
 import { buildSeamTable, type SeamTable } from '../planet/seamTable';
@@ -41,8 +40,6 @@ interface FacePasses {
   advect: ComputeNode;
   copyS2: ComputeNode;
   thermal: ComputeNode;
-  seamSmooth: ComputeNode;
-  copySeam: ComputeNode;
 }
 
 export class Simulation implements SimHooks {
@@ -60,6 +57,7 @@ export class Simulation implements SimHooks {
   readonly waterSurface: FieldSet; // b + vol/area; normal bake samples this (1 tex/face)
   private readonly waterBaker: NormalBaker;
   private readonly waterNormalSeam: NormalSeamSync;
+  private readonly waterNormalBand: NormalBandSmooth;
   private readonly surfaceCombine: ComputeNode[] = [];
   erosionEnabled = false;
   private readonly passes = new Map<FaceName, FacePasses>();
@@ -70,6 +68,7 @@ export class Simulation implements SimHooks {
   private readonly heightSeam: SeamSync;
   private readonly looseSeam: SeamSync;
   private readonly sedimentSeam: SeamSync;
+  private readonly velSeam: VelocityMagSeam;
   private tickCount = 0;
   /** true on ticks where erosion mutated bedrock (Engine rebakes normals then). */
   terrainChanged = false;
@@ -103,6 +102,7 @@ export class Simulation implements SimHooks {
     this.heightSeam = new SeamSync(this.height, table, n);
     this.looseSeam = new SeamSync(this.loose, table, n);
     this.sedimentSeam = new SeamSync(this.sediment, table, n);
+    this.velSeam = new VelocityMagSeam(this.velocity, table, n);
 
     this.waterNormals = new FieldSet(n, true);
     const sampleB: SampleFace = (f, coord) => textureLoad(height.field(f).main, coord).x;
@@ -111,6 +111,7 @@ export class Simulation implements SimHooks {
     const sampleWater: SampleFace = (f, coord) => textureLoad(this.waterSurface.field(f).main, coord).x;
     this.waterBaker = new NormalBaker(sampleWater, table, this.waterNormals, n);
     this.waterNormalSeam = new NormalSeamSync(this.waterNormals, table, n);
+    this.waterNormalBand = new NormalBandSmooth(this.waterNormals, n);
     for (const face of FACES) {
       this.surfaceCombine.push(
         buildSurfaceCombine(
@@ -184,8 +185,6 @@ export class Simulation implements SimHooks {
         ),
         copyS2: buildCopyCompute(s.scratch, s.main, n) as ComputeNode,
         thermal: buildThermal(b.main, b.scratch, n, face, table, sampleB, d.main, area),
-        seamSmooth: buildSeamSmooth(b.main, b.scratch, n, face, table, sampleB),
-        copySeam: buildCopyCompute(b.scratch, b.main, n) as ComputeNode,
       });
     }
   }
@@ -240,6 +239,9 @@ export class Simulation implements SimHooks {
         r.compute(p.velocity);
         r.compute(p.copyVel);
       }
+      // make flow SPEED consistent across seams so the shared edge erodes equally
+      // (⊥ trench/pileup along the seam from per-face velocity divergence).
+      this.velSeam.sync(r);
       for (const p of this.passes.values()) {
         r.compute(p.erosion);
         r.compute(p.copyB);
@@ -265,11 +267,6 @@ export class Simulation implements SimHooks {
     this.waterSeam.sync(r);
     if (doErosion) {
       this.heightSeam.sync(r); // bedrock changed -> keep edge continuous
-      // cross-seam C1 smoothing in the seam band (two-phase: all read main ->
-      // scratch, then copy back) so the bedrock SLOPE matches across the seam
-      // -> no erosion crease. Reads neighbor main, so must barrier before copy.
-      for (const p of this.passes.values()) r.compute(p.seamSmooth);
-      for (const p of this.passes.values()) r.compute(p.copySeam);
       this.looseSeam.sync(r); // keep loose-material (color) continuous across seams
       this.sedimentSeam.sync(r); // suspended sediment can't cross seam in advect ->
       // edge-average it so it doesn't pile up + deposit a ridge along the seam.
@@ -280,6 +277,7 @@ export class Simulation implements SimHooks {
     if (this.tickCount % 3 === 0) {
       for (const c of this.surfaceCombine) r.compute(c); // b + vol/area -> surface tex
       this.waterBaker.bake(r);
+      this.waterNormalBand.sync(r);
       this.waterNormalSeam.sync(r);
     }
   }
@@ -298,6 +296,7 @@ export class Simulation implements SimHooks {
     }
     for (const c of this.surfaceCombine) r.compute(c);
     this.waterBaker.bake(r);
+    this.waterNormalBand.sync(r);
     this.waterNormalSeam.sync(r);
   }
 }

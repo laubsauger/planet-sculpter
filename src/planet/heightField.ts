@@ -55,8 +55,9 @@ function fbm(dir: Vec3): number {
   let sum = 0;
   let norm = 0;
   let weight = 1;
-  // fewer octaves + faster amplitude falloff -> ridges without 1-texel spikes.
-  for (let o = 0; o < 5; o++) {
+  // 7 octaves -> more detail at finer scales (was 5); faster amplitude falloff
+  // keeps ridges crisp without 1-texel spikes.
+  for (let o = 0; o < 7; o++) {
     const nv = valueNoise(dir[0] * freq, dir[1] * freq, dir[2] * freq);
     let signal = 1 - Math.abs(nv * 2 - 1); // ridge: peak at nv=0.5
     signal = signal * signal * 0.6 + signal * 0.4; // softer sharpen
@@ -76,6 +77,23 @@ function fbm(dir: Vec3): number {
   const typeN = valueNoise(dir[0] * 0.75 + 20, dir[1] * 0.75 - 15, dir[2] * 0.75 + 8);
   const rugged = smoothStep01((typeN - 0.28) / 0.45); // 0 plains .. 1 mountains
   h = h * (0.58 + 0.55 * rugged);
+
+  // fine surface roughness (high-freq, signed) — stronger on rugged terrain so
+  // mountains read craggy, plains stay smooth. adds close-up detail.
+  const fine = valueNoise(dir[0] * 11 - 17, dir[1] * 11 + 23, dir[2] * 11 - 5) * 2 - 1;
+  h += fine * 0.035 * (0.35 + 0.65 * rugged);
+
+  // PLATEAUS / mesas: regional flat-topped highlands. Subtle compression of the
+  // height variation toward a raised level -> gentle tablelands (⊥ chunky).
+  const plat = smoothStep01((valueNoise(dir[0] * 0.85 - 31, dir[1] * 0.85 + 14, dir[2] * 0.85 + 19) - 0.56) / 0.16);
+  const onHigh = smoothStep01((h - 0.32) / 0.25); // only flatten elevated terrain
+  h = h + (0.52 - h) * 0.25 * plat * onHigh;
+
+  // RIFT valleys: thin sparse carved lows (inverted ridge noise) -> fine canyons,
+  // not chunky troughs. higher freq + narrow + shallow so they read as fissures.
+  const riftN = 1 - Math.abs(valueNoise(dir[0] * 4.5 + 61, dir[1] * 4.5 - 9, dir[2] * 4.5 + 40) * 2 - 1);
+  const rift = smoothStep01((riftN - 0.88) / 0.07); // only sharp narrow ridge cores
+  h -= rift * 0.05 * smoothStep01((h - 0.18) / 0.2); // shallow carve
 
   // lift the highest peaks higher (snow-capped) without raising lowlands.
   h = h + Math.max(0, h - 0.5) * 0.55;
@@ -152,11 +170,17 @@ export function buildRainfallTexture(face: FaceName, res: number): HeightTexture
       const u = -1 + (2 * i) / res;
       const v = -1 + (2 * j) / res;
       const dir = faceUVToDir(face, u, v);
-      // low frequency -> big climate zones.
-      const a = valueNoise(dir[0] * 1.4 + 30, dir[1] * 1.4 - 12, dir[2] * 1.4 + 7);
-      const b = valueNoise(dir[0] * 2.8 - 4, dir[1] * 2.8 + 9, dir[2] * 2.8 - 2);
-      const t = a * 0.7 + b * 0.3;
-      data[j * n + i] = Math.max(0, Math.min(1, (t - 0.32) * 2.6)); // wet zones vs dry
+      // several big climate regions (low freq) + mid detail -> MANY distinct wet
+      // and dry zones spread over the planet (⊥ one blob, ⊥ globally uniform).
+      const a = valueNoise(dir[0] * 1.3 + 30, dir[1] * 1.3 - 12, dir[2] * 1.3 + 7);
+      const b = valueNoise(dir[0] * 3.2 - 4, dir[1] * 3.2 + 9, dir[2] * 3.2 - 2);
+      // gentle latitude banding (y = pole axis) so wet/dry also shifts by band.
+      const lat = Math.abs(dir[1]); // 0 equator .. 1 pole
+      const band = 0.5 + 0.4 * Math.cos(lat * Math.PI * 2);
+      const r = a * 0.5 + b * 0.22 + band * 0.28;
+      // moderate spread: full 0..1 range with distinct dry (deserts) + wet zones
+      // and gradients between -> varied, not all-or-nothing.
+      data[j * n + i] = Math.max(0, Math.min(1, (r - 0.28) * 1.9));
     }
   }
   const texture = new DataTexture(data, n, n, RedFormat, FloatType);
