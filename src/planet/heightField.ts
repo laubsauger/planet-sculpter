@@ -78,6 +78,13 @@ function fbm(dir: Vec3): number {
   const rugged = smoothStep01((typeN - 0.28) / 0.45); // 0 plains .. 1 mountains
   h = h * (0.58 + 0.55 * rugged);
 
+  // CONTINENTAL uplift: broad low-frequency landmasses ride well ABOVE sea level
+  // (varied highlands/plateaus), while basins stay low -> oceans. Replaces the
+  // flat near-sea-level shelf with real above-water terrain + large-scale relief.
+  const cont = valueNoise(dir[0] * 0.6 + 71, dir[1] * 0.6 - 33, dir[2] * 0.6 + 12);
+  const continental = smoothStep01((cont - 0.4) / 0.3); // 0 ocean basin .. 1 continent
+  h = h + continental * 0.22;
+
   // fine surface roughness (high-freq, signed) — stronger on rugged terrain so
   // mountains read craggy, plains stay smooth. adds close-up detail.
   const fine = valueNoise(dir[0] * 11 - 17, dir[1] * 11 + 23, dir[2] * 11 - 5) * 2 - 1;

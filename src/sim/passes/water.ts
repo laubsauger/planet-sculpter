@@ -39,6 +39,7 @@ export function makeFluidUniforms(o: {
   pipeArea?: number;
   pipeLength?: number;
   damping?: number;
+  evapProp?: number;
 }) {
   return {
     source: uniform(o.source ?? 0),
@@ -48,6 +49,9 @@ export function makeFluidUniforms(o: {
     pipeLength: uniform(o.pipeLength ?? 1),
     // flux momentum retained per step (<1). Lower = waves settle faster.
     damping: uniform(o.damping ?? 0.88),
+    // depth-PROPORTIONAL evaporation /sec: gives a steady-state depth
+    // (d_eq ≈ rain/evapProp) so continuous rain can't flood the planet (V41).
+    evapProp: uniform(o.evapProp ?? 0),
     dt: uniform(1 / 60),
   };
 }
@@ -58,7 +62,7 @@ export type FluidUniforms = ReturnType<typeof makeFluidUniforms>;
 /** Water instance. Very low evaporation so river flow survives and travels;
  *  damping 0.6 = flux tracks head directly (smooth gradient flow, little
  *  sloshing -> clean velocity field for erosion). Raise loss for rain use. */
-export const waterUniforms = makeFluidUniforms({ loss: 0.0003, pipeArea: 4, damping: 0.62 });
+export const waterUniforms = makeFluidUniforms({ loss: 0.0003, pipeArea: 4, damping: 0.85, evapProp: 0.06 });
 
 /** Sediment-driven viscosity (V34): muddy water flows slower. effectiveFlowRate
  *  = flowRate / (1 + conc*mud), clamped. 0 = off. */
@@ -169,30 +173,24 @@ export function buildFlux(
     const prev = textureLoad(fPrev, ivec2(ix, iy));
 
     let k: any = p.dt.mul(p.pipeArea).mul(p.gravity).div(p.pipeLength);
-    // V34: muddy water (high sediment concentration) flows slower -> deltas /
-    // viscous basins. visc clamped so it can't fully freeze flow.
     if (sediment) {
       const conc = textureLoad(sediment, ivec2(ix, iy)).x.div(max(dc, float(EPS)));
       const visc = float(1).add(conc.mul(mudViscosityFactor)).min(float(8));
       k = k.div(visc);
     }
 
-    // damped flux accumulator: retained momentum decays each step -> no endless sloshing.
     let fL = max(float(0), prev.x.mul(p.damping).add(k.mul(hc.sub(surf(xm, iy)))));
     let fR = max(float(0), prev.y.mul(p.damping).add(k.mul(hc.sub(surf(xp, iy)))));
     let fT = max(float(0), prev.z.mul(p.damping).add(k.mul(hc.sub(surf(ix, yp)))));
     let fB = max(float(0), prev.w.mul(p.damping).add(k.mul(hc.sub(surf(ix, ym)))));
 
-    // Seal face borders: no flux into a wall (clamped neighbor would otherwise
-    // read self -> phantom flux -> non-conservation -> water explosion).
-    // Cross-face transfer is handled by the conservative seam diffusion.
+    // Seal face borders (no flux into a wall -> conservation; cross-face via seam).
     fL = ix.lessThan(int(1)).select(float(0), fL);
     fR = ix.greaterThan(int(res - 1)).select(float(0), fR);
     fT = iy.greaterThan(int(res - 1)).select(float(0), fT);
     fB = iy.lessThan(int(1)).select(float(0), fB);
 
     const sum = fL.add(fR).add(fT).add(fB);
-    // scale so total outflow <= fluid present this step.
     const l2 = p.pipeLength.mul(p.pipeLength);
     const scale = min(float(1), dc.mul(l2).div(max(sum.mul(p.dt), float(EPS))));
 
@@ -252,8 +250,11 @@ export function buildFluidUpdate(
     // regional rain = global rate * local rainfall map (wet/dry climate zones).
     const rain = p.source.mul(textureLoad(rainfall, ivec2(ix, iy)).x);
     let next: any = inflow.sub(outflow).mul(p.dt).div(l2).add(dc); // flow (volume)
-    next = next.sub(p.loss.mul(p.dt).mul(areaC)); // evap / cooling (depth->vol)
+    next = next.sub(p.loss.mul(p.dt).mul(areaC)); // subtractive evap (dries thin films)
     next = next.add(rain.add(emit).mul(p.dt).mul(areaC)); // rain + emitter (depth->vol)
+    // PROPORTIONAL evap (V41): removes a fraction/sec -> steady-state water level
+    // (rain balances evap), so continuous rain reaches equilibrium, ⊥ floods.
+    next = next.mul(max(float(0), float(1).sub(p.evapProp.mul(p.dt))));
     if (useSea) {
       const below = textureLoad(b, ivec2(ix, iy)).x.mul(-1).add(seaLevelUniform); // seaLevel - b
       const need = below.max(float(0)).mul(areaC); // VOLUME needed to reach sea level

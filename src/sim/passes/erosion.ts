@@ -52,6 +52,9 @@ export const erosionUniforms = {
   talus: uniform(0.004),
   /** low -> channels stay sharp/narrow (less smoothing fighting channelization). */
   thermalRate: uniform(0.3),
+  /** faster-than-realtime erosion: scales per-tick erode/deposit amount + cap so
+   *  terrain evolves quicker WITHOUT extra GPU work (⊥ more ticks). 1 = realtime. */
+  simSpeed: uniform(1),
   /** incision feedback (V37): 0 = uniform sheet erosion, 1 = erosion strongly
    *  concentrated where discharge (depth*speed) is high -> channels self-deepen
    *  & capture flow -> emergent rivers instead of wide sheet flow. */
@@ -223,7 +226,7 @@ export function buildErosion(
       // per-cell resistance variation -> symmetry breaking -> channels/canyons.
       const hard = textureLoad(hardness, ivec2(ix, iy)).x;
 
-      const CAP = float(0.001); // allow deeper per-step carving -> channel feedback
+      const CAP = float(0.001).mul(u.simSpeed); // per-step carving cap (scaled by sim speed)
       const erodeGate = speed.greaterThan(u.erodeSpeedMin).select(float(1), float(0)).mul(notSource);
       // erosion scaled by material softness * local resistance variation.
       const erodeBase = max(float(0), capacity.sub(sc))
@@ -256,8 +259,8 @@ export function buildErosion(
       const raw = sin(bc.mul(u.strataFreq)).abs();
       const band = smoothstep(float(0), float(0.3), raw); // ~0 at hard layer, 1 soft
       const strataResist = mix(float(1), band, u.strataStrength); // hard band -> 1-strength
-      const erode = erodeBase.add(lateral).mul(strataResist).min(CAP);
-      const dep = max(float(0), sc.sub(capacity)).mul(u.deposit).min(CAP);
+      const erode = erodeBase.add(lateral).mul(strataResist).mul(u.simSpeed).min(CAP);
+      const dep = max(float(0), sc.sub(capacity)).mul(u.deposit).mul(u.simSpeed).min(CAP);
 
       bNew.assign(max(bc.sub(erode).add(dep), float(0)));
       // loose: erosion removes loose first (then bites rock); deposition adds loose.
@@ -334,7 +337,7 @@ export function buildThermal(
     // incised river bed doesn't immediately heal flat by slumping its banks in.
     const depth = textureLoad(d, ivec2(ix, iy)).x.div(max(textureLoad(area, ivec2(ix, iy)).x, float(1e-6)));
     const wet = smoothstep(float(0), u.channelDepthRef, depth); // 0 dry .. 1 deep
-    const rate = u.thermalRate.mul(float(1).sub(wet.mul(0.85)));
+    const rate = u.thermalRate.mul(float(1).sub(wet.mul(0.85))).mul(u.simSpeed);
     const bNew = max(c.add(net.mul(rate).mul(0.25)), float(0));
     textureStore(bOut, uvec2(x, y), vec4(bNew, 0, 0, 1)).toWriteOnly();
   });

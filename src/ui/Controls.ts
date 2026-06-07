@@ -44,6 +44,8 @@ export interface ControlHandles {
   onClearSources: () => void;
   onErosionChange: () => void;
   onLightingChange: () => void;
+  weather: { enabled: boolean };
+  onWeatherToggle: (on: boolean) => void;
 }
 
 export class Controls {
@@ -61,7 +63,10 @@ export class Controls {
     water.add({ sea: PLANET.seaLevel }, 'sea', 0, 0.6, 0.005).name('sea level').onChange(setSeaLevel);
     water.add(h.water, 'rainOn').name('rain').onChange(h.onRainChange);
     water.add(h.water, 'rainRate', 0, 0.02, 0.0005).name('rain intensity').onChange(h.onRainChange);
-    water.add(waterUniforms.loss, 'value', 0, 0.01, 0.0001).name('evaporation');
+    water.add(waterUniforms.loss, 'value', 0, 0.01, 0.0001).name('evaporation (flat)');
+    water
+      .add(waterUniforms.evapProp, 'value', 0, 0.3, 0.005)
+      .name('evaporation (proportional)');
     water.add(waterUniforms.pipeArea, 'value', 0.2, 6, 0.1).name('flow speed');
     water.add(waterUniforms.gravity, 'value', 1, 20, 0.5).name('gravity');
     water.add(waterUniforms.damping, 'value', 0.5, 0.99, 0.01).name('damping');
@@ -72,6 +77,7 @@ export class Controls {
 
     const ero = this.gui.addFolder('Erosion');
     ero.add(h.erosion, 'enabled').name('enabled').onChange(h.onErosionChange);
+    ero.add(erosionUniforms.simSpeed, 'value', 1, 8, 0.5).name('sim speed (faster-than-realtime)');
     ero.add(erosionUniforms.sedimentCapacity, 'value', 0, 2, 0.05).name('capacity (Kc)');
     ero.add(erosionUniforms.dissolve, 'value', 0, 1, 0.02).name('dissolve (Ks)');
     ero.add(erosionUniforms.deposit, 'value', 0, 1, 0.02).name('deposit (Kd)');
@@ -97,6 +103,7 @@ export class Controls {
     light.close();
 
     const weather = this.gui.addFolder('Weather');
+    weather.add(h.weather, 'enabled').name('enable weather [w]').onChange(h.onWeatherToggle);
     weather.add(storminess, 'value', 0, 1, 0.02).name('storminess');
     weather.add(cloudCoverage, 'value', 0, 1, 0.02).name('cloud coverage');
     weather.add(cloudOpacity, 'value', 0, 1, 0.02).name('cloud opacity');

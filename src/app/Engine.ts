@@ -9,8 +9,12 @@ import {
   HemisphereLight,
   Color,
   Vector2,
+  Vector3,
   Mesh,
   SphereGeometry,
+  RingGeometry,
+  MeshBasicMaterial,
+  DoubleSide,
 } from 'three';
 import { makeAtmosphereMaterial } from '../materials/atmosphereMaterial';
 import { makeCloudMaterial } from '../materials/cloudMaterial';
@@ -26,6 +30,8 @@ import {
   buildRainfallTexture,
 } from '../planet/heightField';
 import { buildCellAreaTexture } from '../planet/cellArea';
+import { dirToFaceUV } from '../tsl/warp';
+import { heightScaleUniform } from '../tsl/heightScale';
 import { makeTerrainMaterial } from '../materials/terrainMaterial';
 import { HeightFields, FieldSet, buildSeedCompute, buildFillZero } from '../sim/fields';
 import { buildSeamTable, type SeamTable } from '../planet/seamTable';
@@ -51,6 +57,9 @@ import {
 } from '../ui/Controls';
 import { Sidebar } from '../ui/Sidebar';
 import { PLANET, SIM, RENDER, FACES, type FaceName } from '../config';
+
+/** RingGeometry's default facing normal (+Z); used to orient the cursor to the surface. */
+const CURSOR_Z = new Vector3(0, 0, 1);
 
 export interface SimHooks {
   /** One fixed sim tick. No-op until M4. */
@@ -85,6 +94,21 @@ export class Engine {
   private readonly debugMats = new Map<FaceName, Material>();
   private debugOn = false;
   private debugMode = 0;
+  private readonly heightData = new Map<FaceName, Float32Array>();
+  private cursor!: Mesh;
+
+  /** CPU bedrock height [0,1] at a planet-local direction (for pick refinement +
+   *  cursor). Initial fbm — stale after heavy erosion, but fixes the bulk offset. */
+  private surfaceHeightAt = (dir: Vector3): number => {
+    const { face, u, v } = dirToFaceUV([dir.x, dir.y, dir.z]);
+    const data = this.heightData.get(face);
+    if (!data) return 0;
+    const n = this.heightFields.n;
+    const res = PLANET.res;
+    const tx = Math.min(res, Math.max(0, Math.round(((u + 1) / 2) * res)));
+    const ty = Math.min(res, Math.max(0, Math.round(((v + 1) / 2) * res)));
+    return data[ty * n + tx];
+  };
   private simPaused = false; // 'p' — freeze sim (diagnostic: sim vs render cost)
   private bakeCounter = 0;
   private waterPlanet!: PlanetMesh;
@@ -173,14 +197,15 @@ export class Engine {
     // these shells run noise shaders per-fragment over the whole screen every
     // frame -> heavy. let them be toggled off for perf (key 'w' / GUI).
     this.weatherMeshes = [atmo, clouds, rain];
-    this.setWeather(this.weatherOn);
+    this.setWeather(this.weatherSettings.enabled);
   }
 
   private weatherMeshes: Mesh[] = [];
-  private weatherOn = false; // off by default: full-screen noise shells are heavy; opt in with 'w'
+  // off by default: full-screen noise shells are heavy; opt in via 'w' / GUI.
+  readonly weatherSettings = { enabled: false };
 
   setWeather = (on: boolean): void => {
-    this.weatherOn = on;
+    this.weatherSettings.enabled = on;
     for (const m of this.weatherMeshes) m.visible = on;
   };
 
@@ -202,6 +227,21 @@ export class Engine {
 
     this.planet = new PlanetMesh(PLANET.res, PLANET.baseRadius, makeFlatSolidMaterial());
     this.scene.add(this.planet.group);
+
+    // surface-following interaction cursor: a glowing ring laid tangent to the
+    // terrain at the pick point. child of the planet group so it rides rotation.
+    const cursorMat = new MeshBasicMaterial({
+      color: 0x6fe8ff,
+      transparent: true,
+      opacity: 0.85,
+      side: DoubleSide,
+      depthWrite: false,
+      depthTest: false, // always readable (only ever placed at the near hit)
+    });
+    this.cursor = new Mesh(new RingGeometry(0.78, 1.0, 48), cursorMat);
+    this.cursor.renderOrder = 11;
+    this.cursor.visible = false;
+    this.planet.group.add(this.cursor);
 
     // M2: per-face GPU height field (ping-pong), seeded from CPU fbm,
     // terrain material samples the front storage texture, brush stamps it.
@@ -248,6 +288,8 @@ export class Engine {
         this.simulation.loose.field(face).main,
         this.terrainNormals.field(face).main,
         this.simulation.erosionViz.field(face).main,
+        this.simulation.rainfall.field(face).main,
+        this.simulation.hardness.field(face).main,
       ).material;
       this.terrainMats.set(face, terrainMat);
       this.debugMats.set(
@@ -332,6 +374,8 @@ export class Engine {
       onClearSources: () => this.emitter.clear(this.renderer),
       onErosionChange: () => this.simulation.setErosion(this.erosionSettings.enabled),
       onLightingChange: this.applyLighting,
+      weather: this.weatherSettings,
+      onWeatherToggle: (on: boolean) => this.setWeather(on),
     });
     this.sidebar = new Sidebar({
       brush: this.brushSettings,
@@ -377,7 +421,14 @@ export class Engine {
 
   /** Applied once per frame (coalesced) while dragging — not per pointer event. */
   private applyBrush(): void {
-    const pick = pickPlanet(this.ndc, this.camera, this.planet.group, PLANET.res);
+    const pick = pickPlanet(
+      this.ndc,
+      this.camera,
+      this.planet.group,
+      PLANET.res,
+      this.surfaceHeightAt,
+      heightScaleUniform.value,
+    );
     if (!pick) return;
     if (this.riverMode) {
       // place/extend a continuous river source (persists, emits each tick).
@@ -414,10 +465,41 @@ export class Engine {
   };
 
   private onPointerMove = (e: PointerEvent): void => {
-    if (!this.brushing) return;
-    this.setNdc(e);
-    this.brushDirty = true; // coalesced: applied in frame()
+    this.setNdc(e); // always track pointer so the cursor follows on hover
+    if (this.brushing) this.brushDirty = true; // coalesced: applied in frame()
   };
+
+  /** Position the surface cursor at the pick point (planet-local). */
+  private updateCursor(): void {
+    const active = this.sculptMode || this.riverMode || this.volcanoMode;
+    if (!active || !this.cursor) {
+      if (this.cursor) this.cursor.visible = false;
+      return;
+    }
+    const pick = pickPlanet(
+      this.ndc,
+      this.camera,
+      this.planet.group,
+      PLANET.res,
+      this.surfaceHeightAt,
+      heightScaleUniform.value,
+    );
+    if (!pick) {
+      this.cursor.visible = false;
+      return;
+    }
+    this.cursor.visible = true;
+    const r = PLANET.baseRadius + this.surfaceHeightAt(pick.dir) * heightScaleUniform.value;
+    this.cursor.position.copy(pick.dir).multiplyScalar(r + 0.012);
+    this.cursor.quaternion.setFromUnitVectors(CURSOR_Z, pick.dir);
+    const toolR = this.riverMode
+      ? this.riverSettings.radius
+      : this.volcanoMode
+        ? 0.014
+        : this.brushSettings.radius;
+    const w = Math.max(0.05, toolR * PLANET.baseRadius);
+    this.cursor.scale.set(w, w, w);
+  }
 
   private onPointerUp = (): void => {
     if (!this.brushing) return;
@@ -442,7 +524,8 @@ export class Engine {
         this.controls.gui.controllersRecursive().forEach((c) => c.updateDisplay());
         break;
       case 'w':
-        this.setWeather(!this.weatherOn); // toggle weather shells (perf)
+        this.setWeather(!this.weatherSettings.enabled); // toggle weather shells (perf)
+        this.controls.gui.controllersRecursive().forEach((c) => c.updateDisplay());
         break;
       case 'p':
         this.simPaused = !this.simPaused; // freeze sim (diagnostic)
@@ -516,6 +599,7 @@ export class Engine {
     }
 
     this.orbit.update();
+    this.updateCursor();
     this.renderer.render(this.scene, this.camera);
 
     this.updateHud(dt);
@@ -528,7 +612,7 @@ export class Engine {
     if (this.hud) {
       this.hud.textContent =
         `fps ${this.fpsEma.toFixed(0)}  ${this.frameMsEma.toFixed(1)}ms\n` +
-        `res ${PLANET.res}  sim ${SIM.ticksPerSecond}/s  rain:${this.waterSettings.rainOn ? 'on' : 'off'} [r]  weather:${this.weatherOn ? 'on' : 'off'} [w]  sim:${this.simPaused ? 'PAUSED' : 'on'} [p]\n` +
+        `res ${PLANET.res}  sim ${SIM.ticksPerSecond}/s  rain:${this.waterSettings.rainOn ? 'on' : 'off'} [r]  weather:${this.weatherSettings.enabled ? 'on' : 'off'} [w]  sim:${this.simPaused ? 'PAUSED' : 'on'} [p]\n` +
         `[g] ${this.sculptMode ? 'SCULPT' : 'orbit'}  brush:${this.brushSettings.mode} [1raise 2lower 3smooth 4flatten]  [v]debug:${DEBUG_MODES[this.debugMode]}`;
     }
   }

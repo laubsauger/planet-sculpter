@@ -17,9 +17,9 @@ export interface LightingSettings {
 export const lightingSettings: LightingSettings = {
   azimuth: 0.7,
   elevation: 0.7,
-  sunIntensity: 2.4,
-  fill: 0.5,
-  ambient: 0.65,
+  sunIntensity: 2.6,
+  fill: 0.6, // anti-sun directional fill -> dark hemisphere readable, but not washed blue
+  ambient: 0.35, // low flat hemispheric ambient -> keeps color contrast/saturation
 };
 
 /** World-space unit direction TOWARD the sun (for shaders). */
