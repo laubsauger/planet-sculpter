@@ -26,7 +26,7 @@ export const FLAT = {
   worldSize: 12, // XZ extent (world units)
   heightScale: 3.8, // max Y displacement of height=1 (steep mountains)
   seaLevel: 0.26, // normalized height of the sea surface (~80% land above)
-  meshDetail: 1, // render-mesh tessellation × grid (per-vertex bicubic normal = smooth shading cheaply)
+  meshDetail: 1, // reconstruction/shading smooth the sim grid without multiplying triangles
 } as const;
 
 export const SIM = {

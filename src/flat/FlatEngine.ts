@@ -4,7 +4,7 @@
 
 import {
   Scene, PerspectiveCamera, DirectionalLight, HemisphereLight, Color, Fog,
-  Vector2, Vector3, Raycaster, Plane,
+  Vector2, Vector3, Raycaster, Plane, Mesh, TimestampQuery, DataTexture, RedFormat, FloatType,
 } from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import GUI from 'lil-gui';
@@ -12,19 +12,23 @@ import { OrbitController } from '../app/OrbitController';
 import { buildFlatSeed } from './flatSeed';
 import { buildFlatMesh } from './flatMesh';
 import { makeFlatTerrain } from '../materials/flatTerrain';
-import { makeFlatWater } from '../materials/flatWater';
+import { flowBandScale, flowBandStrength, makeFlatWater } from '../materials/flatWater';
+import { makeFlatDebug, FLAT_DEBUG_MODES, flatDebugMode } from '../materials/flatDebug';
 import { FlatBrush } from './FlatBrush';
-import { FlatSim } from './flatSim';
+import { FlatSim, FLAT_WATER_SOLVERS } from './flatSim';
+import { buildFlatBenchmark, FLAT_BENCHMARKS, type FlatBenchmark, type FlatBenchmarkData } from './flatBenchmarks';
 import { Sidebar } from '../ui/Sidebar';
 import { GridField, buildGridSeed } from '../sim/gridStore';
 import { flatHeightScale, flatSeaLevel, detailStrength, detailFreq } from '../tsl/flatSurface';
 import { sunDirUniform, sunIntensityU, ambientU } from '../tsl/lighting';
-import { waterUniforms } from '../sim/passes/water';
+import { mudViscosityFactor, waterUniforms } from '../sim/passes/water';
 import { erosionUniforms } from '../sim/passes/erosion';
 import { FLAT, SIM, RENDER } from '../config';
 import type { BrushMode } from '../tools/BrushTool';
 
 export class FlatEngine {
+  private static readonly SCENE_BACKGROUND = 0x9ec4e0;
+  private static readonly DEBUG_BACKGROUND = 0x11151c;
   readonly renderer: WebGPURenderer;
   private readonly scene = new Scene();
   private readonly camera: PerspectiveCamera;
@@ -32,6 +36,11 @@ export class FlatEngine {
   private heightField!: GridField;
   private brush!: FlatBrush;
   private sim!: FlatSim;
+  private terrainMesh!: Mesh;
+  private waterMesh!: Mesh;
+  private terrainMaterial!: ReturnType<typeof makeFlatTerrain>;
+  private debugMaterial!: ReturnType<typeof makeFlatDebug>;
+  private defaultState!: FlatBenchmarkData;
   private sidebar!: Sidebar;
   private sun!: DirectionalLight;
   private sky!: HemisphereLight;
@@ -39,6 +48,17 @@ export class FlatEngine {
   private fpsEma = RENDER.targetFps;
   private lastTime = 0;
   private simAccum = 0;
+  private simCpuMsEma = 0;
+  private gpuComputeMs = 0;
+  private gpuRenderMs = 0;
+  private timingPending = false;
+  private lastTimingResolve = 0;
+  private lastComputeCalls = 0;
+  private computeCallsFrame = 0;
+  private debugMode = 0;
+  private readonly diagnostics = { benchmark: 'default' as FlatBenchmark };
+  private snapshotText = '';
+  private previousEarthMass: number | null = null;
   private readonly simInterval = 1 / SIM.ticksPerSecond;
   private readonly canvas: HTMLCanvasElement;
 
@@ -51,13 +71,13 @@ export class FlatEngine {
   private riverMode = false;
   private readonly brushSettings = { mode: 'raise' as BrushMode, radius: 0.06, strength: 0.02, rate: 0.4, target: 0.4 };
   private readonly water = { rainOn: false, rainRate: SIM.rainRate };
-  private readonly river = { rate: 0.012, radius: 0.018 };
+  private readonly river = { rate: 2, radius: 0.022 };
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
-    this.renderer = new WebGPURenderer({ canvas, antialias: true });
-    this.scene.background = new Color(0x9ec4e0);
-    this.scene.fog = new Fog(0x9ec4e0, FLAT.worldSize * 1.3, FLAT.worldSize * 3.2);
+    this.renderer = new WebGPURenderer({ canvas, antialias: true, trackTimestamp: true });
+    this.scene.background = new Color(FlatEngine.SCENE_BACKGROUND);
+    this.scene.fog = new Fog(FlatEngine.SCENE_BACKGROUND, FLAT.worldSize * 1.3, FLAT.worldSize * 3.2);
     this.camera = new PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.05, 200);
     this.camera.position.set(0, FLAT.worldSize * 0.7, FLAT.worldSize * 0.85);
     this.orbit = new OrbitController(this.camera, canvas);
@@ -82,6 +102,15 @@ export class FlatEngine {
 
     const W = FLAT.gridW, H = FLAT.gridH;
     const seed = buildFlatSeed(W, H);
+    this.defaultState = {
+      height: seed.height.texture,
+      loose: seed.loose.texture,
+      water: this.zeroTexture(W, H),
+      sediment: this.zeroTexture(W, H),
+      source: this.zeroTexture(W, H),
+      rainOn: false,
+      erosionOn: false,
+    };
     this.heightField = new GridField(W, H);
     this.renderer.compute(buildGridSeed(seed.height.texture as never, this.heightField.main, W, H));
     this.brush = new FlatBrush(this.heightField.main, this.heightField.scratch, W, H);
@@ -90,13 +119,32 @@ export class FlatEngine {
 
     // render mesh denser than the sim grid (bicubic smooths between texels).
     const mW = Math.round(W * FLAT.meshDetail), mH = Math.round(H * FLAT.meshDetail);
-    const terrain = makeFlatTerrain(this.heightField.main, this.sim.loose.main, seed.moisture.texture, seed.hardness.texture);
-    this.scene.add(buildFlatMesh(mW, mH, terrain));
+    this.terrainMaterial = makeFlatTerrain(
+      this.heightField.main,
+      this.sim.loose.main,
+      seed.moisture.texture,
+      seed.hardness.texture,
+      this.sim.water.main,
+      this.sim.sediment.main,
+      this.sim.activity.main,
+    );
+    this.debugMaterial = makeFlatDebug(
+      this.heightField.main,
+      this.sim.water.main,
+      this.sim.velocity.main,
+      this.sim.sediment.main,
+      this.sim.loose.main,
+      this.sim.source.main,
+      this.sim.flux.main,
+      this.sim.activity.main,
+    );
+    this.terrainMesh = buildFlatMesh(mW, mH, this.terrainMaterial);
+    this.scene.add(this.terrainMesh);
 
-    const water = makeFlatWater(this.heightField.main, this.sim.water.main, this.sim.velocity.main);
-    const waterMesh = buildFlatMesh(mW, mH, water);
-    waterMesh.renderOrder = 1;
-    this.scene.add(waterMesh);
+    const water = makeFlatWater(this.heightField.main, this.sim.water.main, this.sim.velocity.main, this.sim.sediment.main);
+    this.waterMesh = buildFlatMesh(mW, mH, water);
+    this.waterMesh.renderOrder = 1;
+    this.scene.add(this.waterMesh);
 
     this.buildGui();
     this.sidebar = new Sidebar({
@@ -132,10 +180,14 @@ export class FlatEngine {
     const wf = gui.addFolder('Water');
     wf.add(this.water, 'rainOn').name('rain [r]');
     wf.add(this.water, 'rainRate', 0, 0.02, 0.0005).name('rain rate');
+    wf.add(this.sim, 'waterSolver', FLAT_WATER_SOLVERS).name('solver');
     wf.add(waterUniforms.evapProp, 'value', 0, 0.4, 0.005).name('evaporation /s');
+    wf.add(mudViscosityFactor, 'value', 0, 10, 0.25).name('mud viscosity');
+    wf.add(flowBandStrength, 'value', 0, 1, 0.02).name('flow band strength');
+    wf.add(flowBandScale, 'value', 2, 20, 0.5).name('flow band scale');
     wf.add({ riverTool: () => { this.riverMode = !this.riverMode; if (this.riverMode && !this.sculptMode) { this.sculptMode = true; this.orbit.controls.enableRotate = false; } } }, 'riverTool').name('river source tool');
-    wf.add(this.river, 'rate', 0, 0.05, 0.001).name('river rate');
-    wf.add(this.river, 'radius', 0.005, 0.06, 0.002).name('river radius');
+    wf.add(this.river, 'rate', 0, 4, 0.05).name('river discharge');
+    wf.add(this.river, 'radius', 0.008, 0.08, 0.002).name('spring radius');
     wf.add({ clear: () => this.sim.clearWater() }, 'clear').name('clear water');
     wf.add({ cs: () => this.sim.clearSources() }, 'cs').name('clear sources');
     const e = gui.addFolder('Erosion');
@@ -144,6 +196,77 @@ export class FlatEngine {
     e.add(erosionUniforms.sedimentCapacity, 'value', 0, 1, 0.02).name('capacity');
     e.add(erosionUniforms.deposit, 'value', 0, 0.3, 0.01).name('deposit');
     e.add(erosionUniforms.talus, 'value', 0.002, 0.06, 0.002).name('talus');
+    const diagnostics = gui.addFolder('Diagnostics');
+    diagnostics.add(this.diagnostics, 'benchmark', FLAT_BENCHMARKS).name('benchmark');
+    diagnostics.add({ load: () => this.loadBenchmark(this.diagnostics.benchmark) }, 'load').name('load benchmark');
+    diagnostics.add({ snapshot: () => { void this.snapshotConservation(); } }, 'snapshot').name('conservation snapshot');
+    diagnostics.add({ cycleDebug: () => this.cycleDebug() }, 'cycleDebug').name('cycle debug [v]');
+  }
+
+  private zeroTexture(w: number, h: number) {
+    const data = new Float32Array(w * h);
+    const texture = new DataTexture(data, w, h, RedFormat, FloatType);
+    texture.needsUpdate = true;
+    return texture;
+  }
+
+  private loadBenchmark(name: FlatBenchmark): void {
+    const state = name === 'default' ? this.defaultState : buildFlatBenchmark(name, FLAT.gridW, FLAT.gridH);
+    this.sim.loadState(state);
+    this.water.rainOn = state.rainOn;
+    this.sim.erosionEnabled = state.erosionOn;
+    this.simAccum = 0;
+    this.snapshotText = '';
+    this.previousEarthMass = null;
+    this.sidebar?.sync();
+  }
+
+  private cycleDebug(): void {
+    this.debugMode = (this.debugMode + 1) % FLAT_DEBUG_MODES.length;
+    flatDebugMode.value = this.debugMode;
+    this.terrainMesh.material = this.debugMode === 0 ? this.terrainMaterial : this.debugMaterial;
+    this.waterMesh.visible = this.debugMode === 0;
+    const background = this.debugMode === 0 ? FlatEngine.SCENE_BACKGROUND : FlatEngine.DEBUG_BACKGROUND;
+    (this.scene.background as Color).setHex(background);
+    (this.scene.fog as Fog).color.setHex(background);
+  }
+
+  private async snapshotConservation(): Promise<void> {
+    type ReadbackBackend = {
+      copyTextureToBuffer(texture: unknown, x: number, y: number, w: number, h: number, face: number): Promise<{ readonly length: number; readonly [index: number]: number }>;
+    };
+    const backend = this.renderer.backend as unknown as ReadbackBackend;
+    const sum = async (field: GridField): Promise<number> => {
+      const data = await backend.copyTextureToBuffer(field.main, 0, 0, FLAT.gridW, FLAT.gridH, 0);
+      let total = 0;
+      for (let i = 0; i < data.length; i++) total += Number(data[i]);
+      return total;
+    };
+    const [height, loose, water, sediment] = await Promise.all([
+      sum(this.heightField),
+      sum(this.sim.loose),
+      sum(this.sim.water),
+      sum(this.sim.sediment),
+    ]);
+    const earth = height + sediment;
+    const earthDelta = this.previousEarthMass === null ? 0 : earth - this.previousEarthMass;
+    this.previousEarthMass = earth;
+    this.snapshotText = `mass earth:${earth.toFixed(1)} Δ${earthDelta.toExponential(2)} loose:${loose.toFixed(1)} water:${water.toFixed(1)} sed:${sediment.toFixed(1)}`;
+    console.table({ earth, earthDelta, height, loose, water, sediment });
+  }
+
+  private resolveGpuTimings(): void {
+    if (this.timingPending) return;
+    this.timingPending = true;
+    void Promise.all([
+      this.renderer.resolveTimestampsAsync(TimestampQuery.COMPUTE),
+      this.renderer.resolveTimestampsAsync(TimestampQuery.RENDER),
+    ]).then(([compute, render]) => {
+      this.gpuComputeMs = compute ?? 0;
+      this.gpuRenderMs = render ?? 0;
+    }).finally(() => {
+      this.timingPending = false;
+    });
   }
 
   /** ndc -> world plane (y=0) -> uv in [0,1]. */
@@ -183,6 +306,7 @@ export class FlatEngine {
       case '3': this.brushSettings.mode = 'smooth'; this.riverMode = false; break;
       case '4': this.brushSettings.mode = 'flatten'; this.riverMode = false; break;
       case 'r': this.water.rainOn = !this.water.rainOn; break;
+      case 'v': this.cycleDebug(); break;
     }
     this.sidebar?.sync();
   };
@@ -195,18 +319,32 @@ export class FlatEngine {
     this.lastTime = time;
 
     this.sim.setRain(this.water.rainOn ? this.water.rainRate : 0);
+    const simStart = performance.now();
     this.simAccum += dt;
     let steps = 0;
     while (this.simAccum >= this.simInterval && steps < SIM.maxStepsPerFrame) {
       this.sim.tick(this.simInterval); this.simAccum -= this.simInterval; steps++;
     }
     if (this.simAccum > this.simInterval * SIM.maxStepsPerFrame) this.simAccum = 0;
+    const simCpuMs = performance.now() - simStart;
+    this.simCpuMsEma += (simCpuMs - this.simCpuMsEma) * 0.1;
 
     this.orbit.update();
+    const computeCalls = this.renderer.info.compute.calls;
+    const computeDelta = computeCalls - this.lastComputeCalls;
+    if (computeDelta > 0) this.computeCallsFrame = computeDelta;
+    this.lastComputeCalls = computeCalls;
     this.renderer.render(this.scene, this.camera);
+    if (time - this.lastTimingResolve > 1000) {
+      this.lastTimingResolve = time;
+      this.resolveGpuTimings();
+    }
     if (this.hud) {
       this.fpsEma += (1000 / Math.max(dt * 1000, 0.001) - this.fpsEma) * 0.1;
-      this.hud.textContent = `fps ${this.fpsEma.toFixed(0)}  FLAT ${FLAT.gridW}x${FLAT.gridH}  [g]${this.sculptMode ? 'SCULPT' : 'orbit'} ${this.riverMode ? 'RIVER' : this.brushSettings.mode} [r]rain:${this.water.rainOn ? 'on' : 'off'}`;
+      this.hud.textContent =
+        `fps ${this.fpsEma.toFixed(0)}  FLAT ${FLAT.gridW}x${FLAT.gridH}  cpu-sim ${this.simCpuMsEma.toFixed(2)}ms  gpu compute/render ${this.gpuComputeMs.toFixed(2)}/${this.gpuRenderMs.toFixed(2)}ms  dispatch ${this.computeCallsFrame}\n` +
+        `benchmark:${this.diagnostics.benchmark}  solver:${this.sim.waterSolver}${this.sim.waterSolver === 'momentum' ? ` x${this.sim.momentumSubsteps}` : ''}  debug:${FLAT_DEBUG_MODES[this.debugMode]} [v]  [g]${this.sculptMode ? 'SCULPT' : 'orbit'} ${this.riverMode ? 'RIVER' : this.brushSettings.mode} [r]rain:${this.water.rainOn ? 'on' : 'off'}\n` +
+        this.snapshotText;
     }
   };
 

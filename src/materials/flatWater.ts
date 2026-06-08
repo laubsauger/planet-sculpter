@@ -7,12 +7,11 @@
 import { DoubleSide, type Texture } from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import {
-  textureLoad, ivec2, uv, mix, smoothstep, max, clamp, float, vec2, vec3, length,
-  normalize, dot, pow, sin, time, cameraPosition, mx_fractal_noise_float,
+  textureLoad, uv, mix, smoothstep, max, clamp, float, vec2, vec3, length,
+  normalize, dot, pow, sin, time, cameraPosition, mx_fractal_noise_float, uniform,
 } from 'three/tsl';
-import { flatSurface, bilinear } from '../tsl/flatSurface';
+import { flatSurface, bilinear, flatGridX, flatGridY } from '../tsl/flatSurface';
 import { sunDirUniform, sunIntensityU } from '../tsl/lighting';
-import { FLAT } from '../config';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -21,19 +20,20 @@ const MID = vec3(0.08, 0.46, 0.62);
 const DEEP = vec3(0.02, 0.15, 0.34);
 const SKY_REFLECT = vec3(0.6, 0.78, 0.95);
 const FOAM = vec3(0.95, 0.98, 1.0);
+const SILT = vec3(0.76, 0.68, 0.48);
+export const flowBandStrength = uniform(0.52);
+export const flowBandScale = uniform(9);
 
-export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Texture): MeshBasicNodeMaterial {
-  const W = FLAT.gridW, H = FLAT.gridH;
-  const fx = uv().x.mul(W), fy = uv().y.mul(H);
-  const cx = (x: any) => x.max(float(0)).min(float(W - 1)).toInt();
-  const cy = (y: any) => y.max(float(0)).min(float(H - 1)).toInt();
-  const coord = ivec2(cx(fx.floor()), cy(fy.floor()));
+export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Texture, sedimentTex: Texture): MeshBasicNodeMaterial {
+  const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
 
-  const s = flatSurface((c: any) => textureLoad(heightTex, c).x.add(textureLoad(waterTex, c).x), false);
+  const s = flatSurface((c: any) => textureLoad(heightTex, c).x.add(textureLoad(waterTex, c).x), false, true);
   const depth = bilinear((c: any) => textureLoad(waterTex, c).x, fx, fy);
-  const vel = textureLoad(velTex, coord);
+  const vel = bilinear((c: any) => textureLoad(velTex, c).xy, fx, fy);
+  const sediment = bilinear((c: any) => textureLoad(sedimentTex, c).x, fx, fy);
   const flow = vec2(vel.x, vel.y);
   const speed = length(flow);
+  const flowDir = normalize(flow.add(vec2(1e-5, 0)));
 
   // calm wave + flow normals (subtle ripple, not noise soup).
   const posXZ = vec2(s.position.x, s.position.z);
@@ -49,6 +49,24 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   // depth color (view-INDEPENDENT base, always visible).
   let col: any = mix(SHALLOW, MID, smoothstep(0.01, 0.09, depth));
   col = mix(col, DEEP, smoothstep(0.09, 0.32, depth));
+  const concentration = sediment.div(max(depth, float(0.003)));
+  col = mix(col, SILT, smoothstep(0.04, 0.45, concentration).mul(0.78));
+
+  // Broad flow-aligned bands remain readable from overhead and in flat light.
+  // Variation is mostly across the flow, with a moving along-flow breakup.
+  const acrossDir = vec2(flowDir.y.mul(-1), flowDir.x);
+  const along = dot(posXZ, flowDir);
+  const across = dot(posXZ, acrossDir);
+  const travel = time.mul(speed.mul(2.4).add(0.8));
+  const bend = sin(along.mul(2.1).sub(travel.mul(0.55))).mul(1.35)
+    .add(sin(along.mul(5.7).add(across.mul(0.8)).sub(travel.mul(0.2))).mul(0.42));
+  const spacing = across.mul(flowBandScale).add(sin(along.mul(0.72)).mul(1.8));
+  const ridges = sin(spacing.add(bend).sub(travel)).mul(0.5).add(0.5);
+  const breakup = sin(along.mul(11).sub(travel.mul(2.2))).mul(0.5).add(0.5);
+  const streak = smoothstep(0.64, 0.94, ridges).mul(breakup.mul(0.45).add(0.55));
+  const movingWater = smoothstep(0.015, 0.55, speed);
+  const streakStrength = streak.mul(movingWater).mul(smoothstep(0.0004, 0.05, depth));
+  col = mix(col, FOAM, streakStrength.mul(flowBandStrength));
 
   // world-space lighting: gentle sun diffuse keeps base bright + readable any angle.
   const viewW = normalize(cameraPosition.sub(s.position));
@@ -63,14 +81,20 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   col = col.add(vec3(1.0, 0.97, 0.9).mul(spec));
   // shoreline lapping foam + rapids.
   const lap = sin(posXZ.x.add(posXZ.y).mul(6).sub(time.mul(2.2))).mul(0.5).add(0.5);
-  const shore = float(1).sub(smoothstep(0.004, 0.045, depth));
-  const rapids = smoothstep(0.6, 1.6, speed).mul(smoothstep(0.004, 0.02, depth));
-  col = mix(col, FOAM, max(shore.mul(lap.mul(0.6).add(0.2)), rapids.mul(0.7)).min(float(1)));
+  const shore = float(1).sub(smoothstep(0.0005, 0.025, depth));
+  const rapids = smoothstep(0.08, 0.8, speed).mul(smoothstep(0.0004, 0.035, depth));
+  col = mix(col, FOAM, max(shore.mul(lap.mul(0.6).add(0.2)), rapids.mul(0.72).add(streakStrength.mul(0.42))).min(float(1)));
 
-  const opacity = clamp(smoothstep(0.0015, 0.02, depth).mul(0.65).add(smoothstep(0.02, 0.12, depth).mul(0.34)), float(0), float(0.97));
+  const opacity = clamp(
+    smoothstep(0.00012, 0.004, depth).mul(0.54)
+      .add(smoothstep(0.004, 0.08, depth).mul(0.43)),
+    float(0),
+    float(0.97),
+  );
 
   const mat = new MeshBasicNodeMaterial({ transparent: true, side: DoubleSide });
-  mat.positionNode = s.position;
+  const visualLift = smoothstep(0.00008, 0.004, depth).mul(0.008);
+  mat.positionNode = vec3(s.position.x, s.position.y.add(visualLift), s.position.z);
   mat.colorNode = col;
   mat.opacityNode = opacity;
   mat.depthWrite = false;

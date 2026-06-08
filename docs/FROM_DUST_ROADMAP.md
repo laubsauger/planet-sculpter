@@ -134,16 +134,35 @@ and map-boundary rules.
 
 ### M0: Establish a Measurable Baseline
 
-- Declare the flat path canonical in the architecture docs.
-- Add deterministic benchmark scenarios: river-to-sea, dam break, delta, rain
+Status: implemented and runtime-validated on an Apple M3 Max.
+
+- [x] Declare the flat path canonical in the architecture docs.
+- [x] Add deterministic benchmark scenarios: river-to-sea, dam break, delta, rain
   erosion, and brush stress.
-- Add debug views for water, velocity, flux, sediment, mobile earth, erosion,
+- [x] Add debug views for water, velocity, flux, sediment, mobile earth, erosion,
   deposition, and active cells.
-- Add optional, low-frequency diagnostics for total water, suspended sediment,
+- [x] Add optional, low-frequency diagnostics for total water, suspended sediment,
   and terrain material. Readback must not occur in the hot loop.
-- Measure CPU frame time, total simulation time, and ideally GPU time per pass.
-- Set budgets for a representative Apple Silicon device:
+- [x] Measure CPU frame time, aggregate GPU compute/render time, and dispatch count.
+- [x] Capture initial baseline measurements on a representative Apple Silicon device:
   `60 FPS render`, `30-60 Hz water`, and lower-frequency erosion/ecology.
+
+Initial Chrome/WebGPU measurements at `512 x 512`, 20 simulation ticks/second:
+
+- Default pipe-water map: approximately `0.26 ms` aggregate GPU compute,
+  `0.48 ms` GPU render, 8 dispatches per tick.
+- Delta benchmark with erosion: approximately `0.65 ms` GPU compute,
+  `0.47 ms` GPU render, 16 dispatches per tick.
+- Dam-break pipe solver: approximately `0.26 ms` GPU compute and 8 dispatches.
+- Dam-break momentum prototype: approximately `0.16-0.36 ms` GPU compute and
+  5 dispatches. The water-heavy render measured `~19-21 ms` for both solvers and
+  is currently the dominant dam-break cost.
+- Local-wave-speed momentum dam break: approximately `0.19 ms` GPU compute and
+  5 dispatches before sediment coupling. Closed-map water drift measured about
+  `0.0016%` over six seconds.
+- Coupled momentum delta with sediment and erosion: approximately `0.67 ms` GPU
+  compute and 15 dispatches. Earth drift measured about
+  `0.00145 / 108,276` over eight seconds.
 
 Exit criteria:
 
@@ -152,16 +171,19 @@ Exit criteria:
 
 ### M1: Correct Material Transport
 
-- Replace semi-Lagrangian sediment sampling with conservative sediment transfer
+Status: core transport and mobile-earth rules implemented; WebGPU runtime
+conservation measurements and invariant automation remain.
+
+- [x] Replace semi-Lagrangian sediment sampling with conservative sediment transfer
   proportional to directional water outflow and local concentration.
-- Split total terrain behavior into explicit rock and mobile-earth transfers.
-- Make thermal slumping move mobile earth first; only explicit rockfall or
+- [x] Preserve explicit mobile earth over implicit fixed rock during transfers.
+- [x] Make thermal slumping move mobile earth first; only explicit rockfall or
   weathering rules should move rock.
-- Add still-water settling and sediment-driven viscosity after conservative
+- [x] Add still-water settling and sediment-driven viscosity after conservative
   transport works.
-- Port erosion/deposition activity textures and flat debug views from the older
+- [x] Port erosion/deposition activity textures and flat debug views from the older
   path.
-- Add invariant tests for non-negativity and conservation under closed-boundary
+- [ ] Add automated GPU invariant tests for non-negativity and conservation under closed-boundary
   scenarios.
 
 Exit criteria:
@@ -172,17 +194,48 @@ Exit criteria:
 
 ### M2: Improve Water Dynamics
 
-- Prototype a conservative 2D shallow-water finite-volume solver storing
-  `h`, `hu`, and `hv`, using a robust flux such as Rusanov/HLL and a CFL-limited
-  timestep.
-- Compare it against the current pipe solver in the benchmark maps before
+Status: comparative solver, sediment transport, and erosion coupling implemented;
+normal river routing and surge interactions still need validation before it can
+replace the pipe solver.
+
+- [x] Prototype a conservative 2D shallow-water finite-volume solver storing
+  `h`, `hu`, and `hv`, using a local-wave-speed Rusanov flux.
+- [x] Expose pipe and momentum modes side-by-side in the active GUI/HUD.
+- [x] Compare it against the current pipe solver in the dam-break benchmark before
   replacing anything.
-- Require stable wet/dry fronts, terrain edits during flow, dam breaks, river
+- [x] Replace the prototype's fixed Rusanov wave-speed bound with local interface
+  wave speeds and bounded CFL substeps without GPU readback.
+- [x] Add conservative sediment transport and erosion coupling to momentum mode.
+- [ ] Require stable wet/dry fronts, terrain edits during flow, dam breaks, river
   routing, and reflected surge waves.
-- Add controllable tsunami/surge injection only after the underlying solver can
+- [ ] Add controllable tsunami/surge injection only after the underlying solver can
   propagate and interact with terrain.
-- Drive foam from velocity divergence, breaking/rapid flow, and shallow fronts
+- [ ] Drive foam from velocity divergence, breaking/rapid flow, and shallow fronts
   rather than depth alone.
+- [x] Add view-independent, flow-aligned moving bands and sediment tint so moving
+  water remains readable when specular lighting is not visible.
+- [x] Normalize spring controls as total discharge and add a connected
+  river-to-sea visual benchmark.
+
+Current prototype notes:
+
+- A closed dam-break run changed water mass by about `0.0016%` over roughly six
+  seconds after local-wave-speed Rusanov fluxes replaced the fixed bound.
+- Momentum sediment advection retained seeded sediment to displayed precision
+  over eight seconds before erosion was enabled.
+- The normal 20 Hz tick uses one momentum substep; larger external timesteps split
+  according to a conservative enforced depth/velocity bound, capped at eight.
+- Solver switching clears solver-specific momentum, pipe flux, and velocity state
+  so stale fields cannot contaminate comparisons.
+- Source rates are normalized total discharge rather than per-cell rates.
+- The river-to-sea visual benchmark now starts with a shallow connected river and
+  retains a normalized spring. Starting from a completely dry channel still pools
+  near the spring instead of routing downstream and remains an explicit M2 solver
+  defect, not a renderer issue.
+- Shallow visual water uses a small render-only surface lift so thin simulated
+  rivers do not disappear into the reconstructed terrain depth surface.
+- The connected momentum river rendered at approximately `12.7 ms` with
+  `0.49 ms` compute in the latest Chrome/WebGPU validation.
 
 Exit criteria:
 

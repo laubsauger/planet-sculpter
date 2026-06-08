@@ -8,18 +8,21 @@ import { Vector2 } from 'three';
 import {
   Fn, instanceIndex, textureLoad, textureStore, ivec2, uvec2, uint, int,
   float, vec2, vec4, max, min, length, mix, smoothstep, If, uniform,
-  mx_fractal_noise_float, vec3,
+  mx_fractal_noise_float, sqrt, vec3,
 } from 'three/tsl';
 import { GridField, buildGridCopy, buildGridFill, buildGridSeed } from '../sim/gridStore';
-import { waterUniforms } from '../sim/passes/water';
+import { mudViscosityFactor, waterUniforms } from '../sim/passes/water';
 import { erosionUniforms } from '../sim/passes/erosion';
 import {
   evapFlowReduce, evapSpeedRef, evapDeepReduce, evapDeepRef, evapShallowRef,
   rainOrographic, rainHighRef,
 } from '../sim/gridWater';
 import { flatSeaLevel } from '../tsl/flatSurface';
+import { momentumSubstepCount } from './momentumCfl';
 
 type CN = Parameters<WebGPURenderer['compute']>[0];
+export const FLAT_WATER_SOLVERS = ['pipe', 'momentum'] as const;
+export type FlatWaterSolver = (typeof FLAT_WATER_SOLVERS)[number];
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const EPS = 1e-6;
 
@@ -31,7 +34,7 @@ const cX = (x: any, w: number) => x.toFloat().max(float(0)).min(float(w - 1)).to
 const cY = (y: any, h: number) => y.toFloat().max(float(0)).min(float(h - 1)).toInt();
 
 /** Pipe outflow flux (L,R,T,B). */
-function flatFlux(b: StorageTexture, d: StorageTexture, fPrev: StorageTexture, fOut: StorageTexture, w: number, h: number): CN {
+function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture, fPrev: StorageTexture, fOut: StorageTexture, w: number, h: number): CN {
   const p = waterUniforms;
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
@@ -39,7 +42,9 @@ function flatFlux(b: StorageTexture, d: StorageTexture, fPrev: StorageTexture, f
     const hc = surf(ix, iy);
     const dc = textureLoad(d, ivec2(ix, iy)).x;
     const prev = textureLoad(fPrev, ivec2(ix, iy));
-    const k: any = p.dt.mul(p.pipeArea).mul(p.gravity).div(p.pipeLength);
+    const concentration = textureLoad(sediment, ivec2(ix, iy)).x.div(max(dc, float(EPS)));
+    const viscosity = float(1).add(concentration.mul(mudViscosityFactor)).min(float(8));
+    const k: any = p.dt.mul(p.pipeArea).mul(p.gravity).div(p.pipeLength).div(viscosity);
     let fL = max(float(0), prev.x.mul(p.damping).add(k.mul(hc.sub(surf(ix.sub(1), iy)))));
     let fR = max(float(0), prev.y.mul(p.damping).add(k.mul(hc.sub(surf(ix.add(1), iy)))));
     let fT = max(float(0), prev.z.mul(p.damping).add(k.mul(hc.sub(surf(ix, iy.add(1))))));
@@ -124,9 +129,187 @@ function flatUpdate(d: StorageTexture, f: StorageTexture, b: StorageTexture, sou
   return fn().compute(w * h) as CN;
 }
 
+/** Conservative shallow-water prototype. Stores momentum as (hu,hv), uses a
+ * Rusanov finite-volume flux, and applies bed slope/friction as source terms. */
+function flatMomentumUpdate(
+  d: StorageTexture,
+  momentum: StorageTexture,
+  b: StorageTexture,
+  source: StorageTexture,
+  dOut: StorageTexture,
+  momentumOut: StorageTexture,
+  fluxOut: StorageTexture,
+  w: number,
+  h: number,
+): CN {
+  const p = waterUniforms;
+  const fn = Fn(() => {
+    const { x, y, ix, iy } = coords(w);
+    const state = (cx: any, cy: any) => {
+      const depth = textureLoad(d, ivec2(cX(cx, w), cY(cy, h))).x.max(float(0));
+      const mom = textureLoad(momentum, ivec2(cX(cx, w), cY(cy, h)));
+      const wet = depth.greaterThan(float(1e-5)).select(float(1), float(0));
+      return vec3(depth, mom.x.mul(wet), mom.y.mul(wet));
+    };
+    const fluxX = (u: any) => {
+      const invH = float(1).div(max(u.x, float(1e-5)));
+      return vec3(u.y, u.y.mul(u.y).mul(invH).add(p.gravity.mul(u.x).mul(u.x).mul(0.5)), u.y.mul(u.z).mul(invH));
+    };
+    const fluxY = (u: any) => {
+      const invH = float(1).div(max(u.x, float(1e-5)));
+      return vec3(u.z, u.z.mul(u.y).mul(invH), u.z.mul(u.z).mul(invH).add(p.gravity.mul(u.x).mul(u.x).mul(0.5)));
+    };
+    const rusanovX = (left: any, right: any) => {
+      const hL: any = max(left.x, float(0));
+      const hR: any = max(right.x, float(0));
+      const aL: any = left.y.abs().div(max(hL, float(1e-5))).add(sqrt(p.gravity.mul(hL) as any));
+      const aR: any = right.y.abs().div(max(hR, float(1e-5))).add(sqrt(p.gravity.mul(hR) as any));
+      return fluxX(left).add(fluxX(right)).mul(0.5).sub(right.sub(left).mul(max(aL, aR)).mul(0.5));
+    };
+    const rusanovY = (bottom: any, top: any) => {
+      const hB: any = max(bottom.x, float(0));
+      const hT: any = max(top.x, float(0));
+      const aB: any = bottom.z.abs().div(max(hB, float(1e-5))).add(sqrt(p.gravity.mul(hB) as any));
+      const aT: any = top.z.abs().div(max(hT, float(1e-5))).add(sqrt(p.gravity.mul(hT) as any));
+      return fluxY(bottom).add(fluxY(top)).mul(0.5).sub(top.sub(bottom).mul(max(aB, aT)).mul(0.5));
+    };
+
+    const c = state(ix, iy);
+    const l = state(ix.sub(1), iy);
+    const r = state(ix.add(1), iy);
+    const bottom = state(ix, iy.sub(1));
+    const top = state(ix, iy.add(1));
+    const fL = rusanovX(l, c);
+    const fR = rusanovX(c, r);
+    const fB = rusanovY(bottom, c);
+    const fT = rusanovY(c, top);
+    const div = fR.sub(fL).add(fT.sub(fB));
+    const next: any = c.sub(div.mul(p.dt)).toVar();
+
+    const bed = (cx: any, cy: any) => textureLoad(b, ivec2(cX(cx, w), cY(cy, h))).x;
+    const bedDx = bed(ix.add(1), iy).sub(bed(ix.sub(1), iy)).mul(0.5);
+    const bedDy = bed(ix, iy.add(1)).sub(bed(ix, iy.sub(1))).mul(0.5);
+    next.y.assign(next.y.sub(p.dt.mul(p.gravity).mul(c.x).mul(bedDx)));
+    next.z.assign(next.z.sub(p.dt.mul(p.gravity).mul(c.x).mul(bedDy)));
+
+    const emit = textureLoad(source, ivec2(ix, iy)).x;
+    const oro = smoothstep(flatSeaLevel, flatSeaLevel.add(rainHighRef), bed(ix, iy));
+    const rain = p.source.mul(mix(float(1), oro, rainOrographic));
+    next.x.assign(next.x.add(rain.add(emit).mul(p.dt)).max(float(0)));
+    const need = flatSeaLevel.sub(bed(ix, iy)).max(float(0));
+    next.x.assign(next.x.max(need));
+
+    const wet = next.x.greaterThan(float(1e-5)).select(float(1), float(0));
+    const speed = length(vec2(next.y, next.z)).div(max(next.x, float(1e-5)));
+    const speedScale = min(float(1), float(4).div(max(speed, float(EPS))));
+    next.y.assign(next.y.mul(float(0.992)).mul(speedScale).mul(wet));
+    next.z.assign(next.z.mul(float(0.992)).mul(speedScale).mul(wet));
+
+    // Sealed boundaries. The ocean ring remains the explicit depth reservoir.
+    next.y.assign(ix.lessThan(int(1)).or(ix.greaterThan(int(w - 2))).select(float(0), next.y));
+    next.z.assign(iy.lessThan(int(1)).or(iy.greaterThan(int(h - 2))).select(float(0), next.z));
+    textureStore(dOut, uvec2(x, y), vec4(next.x, 0, 0, 1)).toWriteOnly();
+    textureStore(momentumOut, uvec2(x, y), vec4(next.y, next.z, 0, 1)).toWriteOnly();
+    textureStore(fluxOut, uvec2(x, y), vec4(
+      max(float(0).sub(fL.x), float(0)),
+      max(fR.x, float(0)),
+      max(fT.x, float(0)),
+      max(float(0).sub(fB.x), float(0)),
+    )).toWriteOnly();
+  });
+  return fn().compute(w * h) as CN;
+}
+
+function flatMomentumVelocity(momentum: StorageTexture, d: StorageTexture, velOut: StorageTexture, w: number, h: number): CN {
+  const fn = Fn(() => {
+    const { x, y, ix, iy } = coords(w);
+    const depth = textureLoad(d, ivec2(ix, iy)).x;
+    const mom = textureLoad(momentum, ivec2(ix, iy));
+    const wet = depth.greaterThan(float(1e-5)).select(float(1), float(0));
+    const velocity = vec2(mom.x, mom.y).div(max(depth, float(1e-5))).mul(wet);
+    textureStore(velOut, uvec2(x, y), vec4(velocity.x, velocity.y, 0, 1)).toWriteOnly();
+  });
+  return fn().compute(w * h) as CN;
+}
+
+/** Conservative upwind sediment advection using the same local Rusanov water
+ * mass flux as the momentum solver. */
+function flatMomentumSediment(
+  d: StorageTexture,
+  momentum: StorageTexture,
+  sediment: StorageTexture,
+  sedimentOut: StorageTexture,
+  w: number,
+  h: number,
+): CN {
+  const p = waterUniforms;
+  const fn = Fn(() => {
+    const { x, y, ix, iy } = coords(w);
+    const state = (cx: any, cy: any) => {
+      const depth = textureLoad(d, ivec2(cX(cx, w), cY(cy, h))).x.max(float(0));
+      const mom = textureLoad(momentum, ivec2(cX(cx, w), cY(cy, h)));
+      const wet = depth.greaterThan(float(1e-5)).select(float(1), float(0));
+      return vec3(depth, mom.x.mul(wet), mom.y.mul(wet));
+    };
+    const concentration = (cx: any, cy: any) => {
+      const depth = textureLoad(d, ivec2(cX(cx, w), cY(cy, h))).x;
+      const mass = textureLoad(sediment, ivec2(cX(cx, w), cY(cy, h))).x;
+      return mass.div(max(depth, float(1e-5)));
+    };
+    const massFluxX = (left: any, right: any) => {
+      const hL: any = max(left.x, float(0));
+      const hR: any = max(right.x, float(0));
+      const aL: any = left.y.abs().div(max(hL, float(1e-5))).add(sqrt(p.gravity.mul(hL) as any));
+      const aR: any = right.y.abs().div(max(hR, float(1e-5))).add(sqrt(p.gravity.mul(hR) as any));
+      return left.y.add(right.y).mul(0.5).sub(hR.sub(hL).mul(max(aL, aR)).mul(0.5));
+    };
+    const massFluxY = (bottom: any, top: any) => {
+      const hB: any = max(bottom.x, float(0));
+      const hT: any = max(top.x, float(0));
+      const aB: any = bottom.z.abs().div(max(hB, float(1e-5))).add(sqrt(p.gravity.mul(hB) as any));
+      const aT: any = top.z.abs().div(max(hT, float(1e-5))).add(sqrt(p.gravity.mul(hT) as any));
+      return bottom.z.add(top.z).mul(0.5).sub(hT.sub(hB).mul(max(aB, aT)).mul(0.5));
+    };
+    const upwind = (q: any, before: any, after: any) => q.greaterThan(float(0)).select(q.mul(before), q.mul(after));
+
+    const c = state(ix, iy);
+    const l = state(ix.sub(1), iy);
+    const r = state(ix.add(1), iy);
+    const bottom = state(ix, iy.sub(1));
+    const top = state(ix, iy.add(1));
+    const qL = massFluxX(l, c);
+    const qR = massFluxX(c, r);
+    const qB = massFluxY(bottom, c);
+    const qT = massFluxY(c, top);
+    const sL = upwind(qL, concentration(ix.sub(1), iy), concentration(ix, iy));
+    const sR = upwind(qR, concentration(ix, iy), concentration(ix.add(1), iy));
+    const sB = upwind(qB, concentration(ix, iy.sub(1)), concentration(ix, iy));
+    const sT = upwind(qT, concentration(ix, iy), concentration(ix, iy.add(1)));
+    const current = textureLoad(sediment, ivec2(ix, iy)).x;
+    const next = current.sub(sR.sub(sL).add(sT.sub(sB)).mul(p.dt));
+    textureStore(sedimentOut, uvec2(x, y), vec4(max(next, float(0)), 0, 0, 1)).toWriteOnly();
+  });
+  return fn().compute(w * h) as CN;
+}
+
 /** Erode/deposit: shallow fast water (rivers) carves, deep still (lakes/sea) spared;
  *  incision + lateral + 3D volumetric hardness; deposition builds deltas/beds. */
-function flatErosion(b: StorageTexture, loose: StorageTexture, s: StorageTexture, vel: StorageTexture, d: StorageTexture, hardness: StorageTexture, source: StorageTexture, bOut: StorageTexture, looseOut: StorageTexture, sOut: StorageTexture, w: number, h: number): CN {
+function flatErosion(
+  b: StorageTexture,
+  loose: StorageTexture,
+  s: StorageTexture,
+  vel: StorageTexture,
+  d: StorageTexture,
+  hardness: StorageTexture,
+  source: StorageTexture,
+  activity: StorageTexture,
+  bOut: StorageTexture,
+  looseOut: StorageTexture,
+  sOut: StorageTexture,
+  activityOut: StorageTexture,
+  w: number,
+  h: number,
+): CN {
   const u = erosionUniforms;
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
@@ -138,6 +321,9 @@ function flatErosion(b: StorageTexture, loose: StorageTexture, s: StorageTexture
     const bNew: any = bc.toVar();
     const looseNew: any = lc.toVar();
     const sNew: any = sc.toVar();
+    const activityPrev = textureLoad(activity, ivec2(ix, iy));
+    const erodeViz: any = activityPrev.x.mul(u.vizDecay).toVar();
+    const depositViz: any = activityPrev.y.mul(u.vizDecay).toVar();
     If(dc.greaterThan(float(0.0008)).or(sc.greaterThan(float(1e-5))), () => {
       const v = textureLoad(vel, ivec2(ix, iy));
       const dbx = bAt(ix.add(1), iy).sub(bAt(ix.sub(1), iy)).mul(0.5);
@@ -174,43 +360,86 @@ function flatErosion(b: StorageTexture, loose: StorageTexture, s: StorageTexture
       bNew.assign(max(bc.sub(erode).add(dep), float(0)));
       looseNew.assign(max(lc.sub(erode), float(0)).add(dep));
       sNew.assign(max(float(0), sc.add(erode).sub(dep)).min(float(2)));
+      erodeViz.assign(max(erodeViz, erode.div(CAP)));
+      depositViz.assign(max(depositViz, dep.div(CAP)));
     });
     textureStore(bOut, uvec2(x, y), vec4(bNew, 0, 0, 1)).toWriteOnly();
     textureStore(looseOut, uvec2(x, y), vec4(looseNew, 0, 0, 1)).toWriteOnly();
     textureStore(sOut, uvec2(x, y), vec4(sNew, 0, 0, 1)).toWriteOnly();
+    textureStore(activityOut, uvec2(x, y), vec4(erodeViz, depositViz, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
 }
 
-function flatAdvect(vel: StorageTexture, s: StorageTexture, sOut: StorageTexture, w: number, h: number): CN {
+/** Conservative sediment transport: sediment rides with directional water
+ *  transfer at the source cell's concentration. Closed boundaries conserve mass. */
+function flatSedimentTransport(d: StorageTexture, f: StorageTexture, s: StorageTexture, sOut: StorageTexture, w: number, h: number): CN {
+  const p = waterUniforms;
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
-    const v = textureLoad(vel, ivec2(ix, iy));
-    // step in CELLS/tick (NOT dt-scaled — dt*1/60 made it ~0.017 cells -> sediment
-    // never traveled to the sea). backtrace ~ velocity cells so it actually flows.
-    const step = erosionUniforms.advectScale.mul(erosionUniforms.simSpeed);
-    const bx = cX(ix.toFloat().sub(v.x.mul(step)), w);
-    const by = cY(iy.toFloat().sub(v.y.mul(step)), h);
-    textureStore(sOut, uvec2(x, y), vec4(textureLoad(s, ivec2(bx, by)).x, 0, 0, 1)).toWriteOnly();
+    const at = (tex: StorageTexture, cx: any, cy: any) => textureLoad(tex, ivec2(cX(cx, w), cY(cy, h)));
+    const conc = (cx: any, cy: any) => at(s, cx, cy).x.div(max(at(d, cx, cy).x, float(EPS)));
+    const selfF = at(f, ix, iy);
+    const sc = at(s, ix, iy).x;
+    const volumeScale = p.dt.div(p.pipeLength.mul(p.pipeLength));
+    const outgoingWater = selfF.x.add(selfF.y).add(selfF.z).add(selfF.w).mul(volumeScale);
+    const outgoingSediment = min(sc, outgoingWater.mul(conc(ix, iy)));
+
+    const mL = ix.greaterThan(int(0)).select(float(1), float(0));
+    const mR = ix.lessThan(int(w - 1)).select(float(1), float(0));
+    const mT = iy.lessThan(int(h - 1)).select(float(1), float(0));
+    const mB = iy.greaterThan(int(0)).select(float(1), float(0));
+    const incomingSediment = at(f, ix.sub(1), iy).y.mul(conc(ix.sub(1), iy)).mul(mL)
+      .add(at(f, ix.add(1), iy).x.mul(conc(ix.add(1), iy)).mul(mR))
+      .add(at(f, ix, iy.add(1)).w.mul(conc(ix, iy.add(1))).mul(mT))
+      .add(at(f, ix, iy.sub(1)).z.mul(conc(ix, iy.sub(1))).mul(mB))
+      .mul(volumeScale);
+    const next = max(float(0), sc.sub(outgoingSediment).add(incomingSediment));
+    textureStore(sOut, uvec2(x, y), vec4(next, 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
 }
 
-function flatThermal(b: StorageTexture, d: StorageTexture, bOut: StorageTexture, w: number, h: number): CN {
+/** Conservative thermal slumping. Only mobile earth moves; rock stays fixed. */
+function flatThermal(b: StorageTexture, loose: StorageTexture, d: StorageTexture, bOut: StorageTexture, looseOut: StorageTexture, w: number, h: number): CN {
   const u = erosionUniforms;
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
-    const bAt = (cx: any, cy: any) => textureLoad(b, ivec2(cX(cx, w), cY(cy, h))).x;
-    const c = textureLoad(b, ivec2(ix, iy)).x;
-    const nbs = [bAt(ix.sub(1), iy), bAt(ix.add(1), iy), bAt(ix, iy.sub(1)), bAt(ix, iy.add(1))];
-    let net: any = float(0);
-    for (const nb of nbs) {
-      net = net.sub(max(float(0), c.sub(nb).sub(u.talus)));
-      net = net.add(max(float(0), nb.sub(c).sub(u.talus)));
-    }
-    const wet = smoothstep(float(0), u.channelDepthRef, textureLoad(d, ivec2(ix, iy)).x);
-    const rate = u.thermalRate.mul(float(1).sub(wet.mul(0.85))).mul(u.simSpeed);
-    textureStore(bOut, uvec2(x, y), vec4(max(c.add(net.mul(rate).mul(0.25)), float(0)), 0, 0, 1)).toWriteOnly();
+    const at = (tex: StorageTexture, cx: any, cy: any) => textureLoad(tex, ivec2(cX(cx, w), cY(cy, h))).x;
+    const transfer = (sx: any, sy: any, tx: any, ty: any) => {
+      const sourceHeight = at(b, sx, sy);
+      const sourceLoose = at(loose, sx, sy);
+      const request = (nx: any, ny: any) => max(float(0), sourceHeight.sub(at(b, nx, ny)).sub(u.talus));
+      const reqL = request(sx.sub(1), sy);
+      const reqR = request(sx.add(1), sy);
+      const reqT = request(sx, sy.add(1));
+      const reqB = request(sx, sy.sub(1));
+      const total = reqL.add(reqR).add(reqT).add(reqB);
+      const wet = smoothstep(float(0), u.channelDepthRef, at(d, sx, sy));
+      const rate = u.thermalRate.mul(float(1).sub(wet.mul(0.85))).mul(u.simSpeed).mul(0.25);
+      const scale = min(rate, sourceLoose.div(max(total, float(EPS))));
+      const dx = tx.sub(sx);
+      const dy = ty.sub(sy);
+      let requested: any = reqL;
+      requested = dx.greaterThan(int(0)).select(reqR, requested);
+      requested = dy.greaterThan(int(0)).select(reqT, requested);
+      requested = dy.lessThan(int(0)).select(reqB, requested);
+      return requested.mul(scale);
+    };
+
+    const outflow = transfer(ix, iy, ix.sub(1), iy)
+      .add(transfer(ix, iy, ix.add(1), iy))
+      .add(transfer(ix, iy, ix, iy.add(1)))
+      .add(transfer(ix, iy, ix, iy.sub(1)));
+    const inflow = transfer(ix.sub(1), iy, ix, iy)
+      .add(transfer(ix.add(1), iy, ix, iy))
+      .add(transfer(ix, iy.add(1), ix, iy))
+      .add(transfer(ix, iy.sub(1), ix, iy));
+    const delta = inflow.sub(outflow);
+    const c = at(b, ix, iy);
+    const lc = at(loose, ix, iy);
+    textureStore(bOut, uvec2(x, y), vec4(max(c.add(delta), float(0)), 0, 0, 1)).toWriteOnly();
+    textureStore(looseOut, uvec2(x, y), vec4(max(lc.add(delta), float(0)), 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
 }
@@ -218,46 +447,62 @@ function flatThermal(b: StorageTexture, d: StorageTexture, bOut: StorageTexture,
 export class FlatSim {
   readonly water: GridField;
   readonly flux: GridField;
+  readonly momentum: GridField;
   readonly velocity: GridField;
   readonly sediment: GridField;
   readonly loose: GridField;
   readonly source: GridField;
+  readonly activity: GridField; // rg: recent erosion/deposition
   erosionEnabled = false;
-  private readonly nodes: { fluxN: CN; fluxC: CN; velN: CN; velC: CN; updN: CN; watC: CN; eroN: CN; bC: CN; loC: CN; sEC: CN; advN: CN; sAC: CN; thN: CN; bTC: CN };
+  momentumSubsteps = 1;
+  private _waterSolver: FlatWaterSolver = 'pipe';
+  private readonly nodes: { fluxN: CN; fluxC: CN; velN: CN; velC: CN; sedN: CN; sFlowC: CN; updN: CN; watC: CN; momN: CN; momC: CN; momSedN: CN; momSedC: CN; momVelN: CN; momVelC: CN; eroN: CN; bC: CN; loC: CN; sEC: CN; actC: CN; thN: CN; bTC: CN; loTC: CN };
   private readonly srcCenter = uniform(new Vector2(0.5, 0.5));
   private readonly srcRadius = uniform(0.04);
   private readonly srcRate = uniform(0);
   private readonly srcN: CN;
   private readonly srcC: CN;
 
-  constructor(private readonly renderer: WebGPURenderer, height: GridField, looseSeed: any, hardness: any, readonly w: number, readonly h: number) {
+  constructor(private readonly renderer: WebGPURenderer, private readonly height: GridField, looseSeed: any, hardness: any, readonly w: number, readonly h: number) {
     this.water = new GridField(w, h);
     this.flux = new GridField(w, h, true);
+    this.momentum = new GridField(w, h, true);
     this.velocity = new GridField(w, h, true);
     this.sediment = new GridField(w, h);
     this.loose = new GridField(w, h);
     this.source = new GridField(w, h);
+    this.activity = new GridField(w, h, true);
     renderer.compute(buildGridFill(this.water.main, w, h, 0));
+    renderer.compute(buildGridFill(this.momentum.main, w, h, 0));
     renderer.compute(buildGridFill(this.velocity.main, w, h, 0));
     renderer.compute(buildGridFill(this.sediment.main, w, h, 0));
     renderer.compute(buildGridFill(this.source.main, w, h, 0));
+    renderer.compute(buildGridFill(this.activity.main, w, h, 0));
     renderer.compute(buildGridSeed(looseSeed, this.loose.main, w, h));
     const b = height.main;
     this.nodes = {
-      fluxN: flatFlux(b, this.water.main, this.flux.main, this.flux.scratch, w, h),
+      fluxN: flatFlux(b, this.water.main, this.sediment.main, this.flux.main, this.flux.scratch, w, h),
       fluxC: buildGridCopy(this.flux.scratch, this.flux.main, w, h),
       velN: flatVelocity(this.flux.main, this.water.main, this.velocity.main, this.velocity.scratch, w, h),
       velC: buildGridCopy(this.velocity.scratch, this.velocity.main, w, h),
+      sedN: flatSedimentTransport(this.water.main, this.flux.main, this.sediment.main, this.sediment.scratch, w, h),
+      sFlowC: buildGridCopy(this.sediment.scratch, this.sediment.main, w, h),
       updN: flatUpdate(this.water.main, this.flux.main, b, this.source.main, this.velocity.main, this.water.scratch, w, h),
       watC: buildGridCopy(this.water.scratch, this.water.main, w, h),
-      eroN: flatErosion(b, this.loose.main, this.sediment.main, this.velocity.main, this.water.main, hardness, this.source.main, height.scratch, this.loose.scratch, this.sediment.scratch, w, h),
+      momN: flatMomentumUpdate(this.water.main, this.momentum.main, b, this.source.main, this.water.scratch, this.momentum.scratch, this.flux.main, w, h),
+      momC: buildGridCopy(this.momentum.scratch, this.momentum.main, w, h),
+      momSedN: flatMomentumSediment(this.water.main, this.momentum.main, this.sediment.main, this.sediment.scratch, w, h),
+      momSedC: buildGridCopy(this.sediment.scratch, this.sediment.main, w, h),
+      momVelN: flatMomentumVelocity(this.momentum.main, this.water.main, this.velocity.scratch, w, h),
+      momVelC: buildGridCopy(this.velocity.scratch, this.velocity.main, w, h),
+      eroN: flatErosion(b, this.loose.main, this.sediment.main, this.velocity.main, this.water.main, hardness, this.source.main, this.activity.main, height.scratch, this.loose.scratch, this.sediment.scratch, this.activity.scratch, w, h),
       bC: buildGridCopy(height.scratch, b, w, h),
       loC: buildGridCopy(this.loose.scratch, this.loose.main, w, h),
       sEC: buildGridCopy(this.sediment.scratch, this.sediment.main, w, h),
-      advN: flatAdvect(this.velocity.main, this.sediment.main, this.sediment.scratch, w, h),
-      sAC: buildGridCopy(this.sediment.scratch, this.sediment.main, w, h),
-      thN: flatThermal(b, this.water.main, height.scratch, w, h),
+      actC: buildGridCopy(this.activity.scratch, this.activity.main, w, h),
+      thN: flatThermal(b, this.loose.main, this.water.main, height.scratch, this.loose.scratch, w, h),
       bTC: buildGridCopy(height.scratch, b, w, h),
+      loTC: buildGridCopy(this.loose.scratch, this.loose.main, w, h),
     };
     const stamp = Fn(() => {
       const x = instanceIndex.mod(uint(w)), yy = instanceIndex.div(uint(w));
@@ -265,30 +510,76 @@ export class FlatSim {
       const dist = length(vec2(ux.sub(this.srcCenter.x), uy.sub(this.srcCenter.y)));
       const wgt = float(1).sub(smoothstep(float(0), this.srcRadius, dist));
       const cur = textureLoad(this.source.main, ivec2(int(x), int(yy))).x;
-      textureStore(this.source.scratch, uvec2(x, yy), vec4(max(float(0), cur.add(this.srcRate.mul(wgt))), 0, 0, 1)).toWriteOnly();
+      // `rate` is total discharge, not a per-cell rate. The radial smoothstep
+      // kernel integrates to roughly 0.3*pi*R² over normalized map coordinates.
+      const kernelAreaCells = this.srcRadius.mul(this.srcRadius).mul(float(0.3 * Math.PI * w * h));
+      const normalizedRate = this.srcRate.div(max(kernelAreaCells, float(EPS)));
+      textureStore(this.source.scratch, uvec2(x, yy), vec4(max(float(0), cur.add(normalizedRate.mul(wgt))), 0, 0, 1)).toWriteOnly();
     });
     this.srcN = stamp().compute(w * h) as CN;
     this.srcC = buildGridCopy(this.source.scratch, this.source.main, w, h);
   }
 
   setRain(r: number) { waterUniforms.source.value = r; }
-  clearWater() { this.renderer.compute(buildGridFill(this.water.main, this.w, this.h, 0)); this.renderer.compute(buildGridFill(this.flux.main, this.w, this.h, 0)); this.renderer.compute(buildGridFill(this.velocity.main, this.w, this.h, 0)); }
+  get waterSolver(): FlatWaterSolver { return this._waterSolver; }
+  set waterSolver(next: FlatWaterSolver) {
+    if (next === this._waterSolver) return;
+    this._waterSolver = next;
+    for (const field of [this.flux, this.momentum, this.velocity]) {
+      this.renderer.compute(buildGridFill(field.main, this.w, this.h, 0));
+      this.renderer.compute(buildGridFill(field.scratch, this.w, this.h, 0));
+    }
+  }
+  clearWater() {
+    for (const field of [this.water, this.flux, this.momentum, this.velocity]) {
+      this.renderer.compute(buildGridFill(field.main, this.w, this.h, 0));
+      this.renderer.compute(buildGridFill(field.scratch, this.w, this.h, 0));
+    }
+  }
   clearSources() { this.renderer.compute(buildGridFill(this.source.main, this.w, this.h, 0)); }
+  loadState(state: { height: any; loose: any; water: any; sediment: any; source: any }) {
+    const r = this.renderer;
+    for (const [seed, field] of [
+      [state.height, this.height],
+      [state.loose, this.loose],
+      [state.water, this.water],
+      [state.sediment, this.sediment],
+      [state.source, this.source],
+    ] as const) {
+      r.compute(buildGridSeed(seed, field.main, this.w, this.h));
+      r.compute(buildGridSeed(seed, field.scratch, this.w, this.h));
+    }
+    for (const field of [this.flux, this.momentum, this.velocity, this.activity]) {
+      r.compute(buildGridFill(field.main, this.w, this.h, 0));
+      r.compute(buildGridFill(field.scratch, this.w, this.h, 0));
+    }
+  }
   placeSource(u: number, v: number, rate: number, radius = 0.04) {
     this.srcCenter.value.set(u, v); this.srcRate.value = rate; this.srcRadius.value = radius;
     this.renderer.compute(this.srcN); this.renderer.compute(this.srcC);
   }
 
   tick(dt: number) {
-    waterUniforms.dt.value = dt;
     const r = this.renderer, n = this.nodes;
-    r.compute(n.fluxN); r.compute(n.fluxC);
-    r.compute(n.velN); r.compute(n.velC);
-    r.compute(n.updN); r.compute(n.watC);
+    if (this._waterSolver === 'momentum') {
+      this.momentumSubsteps = momentumSubstepCount(dt, waterUniforms.gravity.value);
+      waterUniforms.dt.value = dt / this.momentumSubsteps;
+      for (let i = 0; i < this.momentumSubsteps; i++) {
+        r.compute(n.momSedN); r.compute(n.momSedC);
+        r.compute(n.momN); r.compute(n.watC); r.compute(n.momC);
+      }
+      r.compute(n.momVelN); r.compute(n.momVelC);
+    } else {
+      this.momentumSubsteps = 1;
+      waterUniforms.dt.value = dt;
+      r.compute(n.fluxN); r.compute(n.fluxC);
+      r.compute(n.velN); r.compute(n.velC);
+      r.compute(n.sedN); r.compute(n.sFlowC);
+      r.compute(n.updN); r.compute(n.watC);
+    }
     if (this.erosionEnabled) {
-      r.compute(n.eroN); r.compute(n.bC); r.compute(n.loC); r.compute(n.sEC);
-      r.compute(n.advN); r.compute(n.sAC);
-      r.compute(n.thN); r.compute(n.bTC);
+      r.compute(n.eroN); r.compute(n.bC); r.compute(n.loC); r.compute(n.sEC); r.compute(n.actC);
+      r.compute(n.thN); r.compute(n.bTC); r.compute(n.loTC);
     }
   }
 }

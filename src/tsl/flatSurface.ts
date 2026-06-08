@@ -21,6 +21,8 @@ export const detailFreq = uniform(11);
 
 const W = FLAT.gridW;
 const H = FLAT.gridH;
+export const flatGridX = W - 1;
+export const flatGridY = H - 1;
 const SIZE = FLAT.worldSize;
 
 // Catmull-Rom cubic weights (interpolates THROUGH the samples, C1-smooth).
@@ -44,6 +46,20 @@ export function bicubic(sample: (c: any) => any, fx: any, fy: any): any {
     acc = acc.add(row.mul(wy[j + 1]));
   }
   return acc;
+}
+
+/** Bicubic reconstruction clamped to the local bilinear cell range. Useful for
+ * nonnegative fluid surfaces, where Catmull-Rom overshoot creates tall spikes. */
+export function bicubicClamped(sample: (c: any) => any, fx: any, fy: any): any {
+  const smooth = bicubic(sample, fx, fy);
+  const x0 = fx.floor(), y0 = fy.floor();
+  const cx = (x: any) => x.max(float(0)).min(float(W - 1)).toInt();
+  const cy = (y: any) => y.max(float(0)).min(float(H - 1)).toInt();
+  const a = sample(ivec2(cx(x0), cy(y0)));
+  const b = sample(ivec2(cx(x0.add(1)), cy(y0)));
+  const c = sample(ivec2(cx(x0), cy(y0.add(1))));
+  const d = sample(ivec2(cx(x0.add(1)), cy(y0.add(1))));
+  return smooth.max(a.min(b).min(c).min(d)).min(a.max(b).max(c).max(d));
 }
 
 export interface FlatSurface {
@@ -76,15 +92,18 @@ function perturb(n: any, p: any): any {
   return normalize(n.sub(vec3(dx, float(0), dz).mul(detailStrength)));
 }
 
-export function flatSurface(sampleHeight: (coord: any) => any, detail = true): FlatSurface {
+export function flatSurface(sampleHeight: (coord: any) => any, detail = true, clampCubic = false): FlatSurface {
   const u = uv().x, v = uv().y;
   // BICUBIC height (C1-smooth) -> smooth geometry AND smooth normals, no per-cell
   // facets/blocks regardless of grid resolution.
-  const hAt = (uu: any, vv: any) => bicubic(sampleHeight, uu.mul(W), vv.mul(H));
+  const hAt = (uu: any, vv: any) => {
+    const fx = uu.mul(flatGridX), fy = vv.mul(flatGridY);
+    return clampCubic ? bicubicClamped(sampleHeight, fx, fy) : bicubic(sampleHeight, fx, fy);
+  };
   const worldPos = (uu: any, vv: any) =>
     vec3(uu.sub(0.5).mul(SIZE), hAt(uu, vv).mul(flatHeightScale), vv.sub(0.5).mul(SIZE));
 
-  const e = float(1.2 / W);
+  const e = float(1.2 / flatGridX);
   const p = worldPos(u, v);
   const px = worldPos(u.add(e), v), pxm = worldPos(u.sub(e), v);
   const pz = worldPos(u, v.add(e)), pzm = worldPos(u, v.sub(e));

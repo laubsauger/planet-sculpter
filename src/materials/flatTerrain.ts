@@ -6,9 +6,8 @@
 import { DoubleSide, type Texture } from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import { textureLoad, uv, mix, smoothstep, max, dot, float, vec3 } from 'three/tsl';
-import { flatSurface, bilinear, flatSeaLevel } from '../tsl/flatSurface';
+import { flatSurface, bilinear, flatSeaLevel, flatGridX, flatGridY } from '../tsl/flatSurface';
 import { sunDirUniform, sunIntensityU, ambientU } from '../tsl/lighting';
-import { FLAT } from '../config';
 
 const SUN_COL = vec3(1.0, 0.93, 0.82);
 const SKY_COL = vec3(0.45, 0.6, 0.82);
@@ -23,16 +22,22 @@ const ROCK = vec3(0.42, 0.39, 0.35);
 const ROCK_DARK = vec3(0.28, 0.25, 0.23);
 const ROCK_RED = vec3(0.5, 0.34, 0.26);
 const SNOW = vec3(0.95, 0.96, 0.98);
+const WET_EARTH = vec3(0.16, 0.12, 0.075);
+const FRESH_CUT = vec3(0.34, 0.2, 0.11);
+const FRESH_DEPOSIT = vec3(0.76, 0.58, 0.31);
 
 export function makeFlatTerrain(
   heightTex: Texture,
   looseTex: Texture,
   moistureTex: Texture,
   hardnessTex: Texture,
+  waterTex: Texture,
+  sedimentTex: Texture,
+  activityTex: Texture,
 ): MeshBasicNodeMaterial {
-  const W = FLAT.gridW, H = FLAT.gridH;
-  const fx = uv().x.mul(W), fy = uv().y.mul(H);
+  const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
   const bl = (t: Texture) => bilinear((c: any) => textureLoad(t, c).x, fx, fy);
+  const blVec = (t: Texture) => bilinear((c: any) => textureLoad(t, c), fx, fy);
 
   const s = flatSurface((c: any) => textureLoad(heightTex, c).x);
   const h = s.height;
@@ -40,6 +45,9 @@ export function makeFlatTerrain(
   const moisture = bl(moistureTex);
   const erod = bl(hardnessTex);
   const looseRatio = bl(looseTex).div(0.022).min(float(1));
+  const water = bl(waterTex);
+  const sediment = bl(sedimentTex);
+  const activity = blVec(activityTex);
 
   // ground cover by moisture + elevation.
   const grass = mix(GRASS, GRASS_LUSH, smoothstep(0.4, 0.75, moisture));
@@ -53,7 +61,17 @@ export function makeFlatTerrain(
   const exposure = max(smoothstep(0.32, 0.55, slope), float(1).sub(looseRatio)).min(float(1));
   albedo = mix(albedo, rock, exposure);
 
-  // coastal sand band at the waterline + darker wet just under it.
+  // Fresh material motion remains visible for a while rather than appearing as
+  // an abrupt grid-colored edit.
+  albedo = mix(albedo, FRESH_CUT, smoothstep(0.04, 0.65, activity.x).mul(0.62));
+  albedo = mix(albedo, FRESH_DEPOSIT, smoothstep(0.04, 0.65, activity.y).mul(0.72));
+
+  // Wet and sediment-rich ground darkens smoothly around active channels.
+  const wet = smoothstep(0.0004, 0.018, water);
+  const muddy = smoothstep(0.002, 0.08, sediment);
+  albedo = mix(albedo, WET_EARTH, max(wet.mul(0.56), muddy.mul(0.42)));
+
+  // Coastal sand band at the waterline + darker wet just under it.
   const above = h.sub(flatSeaLevel);
   albedo = mix(albedo, SAND, smoothstep(0.035, 0.0, above.abs()).mul(0.7));
   albedo = albedo.mul(mix(float(1), float(0.55), smoothstep(0.0, -0.06, above)));
