@@ -97,7 +97,7 @@ export class FlatEngine {
     this.sun.shadow.camera.far = FLAT.worldSize * 4;
     this.sun.shadow.bias = -0.0004;
     this.sun.shadow.normalBias = 0.02;
-    this.sky = new HemisphereLight(0xbfd8ff, 0x6b5a3f, 0.55);
+    this.sky = new HemisphereLight(0xcce6ff, 0x8b7654, 0.82);
     this.scene.add(this.sun, this.sky);
     // world-space lighting uniforms for the unlit terrain (camera-independent).
     sunDirUniform.value.copy(this.sun.position).normalize();

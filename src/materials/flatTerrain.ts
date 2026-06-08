@@ -66,7 +66,7 @@ export function makeFlatTerrain(
   // bright water-colored fringe. Sediment adds only a restrained warm earth tint.
   const wet = smoothstep(0.0004, 0.018, water);
   const muddy = smoothstep(0.002, 0.08, sediment);
-  albedo = albedo.mul(mix(float(1), float(0.48), wet.mul(0.72)));
+  albedo = albedo.mul(mix(float(1), float(0.68), wet.mul(0.72)));
   albedo = mix(albedo, WET_EARTH, muddy.mul(0.28));
   // Lingering wetness (activity.z): subtly darken ground that was recently under water,
   // fading back to dry over a few seconds after runoff.

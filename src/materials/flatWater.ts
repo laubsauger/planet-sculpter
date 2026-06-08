@@ -136,7 +136,14 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
     .add(smoothstep(0.0012, 0.05, depth).mul(0.35));
   const flowOpacity = smoothstep(0.04, 0.45, speed).mul(0.36)
     .mul(smoothstep(0.00015, 0.001, depth));
-  const landOpacity = max(depthOpacity.mul(mix(float(1), float(0.12), steepRunoff)), flowOpacity);
+  const channelOrPool = max(
+    smoothstep(0.00045, 0.004, depth.mul(speed)),
+    smoothstep(0.012, 0.045, depth),
+  );
+  const landOpacity = max(
+    depthOpacity.mul(channelOrPool).mul(mix(float(1), float(0.12), steepRunoff)),
+    flowOpacity.mul(channelOrPool),
+  );
   const muddyOpacity = turbidity.mul(smoothstep(0.0005, 0.018, depth)).mul(0.72);
   // OCEAN: clear shallows reveal the sandy seabed, ramping to opaque deep blue (the
   // From-Dust look) instead of a flat turquoise sheet.

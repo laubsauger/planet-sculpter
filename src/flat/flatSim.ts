@@ -43,7 +43,7 @@ function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture
     // Treat a spring as hydraulic head as well as incoming volume. This makes the
     // pipe solver evacuate discharge on the next flux pass instead of accumulating
     // a stationary mound until the geometric water surface becomes steep enough.
-    const hc = surf(ix, iy).add(emit.mul(0.12));
+    const hc = surf(ix, iy).add(emit.mul(0.04));
     const dc = textureLoad(d, ivec2(ix, iy)).x;
     const prev = textureLoad(fPrev, ivec2(ix, iy));
     const concentration = textureLoad(sediment, ivec2(ix, iy)).x.div(max(dc, float(EPS)));
@@ -110,7 +110,35 @@ function flatUpdate(d: StorageTexture, f: StorageTexture, b: StorageTexture, sou
       .add(fAt(ix, iy.sub(1)).z.mul(mB));
     const l2 = p.pipeLength.mul(p.pipeLength);
     const bc = textureLoad(b, ivec2(ix, iy)).x;
-    const emit = textureLoad(source, ivec2(ix, iy)).x;
+    const sourceAt = (cx: any, cy: any) => textureLoad(source, ivec2(cX(cx, w), cY(cy, h))).x;
+    const surfaceAt = (cx: any, cy: any) => textureLoad(b, ivec2(cX(cx, w), cY(cy, h))).x
+      .add(textureLoad(d, ivec2(cX(cx, w), cY(cy, h))).x);
+    const routedShare = (sx: any, sy: any, tx: any, ty: any) => {
+      const hs = surfaceAt(sx, sy);
+      const sourceHere = sourceAt(sx, sy);
+      const drop = (nx: any, ny: any) => {
+        const downhill = max(float(0.0002), hs.sub(surfaceAt(nx, ny)).add(float(0.001)));
+        // Prefer moving down the radial source gradient, out of the emitter
+        // footprint. A small baseline preserves routing on a flat source plateau.
+        const outward = max(float(0), sourceHere.sub(sourceAt(nx, ny))).mul(120).add(float(0.08));
+        return downhill.mul(outward);
+      };
+      const l = drop(sx.sub(1), sy), r = drop(sx.add(1), sy);
+      const t = drop(sx, sy.add(1)), bot = drop(sx, sy.sub(1));
+      const total = l.add(r).add(t).add(bot);
+      let selected: any = l;
+      selected = tx.greaterThan(sx).select(r, selected);
+      selected = ty.greaterThan(sy).select(t, selected);
+      selected = ty.lessThan(sy).select(bot, selected);
+      return sourceHere.mul(selected.div(max(total, float(EPS))));
+    };
+    // Route spring discharge directly into its downhill-adjacent cells. This is
+    // conservative (the four shares sum to the source rate) and avoids creating
+    // a circular reservoir at the emitter before the pipe pressure reacts.
+    const emit = routedShare(ix.sub(1), iy, ix, iy)
+      .add(routedShare(ix.add(1), iy, ix, iy))
+      .add(routedShare(ix, iy.sub(1), ix, iy))
+      .add(routedShare(ix, iy.add(1), ix, iy));
     const oro = smoothstep(flatSeaLevel, flatSeaLevel.add(rainHighRef), bc);
     // Weather: low-frequency animated noise so rain falls in DRIFTING patches/cells,
     // not a uniform sheet. x/y drift + an evolving z give moving weather fronts.
