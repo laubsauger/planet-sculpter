@@ -11,6 +11,22 @@ export const PLANET = {
   heightScale: 0.48,
   /** Sea level in stored-height units [0..1]: terrain below is underwater. */
   seaLevel: 0.14,
+  /** Equirectangular grid (pivot away from cube-sphere): lon cols (wrap) × lat
+   *  rows (clamp at poles). lon ~2× lat. texel(tx,ty) <-> u=tx/lonRes, v=ty/(latRes-1). */
+  lonRes: 768,
+  latRes: 384,
+} as const;
+
+/** Flat From-Dust-style local map (pivot away from the sphere). Uniform W×H grid
+ *  -> all resolution in the visible patch, no pole/distortion. Island: terrain in
+ *  the middle, ocean at the edges (water drains off into it). */
+export const FLAT = {
+  gridW: 512,
+  gridH: 512,
+  worldSize: 12, // XZ extent (world units)
+  heightScale: 3.8, // max Y displacement of height=1 (steep mountains)
+  seaLevel: 0.26, // normalized height of the sea surface (~80% land above)
+  meshDetail: 1, // render-mesh tessellation × grid (per-vertex bicubic normal = smooth shading cheaply)
 } as const;
 
 export const SIM = {
@@ -25,7 +41,7 @@ export const SIM = {
   gravity: 9.81,
   pipeArea: 1.0,
   pipeLength: 1.0,
-  rainRate: 0.0025,
+  rainRate: 0.006,
   evaporation: 0.04,
   sedimentCapacity: 0.25, // Kc
   dissolve: 0.3, // Ks
@@ -40,6 +56,12 @@ export const RENDER = {
   targetFps: 60,
   /** Frame-time budget (ms) before adaptive downscale. */
   frameBudgetMs: 1000 / 60,
+  /** Render-mesh tessellation multiplier over the sim grid. The sim stays at
+   *  lonRes×latRes but the displaced mesh is meshDetail× denser, so the smooth
+   *  (Hermite) height interp + procedural detail noise become real sub-grid
+   *  GEOMETRY instead of being collapsed onto the coarse grid vertices. 2 ≈ 4×
+   *  the triangles; bump for more silhouette detail, drop if fps suffers. */
+  meshDetail: 2,
 } as const;
 
 /** 6 cube faces, fixed index order. Used everywhere (warp, seams, textures). */

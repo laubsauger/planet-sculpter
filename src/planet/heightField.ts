@@ -96,16 +96,43 @@ function fbm(dir: Vec3): number {
   const onHigh = smoothStep01((h - 0.32) / 0.25); // only flatten elevated terrain
   h = h + (0.52 - h) * 0.25 * plat * onHigh;
 
-  // RIFT valleys: thin sparse carved lows (inverted ridge noise) -> fine canyons,
-  // not chunky troughs. higher freq + narrow + shallow so they read as fissures.
-  const riftN = 1 - Math.abs(valueNoise(dir[0] * 4.5 + 61, dir[1] * 4.5 - 9, dir[2] * 4.5 + 40) * 2 - 1);
-  const rift = smoothStep01((riftN - 0.88) / 0.07); // only sharp narrow ridge cores
-  h -= rift * 0.05 * smoothStep01((h - 0.18) / 0.2); // shallow carve
+  // (No pre-cut river channels: rivers should emerge ORGANICALLY from the sim's
+  // erosion on diverse terrain/hardness, ⊥ baked-in valleys. Rift carving removed.)
 
   // lift the highest peaks higher (snow-capped) without raising lowlands.
   h = h + Math.max(0, h - 0.5) * 0.55;
 
   return Math.max(0, Math.min(1, h));
+}
+
+// --- per-direction field VALUES (shared by cube-sphere faces + equirect grid).
+//     dir-based so they work for ANY sphere parametrization. -------------------
+
+/** Bedrock height [0,1] at a sphere direction. */
+export function heightValue(dir: Vec3): number {
+  return fbm(dir);
+}
+/** Initial loose (soil/sand) thickness — own offset fbm; ~[0.008, 0.1]. */
+export function looseValue(dir: Vec3): number {
+  const t = fbm([dir[0] + 11.3, dir[1] - 7.1, dir[2] + 4.9] as Vec3);
+  return 0.008 + t * t * 0.09;
+}
+/** Regional rainfall [0,1] — big wet/dry zones + latitude banding. */
+export function rainfallValue(dir: Vec3): number {
+  const a = valueNoise(dir[0] * 1.3 + 30, dir[1] * 1.3 - 12, dir[2] * 1.3 + 7);
+  const b = valueNoise(dir[0] * 3.2 - 4, dir[1] * 3.2 + 9, dir[2] * 3.2 - 2);
+  const lat = Math.abs(dir[1]);
+  const band = 0.5 + 0.4 * Math.cos(lat * Math.PI * 2);
+  const r = a * 0.5 + b * 0.22 + band * 0.28;
+  return Math.max(0, Math.min(1, (r - 0.28) * 1.9));
+}
+/** Erodibility multiplier (~[0.12, 2.6]) — multi-scale resistant rock zones. */
+export function hardnessValue(dir: Vec3): number {
+  const lo = valueNoise(dir[0] * 2.5 + 13, dir[1] * 2.5 - 6, dir[2] * 2.5 + 21);
+  const t = valueNoise(dir[0] * 7 - 5.2, dir[1] * 7 + 3.7, dir[2] * 7 - 1.9);
+  const t2 = valueNoise(dir[0] * 14 + 2, dir[1] * 14 - 8, dir[2] * 14 + 5);
+  const r = lo * 0.45 + t * 0.37 + t2 * 0.18;
+  return 0.12 + Math.pow(r, 1.9) * 2.5;
 }
 
 export interface HeightTexture {

@@ -25,6 +25,13 @@ export const lightingSettings: LightingSettings = {
 /** World-space unit direction TOWARD the sun (for shaders). */
 export const sunDirUniform = uniform(vec3(0, 1, 0));
 
+/** Intensity uniforms mirroring lightingSettings, for the unlit TOON terrain
+ *  (which does its own quantized lighting instead of the PBR light rig). Kept in
+ *  sync by the engine's applyLighting. */
+export const sunIntensityU = uniform(lightingSettings.sunIntensity);
+export const fillU = uniform(lightingSettings.fill);
+export const ambientU = uniform(lightingSettings.ambient);
+
 /** Direction toward the sun from azimuth/elevation. */
 export function sunDirection(s: LightingSettings): Vector3 {
   const ce = Math.cos(s.elevation);

@@ -1,5 +1,7 @@
-// Bootstrap: WebGPU gate (I.gate) -> Engine.init (V8) -> loop.
-import { Engine } from './app/Engine';
+// Bootstrap: WebGPU gate (I.gate) -> engine.init (V8) -> loop.
+// PIVOT: flat From-Dust-style FlatEngine replaces the sphere GridEngine (poles +
+// equirect distortion not worth it; flat = all res in the patch, crisp, no seams).
+import { FlatEngine } from './flat/FlatEngine';
 
 async function main(): Promise<void> {
   const gate = document.getElementById('gate')!;
@@ -12,10 +14,9 @@ async function main(): Promise<void> {
   }
 
   try {
-    const engine = new Engine(canvas);
+    const engine = new FlatEngine(canvas);
     await engine.init();
     engine.start();
-    // Sim wired at M4 (T13): engine.setSim(new Simulation(...))
   } catch (err) {
     console.error('Init failed:', err);
     gate.style.display = 'flex';

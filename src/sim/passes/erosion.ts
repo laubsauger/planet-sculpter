@@ -37,43 +37,59 @@ type ComputeNode = Parameters<WebGPURenderer['compute']>[0];
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 export const erosionUniforms = {
-  sedimentCapacity: uniform(0.4), // Kc — more carving capacity (deeper channels)
-  dissolve: uniform(0.18), // Ks
-  deposit: uniform(0.06), // Kd — low so rivers don't dam themselves
+  sedimentCapacity: uniform(0.35), // Kc — carving capacity
+  dissolve: uniform(0.07), // Ks — slow carving: runoff flows faster than it erodes
+  deposit: uniform(0.14), // Kd — fills pits / builds deltas (balance incision)
   minSlope: uniform(0.015),
-  advectScale: uniform(1.0),
+  advectScale: uniform(0.5), // sediment backtrace in CELLS/tick (flat sim)
   /** min flow speed to erode; low so even slow river flow carves a channel. */
-  erodeSpeedMin: uniform(0.22),
+  erodeSpeedMin: uniform(0.08),
+  /** depth above which erosion is suppressed: rivers are SHALLOW + fast (erode),
+   *  lakes/oceans are DEEP + slow (bury the bed -> little erosion, only beaches/
+   *  shallows cut). Without this, deep standing water out-erodes rivers (its huge
+   *  depth amplifies stream-power/lateral terms). shallow->1, deep->0. */
+  erodeShallowDepth: uniform(0.025),
+  erodeDeepDepth: uniform(0.09),
   /** erodibility of exposed hard rock (loose = 1). lower = more resistant. */
   rockErodibility: uniform(0.18),
   /** loose-layer thickness at which the surface is "fully soft". */
   looseFull: uniform(0.02),
-  /** thermal slump: height diff above which material slides to lower neighbors. */
-  talus: uniform(0.004),
+  /** thermal slump: height diff above which material slides to lower neighbors
+   *  = angle of repose. HIGH enough that normal generated mountains are at-rest
+   *  (no dry creep -> peaks don't melt when nothing's happening); only slopes
+   *  oversteepened by water incision slump -> erosion is effectively water-driven. */
+  talus: uniform(0.02),
   /** low -> channels stay sharp/narrow (less smoothing fighting channelization). */
-  thermalRate: uniform(0.3),
+  thermalRate: uniform(0.2),
   /** faster-than-realtime erosion: scales per-tick erode/deposit amount + cap so
    *  terrain evolves quicker WITHOUT extra GPU work (⊥ more ticks). 1 = realtime. */
   simSpeed: uniform(1),
   /** incision feedback (V37): 0 = uniform sheet erosion, 1 = erosion strongly
    *  concentrated where discharge (depth*speed) is high -> channels self-deepen
    *  & capture flow -> emergent rivers instead of wide sheet flow. */
-  channelFocus: uniform(0.9),
+  channelFocus: uniform(0.85),
   /** discharge (depth*speed) at which a cell counts as a full channel. */
-  channelDischarge: uniform(0.015),
+  channelDischarge: uniform(0.008),
   /** thermal slump is suppressed in deep flowing water -> channels don't heal flat. */
   channelDepthRef: uniform(0.02),
   /** flow momentum/inertia (V38): 0 = velocity tracks instant gradient (straight
    *  channels), ->1 = flow overshoots bends -> swings into outer banks -> meander. */
   flowInertia: uniform(0.6),
   /** lateral (cut-bank) erosion: erode where flow runs ACROSS slope (rams a bank)
-   *  -> channel migrates sideways. the other half of meandering. */
-  lateralErosion: uniform(0.5),
+   *  -> channel migrates sideways. HIGH values undercut the mountain BASE and make
+   *  it retreat in circumference instead of incising channels — keep low. */
+  lateralErosion: uniform(0.18),
   /** stratified bedrock (V39): erosion resistance varies with ELEVATION -> hard
    *  rock LAYERS. river incises until it hits a hard band, then stalls (⊥ runaway
    *  downcut/widening) -> terraced canyons. freq = layer count over height range. */
   strataFreq: uniform(55),
-  strataStrength: uniform(0.75),
+  strataStrength: uniform(0.45),
+  /** 3D VOLUMETRIC hardness (V43): erodibility from 3D noise at the bedrock point
+   *  dir*(R+b), NOT just the 2D surface map. As erosion lowers terrain it exposes
+   *  different hardness with DEPTH -> interlocking hard/soft, resistant knobs left
+   *  standing, hard rock at the surface. amp 1 -> can reach near-unerodible. */
+  hardness3dFreq: uniform(2.0),
+  hardness3dAmp: uniform(0.3),
   /** viz texture decay/tick: fresh erode/deposit streaks fade over ~tens of ticks. */
   vizDecay: uniform(0.95),
   /** still water settles suspended sediment -> muddy lakes clear, beds build (V35). */
