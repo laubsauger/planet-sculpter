@@ -39,8 +39,14 @@ type ComputeNode = Parameters<WebGPURenderer['compute']>[0];
 export const erosionUniforms = {
   sedimentCapacity: uniform(0.35), // Kc — carving capacity
   dissolve: uniform(0.07), // Ks — slow carving: runoff flows faster than it erodes
-  deposit: uniform(0.14), // Kd — fills pits / builds deltas (balance incision)
+  deposit: uniform(0.08), // Kd — fills pits / builds deltas (lower = gradual, spreads instead of a sharp plateau at the slope base)
   minSlope: uniform(0.015),
+  /** flow-driven transport floor: capacity must NOT vanish on a locally flat spot
+   *  while water still moves fast. effective transport slope = max(sinTilt,
+   *  speed*flowTransport) so fast flow keeps carrying sediment downstream (advection)
+   *  instead of dumping its whole load at the first gentle segment -> plateau ->
+   *  self-flattening feedback -> the channel dams itself. 0 = pure slope (old). */
+  flowTransport: uniform(0.05),
   advectScale: uniform(0.5), // sediment backtrace in CELLS/tick (flat sim)
   /** min flow speed to erode; low so even slow river flow carves a channel. */
   erodeSpeedMin: uniform(0.08),
@@ -92,6 +98,9 @@ export const erosionUniforms = {
   hardness3dAmp: uniform(0.3),
   /** viz texture decay/tick: fresh erode/deposit streaks fade over ~tens of ticks. */
   vizDecay: uniform(0.95),
+  /** wetness decay/tick (slower): ground stays darkened for a few seconds AFTER the
+   *  water has run off, then dries back. stored in activity.z. */
+  wetDecay: uniform(0.99),
   /** still water settles suspended sediment -> muddy lakes clear, beds build (V35). */
   stillDeposit: uniform(0.04),
   dt: uniform(1 / 60),

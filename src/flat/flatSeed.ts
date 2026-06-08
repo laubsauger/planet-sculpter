@@ -71,6 +71,18 @@ export function buildFlatSeed(w: number, h: number) {
       const dx = u - 0.5, dy = v - 0.5;
       const r = Math.sqrt(dx * dx + dy * dy) * 2; // 0 centre .. ~1.41 corner
       const island = smooth(1.4, 0.8, r); // mostly land (~80%), ocean ring near edges
+      // OCEAN FRAME: radial falloff only hits ocean at the corners (r~1.41); the
+      // mid-edges (r=1.0) stay land and touch the world wall. This box mask keys off
+      // distance to the NEAREST edge so a uniform ocean ring wraps all four sides.
+      // Organic coastline: warp the edge-distance with noise (broad bays/capes + finer
+      // wiggle) so the shore meanders and corners round off instead of a straight square.
+      // Wider band so coastal mountains slope into the sea rather than forming a wall.
+      const rawEdge = Math.min(u, 1 - u, v, 1 - v); // 0 at border .. 0.5 centre
+      const coastWarp = (fbm(u * 0.9 + 5, v * 0.9 + 9, 3) - 0.5) * 0.16
+        + (fbm(u * 2.6 + 41, v * 2.6 + 17, 4) - 0.5) * 0.1;
+      // outer hard cutoff guarantees the true world edge is always ocean even if the
+      // warp pushes a cape outward; the warped band shapes the coastline inside that.
+      const frame = smooth(0.03, 0.24, rawEdge + coastWarp) * smooth(0.0, 0.03, rawEdge);
       // domain warp -> organic, non-radial shapes.
       const wu = u + fbm(u * 1.5 + 1.3, v * 1.5 + 4.7, 3) * 0.3;
       const wv = v + fbm(u * 1.5 + 7.1, v * 1.5 + 2.2, 3) * 0.3;
@@ -81,13 +93,16 @@ export function buildFlatSeed(w: number, h: number) {
       // MOUNTAIN RANGES: ridged, cubed = sharp steep peaks, gated to mtn regions.
       const rg = fbm(wu * 3.2 + 11, wv * 3.2 + 7, 6, true);
       const region = ex(fbm(wu * 1.2 + 3, wv * 1.2 + 8, 3), 2.2);
-      const mtn = rg * rg * rg * 0.95 * region;
+      // squared (not cubed) + lower amp -> broader rolling ranges instead of a few
+      // spiky peaks dominating; leaves more midland between valley and summit.
+      const mtn = rg * rg * 0.62 * region;
       // base land 0.4 (above sea 0.3) + continental variation + mountains.
       let e = (0.4 + (cont - 0.5) * 0.6 + mtn) * island;
       // PLATEAUS: terrace some midland patches (mesas/tablelands).
       const plat = fbm(wu * 2.4 + 20, wv * 2.4 + 30, 3);
       const terr = Math.round(e * 5) / 5;
       e += (terr - e) * smooth(0.65, 0.85, plat) * 0.4;
+      e *= frame; // force sub-sea-level along the world edges -> ocean ring
       height[j * w + i] = Math.min(1, Math.max(0, e));
       const mst = (fbm(u * 2.3 + 31, v * 2.3 + 19, 5) - 0.5) * 2.2 + 0.5;
       moisture[j * w + i] = Math.min(1, Math.max(0, mst));

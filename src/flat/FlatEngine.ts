@@ -71,7 +71,7 @@ export class FlatEngine {
   private riverMode = false;
   private readonly brushSettings = { mode: 'raise' as BrushMode, radius: 0.06, strength: 0.02, rate: 0.4, target: 0.4 };
   private readonly water = { rainOn: false, rainRate: SIM.rainRate };
-  private readonly river = { rate: 2, radius: 0.022 };
+  private readonly river = { rate: 2, radius: 0.012 };
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -179,7 +179,7 @@ export class FlatEngine {
     t.add(detailFreq, 'value', 1, 24, 0.5).name('detail freq');
     const wf = gui.addFolder('Water');
     wf.add(this.water, 'rainOn').name('rain [r]');
-    wf.add(this.water, 'rainRate', 0, 0.02, 0.0005).name('rain rate');
+    wf.add(this.water, 'rainRate', 0, 0.01, 0.0002).name('rain rate');
     wf.add(this.sim, 'waterSolver', FLAT_WATER_SOLVERS).name('solver');
     wf.add(waterUniforms.evapProp, 'value', 0, 0.4, 0.005).name('evaporation /s');
     wf.add(mudViscosityFactor, 'value', 0, 10, 0.25).name('mud viscosity');

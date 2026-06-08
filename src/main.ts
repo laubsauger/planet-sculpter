@@ -17,6 +17,11 @@ async function main(): Promise<void> {
     const engine = new FlatEngine(canvas);
     await engine.init();
     engine.start();
+    if (import.meta.env.DEV) {
+      const { erosionUniforms } = await import('./sim/passes/erosion');
+      const { waterUniforms } = await import('./sim/passes/water');
+      Object.assign(window as object, { engine, erosionUniforms, waterUniforms });
+    }
   } catch (err) {
     console.error('Init failed:', err);
     gate.style.display = 'flex';

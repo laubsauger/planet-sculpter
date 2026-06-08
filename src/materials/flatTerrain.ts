@@ -70,6 +70,9 @@ export function makeFlatTerrain(
   const wet = smoothstep(0.0004, 0.018, water);
   const muddy = smoothstep(0.002, 0.08, sediment);
   albedo = mix(albedo, WET_EARTH, max(wet.mul(0.56), muddy.mul(0.42)));
+  // Lingering wetness (activity.z): subtly darken ground that was recently under water,
+  // fading back to dry over a few seconds after runoff.
+  albedo = albedo.mul(mix(float(1), float(0.7), activity.z.min(float(1))));
 
   // Coastal sand band at the waterline + darker wet just under it.
   const above = h.sub(flatSeaLevel);

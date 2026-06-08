@@ -8,7 +8,7 @@ import { Vector2 } from 'three';
 import {
   Fn, instanceIndex, textureLoad, textureStore, ivec2, uvec2, uint, int,
   float, vec2, vec4, max, min, length, mix, smoothstep, If, uniform,
-  mx_fractal_noise_float, sqrt, vec3,
+  mx_fractal_noise_float, sqrt, vec3, time, clamp,
 } from 'three/tsl';
 import { GridField, buildGridCopy, buildGridFill, buildGridSeed } from '../sim/gridStore';
 import { mudViscosityFactor, waterUniforms } from '../sim/passes/water';
@@ -108,7 +108,14 @@ function flatUpdate(d: StorageTexture, f: StorageTexture, b: StorageTexture, sou
     const bc = textureLoad(b, ivec2(ix, iy)).x;
     const emit = textureLoad(source, ivec2(ix, iy)).x;
     const oro = smoothstep(flatSeaLevel, flatSeaLevel.add(rainHighRef), bc);
-    const rain = p.source.mul(mix(float(1), oro, rainOrographic));
+    // Weather: low-frequency animated noise so rain falls in DRIFTING patches/cells,
+    // not a uniform sheet. x/y drift + an evolving z give moving weather fronts.
+    const ux = ix.toFloat().div(float(w)), uy = iy.toFloat().div(float(h));
+    const cloud = mx_fractal_noise_float(
+      vec3(ux.mul(2.6).add(time.mul(0.02)), uy.mul(2.6).sub(time.mul(0.015)), time.mul(0.05)), 3);
+    const cloudMask = clamp(cloud.mul(0.9).add(0.65), float(0), float(1.5));
+    // orographic: mountains wring more rain out of the passing clouds.
+    const rain = p.source.mul(mix(float(1), oro, rainOrographic)).mul(cloudMask);
     let next: any = inflow.sub(outflow).mul(p.dt).div(l2).add(dc);
     next = next.add(rain.add(emit).mul(p.dt));
     // flow + deep aware evaporation.
@@ -324,6 +331,9 @@ function flatErosion(
     const activityPrev = textureLoad(activity, ivec2(ix, iy));
     const erodeViz: any = activityPrev.x.mul(u.vizDecay).toVar();
     const depositViz: any = activityPrev.y.mul(u.vizDecay).toVar();
+    // persistent wetness (activity.z): rises under water, decays slowly when dry so the
+    // ground stays darkened for a few seconds after the water has run off.
+    const wetViz: any = max(activityPrev.z.mul(u.wetDecay), smoothstep(float(0.0006), float(0.01), dc)).toVar();
     If(dc.greaterThan(float(0.0008)).or(sc.greaterThan(float(1e-5))), () => {
       const v = textureLoad(vel, ivec2(ix, iy));
       const dbx = bAt(ix.add(1), iy).sub(bAt(ix.sub(1), iy)).mul(0.5);
@@ -332,11 +342,28 @@ function flatErosion(
       const sinTilt = max(tilt, u.minSlope);
       const speed = length(vec2(v.x, v.y)).min(float(3));
       const depthSuppress = float(1).sub(smoothstep(u.erodeShallowDepth, u.erodeDeepDepth, dc));
-      const discharge = dc.mul(speed);
+      // Erosion is a near-bed shear effect: only near-bed flow carves, not the whole
+      // column. Cap effective depth at channel scale so a DEEP lake's large dc can't
+      // inflate discharge -> conc/lateral terms and let slow swirl dig its own bed +
+      // build a rim dam. Rivers are shallow (dc < channelDepthRef) -> unaffected.
+      const erodeDepth = dc.min(u.channelDepthRef);
+      const discharge = erodeDepth.mul(speed);
       const conc = mix(float(1), smoothstep(float(0), u.channelDischarge, discharge), u.channelFocus);
       const hasWater = dc.greaterThan(float(0.0012)).select(float(1), float(0));
+      // DECOUPLED capacities (hysteresis). Erosion uses the slope-based capacity so
+      // fast FLATS don't get carved (no source moat / mid-slope gouging). Deposition
+      // uses a HIGHER transport capacity (flow keeps sediment alive on flats) so the
+      // river carries its load further and deposits gradually instead of dumping a
+      // plateau the instant the slope eases. Between the two -> sediment just rides.
       const capacity = u.sedimentCapacity.mul(sinTilt).mul(speed).mul(hasWater).mul(conc);
-      const notSource = textureLoad(source, ivec2(ix, iy)).x.lessThan(float(0.0001)).select(float(1), float(0));
+      const transport = max(sinTilt, speed.mul(u.flowTransport));
+      const capCarry = u.sedimentCapacity.mul(transport).mul(speed).mul(hasWater).mul(conc);
+      // Spring damping (NOT a hard cutoff): a fully-protected source cell stays high
+      // while the divergent outflow carves a moat around it -> plateau + canyon. Instead
+      // erosion is only REDUCED near the spring (to 25% at the core) over a WIDE gentle
+      // ramp, so the spring subsides gently with its surroundings — no plateau, no moat.
+      const srcVal = textureLoad(source, ivec2(ix, iy)).x;
+      const notSource = float(1).sub(smoothstep(float(0), float(0.003), srcVal).mul(0.75));
       const softness = max(u.rockErodibility, lc.div(u.looseFull).min(float(1)));
       // 3D volumetric hardness at the bedrock point (world x,height,z).
       // broad volumetric hardness (low freq -> regional hard/soft provinces, NOT a
@@ -352,11 +379,17 @@ function flatErosion(
       const align = max(float(0), fdir.normalize().dot(dh.normalize()));
       const gentle = float(1).sub(smoothstep(float(0.05), float(0.18), tilt));
       const lateral = discharge.mul(float(1).sub(align)).mul(gentle).mul(u.lateralErosion).mul(softness).mul(hard).mul(erodeGate);
-      const erode = erodeBase.add(lateral).mul(depthSuppress).mul(u.simSpeed).min(CAP);
+      // NO-SINK: never carve a cell below its LOWEST neighbor. A closed pit (lower
+      // than all neighbors) traps water + sediment -> flow stalls -> it deposits a bar
+      // it can never cut back through (the "digs in after the drop then dams itself"
+      // bug). Canyons (lower than most, but OPEN downstream) are still allowed.
+      const minNb = min(min(bAt(ix.add(1), iy), bAt(ix.sub(1), iy)), min(bAt(ix, iy.add(1)), bAt(ix, iy.sub(1))));
+      const noSink = max(float(0), bc.sub(minNb));
+      const erode = erodeBase.add(lateral).mul(depthSuppress).mul(u.simSpeed).min(CAP).min(noSink);
       // ANTI-DAM: never deposit enough to raise the bed above the local water
       // surface. Excess sediment stays suspended -> advects on to deeper water ->
       // spreads a submerged delta fan instead of instantly damming the channel.
-      const dep = max(float(0), sc.sub(capacity)).mul(u.deposit).mul(u.simSpeed).min(CAP).min(dc.mul(0.35));
+      const dep = max(float(0), sc.sub(capCarry)).mul(u.deposit).mul(u.simSpeed).min(CAP).min(dc.mul(0.22));
       bNew.assign(max(bc.sub(erode).add(dep), float(0)));
       looseNew.assign(max(lc.sub(erode), float(0)).add(dep));
       sNew.assign(max(float(0), sc.add(erode).sub(dep)).min(float(2)));
@@ -366,7 +399,7 @@ function flatErosion(
     textureStore(bOut, uvec2(x, y), vec4(bNew, 0, 0, 1)).toWriteOnly();
     textureStore(looseOut, uvec2(x, y), vec4(looseNew, 0, 0, 1)).toWriteOnly();
     textureStore(sOut, uvec2(x, y), vec4(sNew, 0, 0, 1)).toWriteOnly();
-    textureStore(activityOut, uvec2(x, y), vec4(erodeViz, depositViz, 0, 1)).toWriteOnly();
+    textureStore(activityOut, uvec2(x, y), vec4(erodeViz, depositViz, wetViz, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
 }

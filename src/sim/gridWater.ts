@@ -32,8 +32,8 @@ import { type FluidUniforms, mudViscosityFactor } from './passes/water';
  *  enough to prevent flooding. Calibrated to the actual velocity scale (k≈1.96 ->
  *  river speeds ~2-3): protection only kicks in WELL above standing-water speed
  *  (deadzone at 0.4*ref) or thin sheet flow stays protected and the planet floods. */
-export const evapFlowReduce = uniform(0.7); // max evap reduction for fast flow
-export const evapSpeedRef = uniform(2.5); // speed at which reduction saturates
+export const evapFlowReduce = uniform(0.85); // max evap reduction for fast flow
+export const evapSpeedRef = uniform(0.8); // speed at which reduction saturates (rivers flow ~1 — must be protected or they evaporate mid-course before reaching the sea)
 /** Deep water also evaporates slowly: proportional evap removes a FRACTION of the
  *  column, so a deep still lake (speed≈0, no flow protection) loses huge absolute
  *  depth and drains to a puddle. Protect deep water too — saturating, so an
