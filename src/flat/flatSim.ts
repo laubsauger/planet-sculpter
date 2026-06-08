@@ -34,12 +34,16 @@ const cX = (x: any, w: number) => x.toFloat().max(float(0)).min(float(w - 1)).to
 const cY = (y: any, h: number) => y.toFloat().max(float(0)).min(float(h - 1)).toInt();
 
 /** Pipe outflow flux (L,R,T,B). */
-function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture, fPrev: StorageTexture, fOut: StorageTexture, w: number, h: number): CN {
+function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture, source: StorageTexture, fPrev: StorageTexture, fOut: StorageTexture, w: number, h: number): CN {
   const p = waterUniforms;
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
     const surf = (cx: any, cy: any) => textureLoad(b, ivec2(cX(cx, w), cY(cy, h))).x.add(textureLoad(d, ivec2(cX(cx, w), cY(cy, h))).x);
-    const hc = surf(ix, iy);
+    const emit = textureLoad(source, ivec2(ix, iy)).x;
+    // Treat a spring as hydraulic head as well as incoming volume. This makes the
+    // pipe solver evacuate discharge on the next flux pass instead of accumulating
+    // a stationary mound until the geometric water surface becomes steep enough.
+    const hc = surf(ix, iy).add(emit.mul(0.12));
     const dc = textureLoad(d, ivec2(ix, iy)).x;
     const prev = textureLoad(fPrev, ivec2(ix, iy));
     const concentration = textureLoad(sediment, ivec2(ix, iy)).x.div(max(dc, float(EPS)));
@@ -199,10 +203,47 @@ function flatMomentumUpdate(
     next.y.assign(next.y.sub(p.dt.mul(p.gravity).mul(c.x).mul(bedDx)));
     next.z.assign(next.z.sub(p.dt.mul(p.gravity).mul(c.x).mul(bedDy)));
 
-    const emit = textureLoad(source, ivec2(ix, iy)).x;
+    const sourceAt = (cx: any, cy: any) => textureLoad(source, ivec2(cX(cx, w), cY(cy, h))).x;
+    const emit = sourceAt(ix, iy);
     const oro = smoothstep(flatSeaLevel, flatSeaLevel.add(rainHighRef), bed(ix, iy));
-    const rain = p.source.mul(mix(float(1), oro, rainOrographic));
-    next.x.assign(next.x.add(rain.add(emit).mul(p.dt)).max(float(0)));
+    const ux = ix.toFloat().div(float(w)), uy = iy.toFloat().div(float(h));
+    const cloud = mx_fractal_noise_float(
+      vec3(ux.mul(2.6).add(time.mul(0.02)), uy.mul(2.6).sub(time.mul(0.015)), time.mul(0.05)), 3);
+    const cloudMask = clamp(cloud.mul(0.9).add(0.65), float(0), float(1.5));
+    const rain = p.source.mul(mix(float(1), oro, rainOrographic)).mul(cloudMask);
+    const emittedDepth = emit.mul(p.dt);
+    next.x.assign(next.x.add(rain.mul(p.dt)).add(emittedDepth).max(float(0)));
+
+    // A spring injects discharge, not a stack of motionless water. Drive the new
+    // volume downhill and outward across the source footprint so pressure leaves
+    // the source immediately instead of first building a tall dome.
+    const downhill = vec2(
+      bed(ix.sub(1), iy).sub(bed(ix.add(1), iy)),
+      bed(ix, iy.sub(1)).sub(bed(ix, iy.add(1))),
+    );
+    const outward = vec2(
+      sourceAt(ix.sub(1), iy).sub(sourceAt(ix.add(1), iy)),
+      sourceAt(ix, iy.sub(1)).sub(sourceAt(ix, iy.add(1))),
+    );
+    const downhillDir = downhill.div(max(length(downhill), float(EPS)));
+    const outwardDir = outward.div(max(length(outward), float(EPS)));
+    const sourceDrive = downhillDir.add(outwardDir.mul(0.65));
+    const sourceDir = sourceDrive.div(max(length(sourceDrive), float(EPS)));
+    const sourceMomentum = emittedDepth.mul(0.75);
+    next.y.assign(next.y.add(sourceDir.x.mul(sourceMomentum)));
+    next.z.assign(next.z.add(sourceDir.y.mul(sourceMomentum)));
+
+    // Match the pipe solver's flow/depth-aware evaporation. Remove momentum with
+    // evaporated mass so shallow drying does not artificially accelerate the remainder.
+    const preEvapSpeed = length(vec2(next.y, next.z)).div(max(next.x, float(1e-5)));
+    const flowKeep = smoothstep(evapSpeedRef.mul(0.4), evapSpeedRef, preEvapSpeed).mul(evapFlowReduce);
+    const deepKeep = smoothstep(evapShallowRef, evapDeepRef, next.x).mul(evapDeepReduce);
+    const keep = max(flowKeep, deepKeep).min(float(0.97));
+    const evapScale = max(float(0), float(1).sub(p.evapProp.mul(float(1).sub(keep)).mul(p.dt)));
+    next.x.assign(next.x.mul(evapScale));
+    next.y.assign(next.y.mul(evapScale));
+    next.z.assign(next.z.mul(evapScale));
+
     const need = flatSeaLevel.sub(bed(ix, iy)).max(float(0));
     next.x.assign(next.x.max(need));
 
@@ -358,12 +399,18 @@ function flatErosion(
       const capacity = u.sedimentCapacity.mul(sinTilt).mul(speed).mul(hasWater).mul(conc);
       const transport = max(sinTilt, speed.mul(u.flowTransport));
       const capCarry = u.sedimentCapacity.mul(transport).mul(speed).mul(hasWater).mul(conc);
-      // Spring damping (NOT a hard cutoff): a fully-protected source cell stays high
-      // while the divergent outflow carves a moat around it -> plateau + canyon. Instead
-      // erosion is only REDUCED near the spring (to 25% at the core) over a WIDE gentle
-      // ramp, so the spring subsides gently with its surroundings — no plateau, no moat.
-      const srcVal = textureLoad(source, ivec2(ix, iy)).x;
-      const notSource = float(1).sub(smoothstep(float(0), float(0.003), srcVal).mul(0.75));
+      // The actual spring footprint is infrastructure, not erodible terrain. Protect
+      // only it and its immediate cells; the directed source momentum now evacuates
+      // water without requiring a wide protected plateau.
+      const sourceAt = (cx: any, cy: any) => textureLoad(source, ivec2(cX(cx, w), cY(cy, h))).x;
+      const srcNear = max(
+        sourceAt(ix, iy),
+        max(
+          max(sourceAt(ix.sub(1), iy), sourceAt(ix.add(1), iy)),
+          max(sourceAt(ix, iy.sub(1)), sourceAt(ix, iy.add(1))),
+        ),
+      );
+      const notSource = float(1).sub(smoothstep(float(0), float(0.003), srcNear));
       const softness = max(u.rockErodibility, lc.div(u.looseFull).min(float(1)));
       // 3D volumetric hardness at the bedrock point (world x,height,z).
       // broad volumetric hardness (low freq -> regional hard/soft provinces, NOT a
@@ -389,7 +436,15 @@ function flatErosion(
       // ANTI-DAM: never deposit enough to raise the bed above the local water
       // surface. Excess sediment stays suspended -> advects on to deeper water ->
       // spreads a submerged delta fan instead of instantly damming the channel.
-      const dep = max(float(0), sc.sub(capCarry)).mul(u.deposit).mul(u.simSpeed).min(CAP).min(dc.mul(0.22));
+      // Calm/deep water continuously drops suspended sediment. This is separate
+      // from capacity-driven deposition: lakes and sheltered coastal water should
+      // clarify even when they are not evaporating.
+      const calm = float(1).sub(smoothstep(float(0.025), float(0.22), speed));
+      const settling = sc.mul(u.stillDeposit).mul(calm).mul(smoothstep(float(0.012), float(0.08), dc));
+      const dep = max(
+        max(float(0), sc.sub(capCarry)).mul(u.deposit).mul(u.simSpeed),
+        settling,
+      ).min(CAP).min(dc.mul(0.22)).mul(notSource);
       bNew.assign(max(bc.sub(erode).add(dep), float(0)));
       looseNew.assign(max(lc.sub(erode), float(0)).add(dep));
       sNew.assign(max(float(0), sc.add(erode).sub(dep)).min(float(2)));
@@ -523,7 +578,7 @@ export class FlatSim {
     renderer.compute(buildGridSeed(looseSeed, this.loose.main, w, h));
     const b = height.main;
     this.nodes = {
-      fluxN: flatFlux(b, this.water.main, this.sediment.main, this.flux.main, this.flux.scratch, w, h),
+      fluxN: flatFlux(b, this.water.main, this.sediment.main, this.source.main, this.flux.main, this.flux.scratch, w, h),
       fluxC: buildGridCopy(this.flux.scratch, this.flux.main, w, h),
       velN: flatVelocity(this.flux.main, this.water.main, this.velocity.main, this.velocity.scratch, w, h),
       velC: buildGridCopy(this.velocity.scratch, this.velocity.main, w, h),

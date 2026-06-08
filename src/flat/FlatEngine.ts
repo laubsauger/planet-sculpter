@@ -86,6 +86,17 @@ export class FlatEngine {
 
     this.sun = new DirectionalLight(0xfff4e2, 3.0);
     this.sun.position.set(6, 9, 4);
+    this.sun.castShadow = true;
+    this.sun.shadow.mapSize.set(2048, 2048);
+    const shadowExtent = FLAT.worldSize * 0.7;
+    this.sun.shadow.camera.left = -shadowExtent;
+    this.sun.shadow.camera.right = shadowExtent;
+    this.sun.shadow.camera.top = shadowExtent;
+    this.sun.shadow.camera.bottom = -shadowExtent;
+    this.sun.shadow.camera.near = 0.1;
+    this.sun.shadow.camera.far = FLAT.worldSize * 4;
+    this.sun.shadow.bias = -0.0004;
+    this.sun.shadow.normalBias = 0.02;
     this.sky = new HemisphereLight(0xbfd8ff, 0x6b5a3f, 0.55);
     this.scene.add(this.sun, this.sky);
     // world-space lighting uniforms for the unlit terrain (camera-independent).
@@ -97,6 +108,7 @@ export class FlatEngine {
 
   async init(): Promise<void> {
     await this.renderer.init();
+    this.renderer.shadowMap.enabled = true;
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 
@@ -139,6 +151,8 @@ export class FlatEngine {
       this.sim.activity.main,
     );
     this.terrainMesh = buildFlatMesh(mW, mH, this.terrainMaterial);
+    this.terrainMesh.castShadow = true;
+    this.terrainMesh.receiveShadow = true;
     this.scene.add(this.terrainMesh);
 
     const water = makeFlatWater(this.heightField.main, this.sim.water.main, this.sim.velocity.main, this.sim.sediment.main);
@@ -191,7 +205,7 @@ export class FlatEngine {
     wf.add({ clear: () => this.sim.clearWater() }, 'clear').name('clear water');
     wf.add({ cs: () => this.sim.clearSources() }, 'cs').name('clear sources');
     const e = gui.addFolder('Erosion');
-    e.add(this.sim, 'erosionEnabled').name('enabled');
+    e.add(this.sim, 'erosionEnabled').name('enabled').listen();
     e.add(erosionUniforms.simSpeed, 'value', 1, 12, 0.5).name('sim speed');
     e.add(erosionUniforms.sedimentCapacity, 'value', 0, 1, 0.02).name('capacity');
     e.add(erosionUniforms.deposit, 'value', 0, 0.3, 0.01).name('deposit');

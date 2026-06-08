@@ -89,7 +89,11 @@ function perturb(n: any, p: any): any {
   const nz = (q: any) => mx_fractal_noise_float(q.mul(detailFreq), 4);
   const dx = nz(p.add(vec3(e, 0, 0))).sub(nz(p.sub(vec3(e, 0, 0))));
   const dz = nz(p.add(vec3(0, 0, e))).sub(nz(p.sub(vec3(0, 0, e))));
-  return normalize(n.sub(vec3(dx, float(0), dz).mul(detailStrength)));
+  // Flat sand/soil should read as broad smooth masses; strong relief belongs on
+  // exposed slopes and cliffs. This also prevents PBR lighting from turning the
+  // same procedural normal into a repeated embossed pattern across the whole map.
+  const relief = float(0.14).add(float(0.86).mul(float(1).sub(n.y.clamp(0, 1))));
+  return normalize(n.sub(vec3(dx, float(0), dz).mul(detailStrength).mul(relief)));
 }
 
 export function flatSurface(sampleHeight: (coord: any) => any, detail = true, clampCubic = false): FlatSurface {
