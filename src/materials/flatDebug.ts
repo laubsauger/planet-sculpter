@@ -1,4 +1,4 @@
-import type { Texture } from 'three';
+import { DoubleSide, type Texture } from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import {
   textureLoad, uv, vec2, vec3, float, length, min, mix, normalize, uniform,
@@ -60,7 +60,7 @@ export function makeFlatDebug(
   col = mode.equal(float(10)).select(ramp(fluxMagnitude.mul(0.2)), col);
   col = mode.equal(float(11)).select(active.select(vec3(0.1, 0.9, 0.2), vec3(0.08, 0.08, 0.1)), col);
 
-  const mat = new MeshBasicNodeMaterial();
+  const mat = new MeshBasicNodeMaterial({ side: DoubleSide });
   mat.positionNode = surface.position;
   mat.colorNode = col;
   return mat;

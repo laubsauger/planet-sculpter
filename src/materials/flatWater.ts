@@ -65,7 +65,7 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   const breakup = sin(along.mul(11).sub(travel.mul(2.2))).mul(0.5).add(0.5);
   const streak = smoothstep(0.64, 0.94, ridges).mul(breakup.mul(0.45).add(0.55));
   const movingWater = smoothstep(0.015, 0.55, speed);
-  const streakStrength = streak.mul(movingWater).mul(smoothstep(0.0004, 0.05, depth));
+  const streakStrength = streak.mul(movingWater).mul(smoothstep(0.00006, 0.05, depth));
   col = mix(col, FOAM, streakStrength.mul(flowBandStrength));
 
   // world-space lighting: gentle sun diffuse keeps base bright + readable any angle.
@@ -85,12 +85,14 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   const rapids = smoothstep(0.08, 0.8, speed).mul(smoothstep(0.0004, 0.035, depth));
   col = mix(col, FOAM, max(shore.mul(lap.mul(0.6).add(0.2)), rapids.mul(0.72).add(streakStrength.mul(0.42))).min(float(1)));
 
-  const opacity = clamp(
-    smoothstep(0.00012, 0.004, depth).mul(0.54)
-      .add(smoothstep(0.004, 0.08, depth).mul(0.43)),
-    float(0),
-    float(0.97),
-  );
+  const depthOpacity = smoothstep(0.00008, 0.0012, depth).mul(0.62)
+    .add(smoothstep(0.0012, 0.05, depth).mul(0.35));
+  // Velocity-driven floor: shallow-but-fast erosive flow stays visible instead of
+  // rounding to zero. Gated by a tiny depth threshold so dry cells (depth 0) with a
+  // stale velocity field don't paint phantom water.
+  const flowOpacity = smoothstep(0.02, 0.4, speed).mul(0.42)
+    .mul(smoothstep(0.00003, 0.0006, depth));
+  const opacity = clamp(max(depthOpacity, flowOpacity), float(0), float(0.97));
 
   const mat = new MeshBasicNodeMaterial({ transparent: true, side: DoubleSide });
   const visualLift = smoothstep(0.00008, 0.004, depth).mul(0.008);
