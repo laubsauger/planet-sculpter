@@ -86,7 +86,7 @@ export function buildFlatBenchmark(name: Exclude<FlatBenchmark, 'default'>, w: n
         // upslope into the corner and evaporates instead of running downhill.
         const srcV = 0.22;
         const sourceX = 0.5 + Math.sin(srcV * Math.PI * 3.2) * 0.055 + Math.sin(srcV * Math.PI * 7.1) * 0.014;
-        source[k] = normalizedGaussian(u, v, sourceX, srcV, 0.022, w, h, 4);
+        source[k] = normalizedGaussian(u, v, sourceX, srcV, 0.013, w, h, 2.5);
         // Warm-start the visual/routing benchmark with a shallow connected river.
         // Spring-only routing from a dry bed remains a separate solver acceptance case.
         if (v >= srcV && v <= 0.84) water[k] = channel * 0.012;

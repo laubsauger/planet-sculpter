@@ -10,7 +10,7 @@ import {
   textureLoad, uv, mix, smoothstep, max, clamp, float, vec2, vec3, length,
   normalize, dot, pow, sin, time, cameraPosition, mx_fractal_noise_float, uniform,
 } from 'three/tsl';
-import { flatSurface, bilinear, flatGridX, flatGridY, flatSeaLevel } from '../tsl/flatSurface';
+import { flatSurface, bilinear, bicubicClamped, flatGridX, flatGridY, flatSeaLevel } from '../tsl/flatSurface';
 import { sunDirUniform, sunIntensityU } from '../tsl/lighting';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -28,7 +28,9 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
 
   const s = flatSurface((c: any) => textureLoad(heightTex, c).x.add(textureLoad(waterTex, c).x), false, true);
-  const depth = bilinear((c: any) => textureLoad(waterTex, c).x, fx, fy);
+  // bicubic depth -> smooth (C1) color + alpha edge instead of grid-aligned bilinear
+  // stair-steps that read as pixelation along the waterline.
+  const depth = bicubicClamped((c: any) => textureLoad(waterTex, c).x, fx, fy);
   const vel = bilinear((c: any) => textureLoad(velTex, c).xy, fx, fy);
   const sediment = bilinear((c: any) => textureLoad(sedimentTex, c).x, fx, fy);
   const flow = vec2(vel.x, vel.y);
@@ -44,7 +46,7 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   };
   // Flow ripples: noise advected ALONG the local flow -> rivers ripple downstream,
   // each follows its own direction (not a shared global wave).
-  const flowR = grad(posXZ.sub(flow.mul(time.mul(0.3))), 3.5).mul(speed.mul(0.4).add(0.04));
+  const flowR = grad(posXZ.sub(flow.mul(time.mul(0.3))), 3.0).mul(speed.min(float(1.2)).mul(0.22).add(0.02));
   // Ambient swell belongs to the OPEN OCEAN ONLY (bedrock below sea level). All water
   // on land — rivers, rain runoff, puddles — must read by its OWN flow (flowR), never
   // share one global wave. Gate the swell by an ocean-basin mask so it can't bleed onto
@@ -92,24 +94,37 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   col = mix(col, SKY_REFLECT, fres.mul(0.45));
   // sun specular glint (Blinn-Phong, additive sparkle).
   const half = normalize(sunDirUniform.add(viewW));
-  const spec = pow(max(float(0), dot(nW, half)), float(80)).mul(sunIntensityU.mul(0.5));
+  const spec = pow(max(float(0), dot(nW, half)), float(40)).mul(sunIntensityU.mul(0.28));
   col = col.add(vec3(1.0, 0.97, 0.9).mul(spec));
   // shoreline lapping foam + rapids.
   const lap = sin(posXZ.x.add(posXZ.y).mul(6).sub(time.mul(2.2))).mul(0.5).add(0.5);
   // wide shallow band so foam rings EVERY coast (steep shores were sub-pixel before),
   // with a solid base + animated lapping on top so it's always present, not sparse.
-  const shore = float(1).sub(smoothstep(0.002, 0.07, depth));
+  // shore foam lives in a shallow-WATER BAND (rises after depth>0, fades by 0.08) — it
+  // must be 0 on dry land (depth 0) or the lapping pattern paints animated foam over the
+  // whole terrain via the opacity term.
+  const shore = smoothstep(0.0004, 0.003, depth).mul(float(1).sub(smoothstep(0.02, 0.08, depth)));
   const rapids = smoothstep(0.08, 0.8, speed).mul(smoothstep(0.0004, 0.035, depth));
-  col = mix(col, FOAM, max(shore.mul(lap.mul(0.45).add(0.4)), rapids.mul(0.72).add(streakStrength.mul(0.42))).min(float(1)));
+  const foamAmt = max(shore.mul(lap.mul(0.45).add(0.4)), rapids.mul(0.72).add(streakStrength.mul(0.42))).min(float(1));
+  col = mix(col, FOAM, foamAmt);
 
+  // LAND water (rivers/puddles): stay readable even thin (depth + flow floor).
   const depthOpacity = smoothstep(0.00008, 0.0012, depth).mul(0.62)
     .add(smoothstep(0.0012, 0.05, depth).mul(0.35));
-  // Velocity-driven floor: shallow-but-fast erosive flow stays visible instead of
-  // rounding to zero. Gated by a tiny depth threshold so dry cells (depth 0) with a
-  // stale velocity field don't paint phantom water.
   const flowOpacity = smoothstep(0.02, 0.35, speed).mul(0.72)
     .mul(smoothstep(0.00001, 0.00015, depth));
-  const opacity = clamp(max(depthOpacity, flowOpacity), float(0), float(0.97));
+  const landOpacity = max(depthOpacity, flowOpacity);
+  // OCEAN: clear shallows reveal the sandy seabed, ramping to opaque deep blue (the
+  // From-Dust look) instead of a flat turquoise sheet.
+  const oceanOpacity = smoothstep(0.004, 0.22, depth).mul(0.9).add(0.05);
+  // foam (shoreline + rapids) stays opaque even over transparent shallows so it reads.
+  // Gate EVERYTHING by water presence so dry land is fully transparent (no phantom
+  // water/foam painted over terrain).
+  const hasWater = smoothstep(0.00003, 0.0003, depth);
+  const opacity = clamp(
+    max(mix(landOpacity, oceanOpacity, oceanMask), foamAmt.mul(0.85)).mul(hasWater),
+    float(0), float(0.97),
+  );
 
   const mat = new MeshBasicNodeMaterial({ transparent: true, side: DoubleSide });
   const visualLift = smoothstep(0.00008, 0.004, depth).mul(0.008);

@@ -442,14 +442,23 @@ function flatThermal(b: StorageTexture, loose: StorageTexture, d: StorageTexture
     const transfer = (sx: any, sy: any, tx: any, ty: any) => {
       const sourceHeight = at(b, sx, sy);
       const sourceLoose = at(loose, sx, sy);
-      const request = (nx: any, ny: any) => max(float(0), sourceHeight.sub(at(b, nx, ny)).sub(u.talus));
+      // Loose sediment (sand/silt) has a GENTLER angle of repose than bedrock and can't
+      // stack into a plateau — it slumps to spread a delta fan. The more loose material
+      // a cell holds, the lower its talus -> deposited deltas push outward instead of
+      // piling up vertically.
+      const looseFrac = sourceLoose.div(u.looseFull).min(float(1));
+      const talusEff = u.talus.mul(float(1).sub(looseFrac.mul(0.7)));
+      const request = (nx: any, ny: any) => max(float(0), sourceHeight.sub(at(b, nx, ny)).sub(talusEff));
       const reqL = request(sx.sub(1), sy);
       const reqR = request(sx.add(1), sy);
       const reqT = request(sx, sy.add(1));
       const reqB = request(sx, sy.sub(1));
       const total = reqL.add(reqR).add(reqT).add(reqB);
+      // bedrock channels stay suppressed underwater (don't heal flat), but LOOSE delta
+      // sediment keeps slumping underwater so it fans out instead of damming a plateau.
       const wet = smoothstep(float(0), u.channelDepthRef, at(d, sx, sy));
-      const rate = u.thermalRate.mul(float(1).sub(wet.mul(0.85))).mul(u.simSpeed).mul(0.25);
+      const wetSuppress = wet.mul(0.85).mul(float(1).sub(looseFrac.mul(0.75)));
+      const rate = u.thermalRate.mul(float(1).sub(wetSuppress)).mul(u.simSpeed).mul(0.25);
       const scale = min(rate, sourceLoose.div(max(total, float(EPS))));
       const dx = tx.sub(sx);
       const dy = ty.sub(sy);
