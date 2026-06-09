@@ -1066,9 +1066,10 @@ export class FlatSim {
       r.compute(n.updN); r.compute(n.watC);
     }
     // Water must have time to establish a connected route before terrain responds.
-    // Eroding every 20 Hz water tick lets the bed flatten faster than a river can
-    // hydraulically adjust, especially on modest slopes.
-    if (this.erosionEnabled && this.tickCount % 4 === 0) {
+    // Give the water solver several steps to re-establish pressure and routing
+    // between terrain mutations. Faster bed edits make rivers repeatedly lose
+    // their route at grade breaks before discharge can adjust.
+    if (this.erosionEnabled && this.tickCount % 8 === 0) {
       r.compute(n.eroN);
       // settle reads OLD bed (still in height.main) + NEW bed (height.scratch) -> must run
       // before bC overwrites height.main; wEC then lands the compensated water depth.
