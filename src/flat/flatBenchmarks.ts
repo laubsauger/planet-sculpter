@@ -7,6 +7,7 @@ export const FLAT_BENCHMARKS = [
   'delta',
   'rainErosion',
   'brushStress',
+  'materialTest',
 ] as const;
 
 export type FlatBenchmark = (typeof FLAT_BENCHMARKS)[number];
@@ -71,6 +72,16 @@ export function buildFlatBenchmark(name: Exclude<FlatBenchmark, 'default'>, w: n
       const k = j * w + i;
       const edge = smoothstep(0, 0.08, Math.min(u, v, 1 - u, 1 - v));
       loose[k] = 0.018 * edge;
+
+      if (name === 'materialTest') {
+        // A near-flat plateau well above sea level for inspecting per-type detail normals
+        // (use with the terrain material-grid debug toggle). A very gentle large-scale tilt
+        // + broad swell so the directional sun rakes across the detail relief from a couple
+        // of angles. Loose kept full so nothing auto-exposes to rock.
+        height[k] = 0.42 + (u - 0.5) * 0.06 + Math.sin(u * Math.PI * 1.5) * Math.sin(v * Math.PI * 1.5) * 0.02;
+        loose[k] = 0.022;
+        continue;
+      }
 
       if (name === 'riverToSea' || name === 'delta') {
         const center = 0.5 + Math.sin(v * Math.PI * 3.2) * 0.055 + Math.sin(v * Math.PI * 7.1) * 0.014;

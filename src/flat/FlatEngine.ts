@@ -12,7 +12,7 @@ import GUI from 'lil-gui';
 import { OrbitController } from '../app/OrbitController';
 import { buildFlatSeed } from './flatSeed';
 import { buildFlatMesh } from './flatMesh';
-import { makeFlatTerrain, shoreWetEnabled } from '../materials/flatTerrain';
+import { makeFlatTerrain, shoreWetEnabled, materialDebugGrid, contourOverlay, contourCount } from '../materials/flatTerrain';
 import { flowBandScale, flowBandStrength, makeFlatWater, causticsEnabled, shoreFoamEnabled, oceanSwellEnabled } from '../materials/flatWater';
 import { makeFlatDebug, FLAT_DEBUG_MODES, flatDebugMode } from '../materials/flatDebug';
 import { FlatBrush } from './FlatBrush';
@@ -238,6 +238,9 @@ export class FlatEngine {
     t.add(flatSeaLevel, 'value', 0, 0.7, 0.01).name('sea level');
     t.add(detailStrength, 'value', 0, 1.5, 0.02).name('detail strength');
     t.add(detailFreq, 'value', 1, 24, 0.5).name('detail freq');
+    t.add({ matGrid: false }, 'matGrid').name('material debug grid').onChange((v: boolean) => { materialDebugGrid.value = v ? 1 : 0; });
+    t.add({ contours: false }, 'contours').name('contour lines').onChange((v: boolean) => { contourOverlay.value = v ? 1 : 0; });
+    t.add(contourCount, 'value', 8, 120, 1).name('contour count');
     const wf = gui.addFolder('Water');
     wf.add(this.water, 'rainOn').name('rain [r]');
     wf.add(this.water, 'rainRate', 0, 0.004, 0.00005).name('rain rate');

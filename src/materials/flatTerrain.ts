@@ -6,8 +6,8 @@
 import { FrontSide, type Texture } from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
 import {
-  textureLoad, uv, mix, smoothstep, max, float, vec3, normalize,
-  mx_noise_float, cameraViewMatrix, transformDirection, sin, time, uniform,
+  textureLoad, uv, mix, smoothstep, max, min, float, vec3, normalize,
+  mx_noise_float, cameraViewMatrix, transformDirection, sin, time, uniform, fract,
 } from 'three/tsl';
 import {
   flatSurface, bilinear, flatSeaLevel, flatGridX, flatGridY, detailFreq, detailStrength,
@@ -30,6 +30,13 @@ const SEABED_SHALLOW = vec3(0.46, 0.66, 0.6); // sandy-turquoise just under the 
 const SEABED_DEEP = vec3(0.05, 0.1, 0.16);    // dark cool deep-ocean floor
 // Debug A/B toggle: 0 disables the animated lapping wet-sand darkening entirely.
 export const shoreWetEnabled = uniform(1);
+// Debug inspection: 1 tiles the 4 material types into vertical strips (sand|grass|rock|snow)
+// with clean base colors, so each per-type detail normal can be inspected in isolation
+// (pair with the flat `materialTest` benchmark).
+export const materialDebugGrid = uniform(0);
+// Optional dev/aesthetic overlay: thin dark height-contour lines at regular elevations.
+export const contourOverlay = uniform(0);
+export const contourCount = uniform(48);
 
 export function makeFlatTerrain(
   heightTex: Texture,
@@ -66,25 +73,35 @@ export function makeFlatTerrain(
   const exposure = max(smoothstep(0.32, 0.55, slope), float(1).sub(looseRatio)).min(float(1));
   albedo = mix(albedo, rock, exposure);
 
-  // Material-specific world-space structure. Broad warped strata and restrained
-  // fracture lines make exposed rock read as rock; directional ripples distinguish
-  // loose coastal sand from a flat tan color field.
+  // Broad material mottling in ALBEDO — low-frequency ONLY. The old strata `sin(p.y*13)`
+  // and `fracture` painted flat contour/crack LINES (the "squiggly line" artifact). Rock
+  // layering/shale now lives in the per-type detail NORMAL below, where it reads as lit
+  // relief instead of a painted line.
   const p = s.position;
   const broadRock = mx_noise_float(p.mul(0.65)).mul(0.5).add(0.5);
-  const rockWarp = mx_noise_float(p.mul(2.1).add(vec3(4.3, 1.7, -2.8)));
-  const strata = sin(p.y.mul(13).add(p.x.mul(0.8)).add(rockWarp.mul(2.8))).mul(0.5).add(0.5);
-  const fracture = float(1).sub(smoothstep(0.02, 0.13,
-    sin(p.x.mul(3.2).add(p.z.mul(2.6)).add(rockWarp.mul(3.5))).abs()));
-  const rockStructure = broadRock.mul(0.16).sub(0.08)
-    .add(strata.mul(0.13).sub(0.065))
-    .sub(fracture.mul(0.12));
+  const province = mx_noise_float(p.mul(1.3).add(vec3(4.3, 1.7, -2.8))).mul(0.5).add(0.5);
+  const rockStructure = broadRock.mul(0.18).sub(0.09).add(province.mul(0.1).sub(0.05));
   albedo = albedo.mul(float(1).add(rockStructure.mul(exposure)));
 
   const sandMask = looseRatio.mul(float(1).sub(exposure))
     .mul(float(1).sub(smoothstep(0.16, 0.42, h.sub(flatSeaLevel))));
-  const sandWarp = mx_noise_float(p.mul(1.4)).mul(1.4);
-  const sandRipples = sin(p.x.mul(9).add(p.z.mul(3.2)).add(sandWarp)).mul(0.5).add(0.5);
-  albedo = albedo.mul(float(1).add(sandRipples.sub(0.5).mul(0.13).mul(sandMask)));
+  const sandWarp = mx_noise_float(p.mul(1.4)).mul(1.2);
+  const sandMottle = mx_noise_float(p.mul(2.4).add(sandWarp)).mul(0.5).add(0.5);
+  albedo = albedo.mul(float(1).add(sandMottle.sub(0.5).mul(0.09).mul(sandMask)));
+
+  // Smooth material weights (NOT hard masks) drive the per-type detail normal + roughness.
+  const wSnowB = smoothstep(0.58, 0.72, h);
+  const wRockB = exposure.mul(float(1).sub(wSnowB));
+  const wSandB = sandMask.mul(float(1).sub(wSnowB));
+  const wGrassB = smoothstep(0.3, 0.55, moisture)
+    .mul(float(1).sub(exposure)).mul(float(1).sub(wSnowB)).mul(float(1).sub(wSandB));
+  // Debug grid override: 4 vertical strips, one pure material each.
+  const gcell = uv().x.mul(4.0);
+  const gseg = (lo: number, hi: number) => gcell.greaterThanEqual(float(lo)).and(gcell.lessThan(float(hi))).select(float(1), float(0));
+  const wSand = mix(wSandB, gseg(0, 1), materialDebugGrid);
+  const wGrass = mix(wGrassB, gseg(1, 2), materialDebugGrid);
+  const wRock = mix(wRockB, gseg(2, 3), materialDebugGrid);
+  const wSnow = mix(wSnowB, gseg(3, 4.01), materialDebugGrid);
 
   // Fresh material motion remains visible for a while rather than appearing as
   // an abrupt grid-colored edit.
@@ -143,15 +160,37 @@ export function makeFlatTerrain(
   const underwater = smoothstep(0.001, 0.012, sub);
   albedo = mix(albedo, seabedTex, underwater);
 
-  // Material-scale bump belongs in the fragment normal, separate from the large
-  // heightfield normal. This gives rock/sand surface texture without changing the
-  // silhouette or producing broad interpolated lighting blobs.
-  const bumpE = float(0.025);
-  const bumpAt = (p: any) => mx_noise_float(p.mul(detailFreq));
-  const bumpX = bumpAt(s.position.add(vec3(bumpE, 0, 0))).sub(bumpAt(s.position.sub(vec3(bumpE, 0, 0))));
-  const bumpZ = bumpAt(s.position.add(vec3(0, 0, bumpE))).sub(bumpAt(s.position.sub(vec3(0, 0, bumpE))));
-  const bumpAmount = mix(float(0.025), float(0.13), exposure).mul(detailStrength);
-  const bumpedWorldNormal = normalize(s.worldNormal.sub(vec3(bumpX, 0, bumpZ).mul(bumpAmount)));
+  // Per-terrain-type procedural detail NORMAL — each material gets its own micro-relief
+  // (wind dunes in sand, fine clumps in grass, layered shale in rock, soft sastrugi in snow)
+  // blended by the material weights. Fragment-only finite-difference of a procedural height
+  // field, so it adds surface character WITHOUT extra geometry. `detailFreq`/`detailStrength`
+  // scale the whole thing so the existing GUI sliders still apply.
+  // Features are deliberately LARGE-SCALE (a handful across each material zone) and BOLD so
+  // they read at the typical far viewing distance — stylized macro-relief, not fine grain.
+  const fscale = detailFreq.mul(0.06);
+  const dn = (q: any, f: number) => mx_noise_float(q.mul(fscale.mul(f)));
+  const duneH = (q: any) => // long rolling wind dunes (anisotropic crests)
+    sin(q.x.mul(fscale.mul(1.6)).add(q.z.mul(fscale.mul(0.9))).add(dn(q, 0.5).mul(2.6))).mul(0.85).add(dn(q, 3.5).mul(0.2));
+  const grassHt = (q: any) => dn(q, 3.5).mul(0.6).add(dn(q, 8.0).mul(0.4)); // clumpy tufts
+  const rockHt = (q: any) => // bold layered shale + angular fracture
+    sin(q.y.mul(fscale.mul(8)).add(dn(q, 1.6).mul(3.2))).mul(0.8).add(dn(q, 2.6).mul(0.6));
+  const snowHt = (q: any) => sin(q.x.mul(fscale.mul(2.4)).add(dn(q, 1.2).mul(2.2))).mul(0.5).add(dn(q, 5.0).mul(0.2)); // sastrugi
+  const detailH = (q: any) => wSand.mul(duneH(q)).add(wGrass.mul(grassHt(q))).add(wRock.mul(rockHt(q))).add(wSnow.mul(snowHt(q)));
+  const eX = vec3(0.03, 0, 0), eZ = vec3(0, 0, 0.03);
+  const dHx = detailH(p.add(eX)).sub(detailH(p.sub(eX)));
+  const dHz = detailH(p.add(eZ)).sub(detailH(p.sub(eZ)));
+  // per-type amplitude: shale boldest, snow subtlest. ~3x bolder than before so it reads.
+  const detailAmp = wSand.mul(1.6).add(wGrass.mul(1.1)).add(wRock.mul(2.8)).add(wSnow.mul(0.7)).add(0.2);
+  const bumpedWorldNormal = normalize(s.worldNormal.sub(vec3(dHx, 0, dHz).mul(detailStrength.mul(detailAmp).mul(3.0))));
+
+  // Stylized material STRUCTURE in the albedo + roughness (not just the normal). Detail
+  // normals only catch raking light, so at a far viewing distance the surface reads as flat
+  // diffuse. Driving the SAME per-type procedural field into value + sheen gives each
+  // material visible, distance-readable character — dune banding, grass clumps, shale strata,
+  // snow drifts — independent of elevation/erosion. Per-type contrast: shale boldest.
+  const structCenter = detailH(p);
+  const structContrast = wSand.mul(0.09).add(wGrass.mul(0.13)).add(wRock.mul(0.17)).add(wSnow.mul(0.05)).add(0.03);
+  albedo = albedo.mul(float(1).add(structCenter.mul(structContrast)));
 
   const mat = new MeshStandardNodeMaterial({
     side: FrontSide,
@@ -160,9 +199,26 @@ export function makeFlatTerrain(
   });
   mat.positionNode = s.position;
   mat.normalNode = (transformDirection as any)(cameraViewMatrix, bumpedWorldNormal);
-  mat.colorNode = albedo;
-  const dryRoughness = mix(float(0.91), float(0.98), sandMask)
-    .sub(fracture.mul(exposure).mul(0.06));
-  mat.roughnessNode = mix(dryRoughness, float(0.7), max(max(wet, activity.z), lapWet).min(float(1)));
+  // Debug grid: clean per-type base colour so only the detail normal + roughness vary.
+  const gridColor = gseg(0, 1).mul(SAND).add(gseg(1, 2).mul(GRASS)).add(gseg(2, 3).mul(ROCK)).add(gseg(3, 4.01).mul(SNOW));
+  let outColor: any = mix(albedo, gridColor, materialDebugGrid);
+  // Optional height-contour overlay: thin dark lines at evenly spaced elevations (dev tool).
+  // thin + faint: an elegant elevation hint, not a bold overlay.
+  const cf = fract(h.mul(contourCount));
+  const cLine = float(1).sub(smoothstep(float(0.0), float(0.02), min(cf, float(1).sub(cf))));
+  outColor = mix(outColor, vec3(0.12, 0.13, 0.16), cLine.mul(0.22).mul(contourOverlay));
+  mat.colorNode = outColor;
+  // Per-type roughness so materials read distinctly under the sun: sand matte, grass soft,
+  // rock varied/slightly sheened, snow brightest. Sequential mix-by-weight; wet = shinier.
+  let rough: any = float(0.93); // dry dirt default
+  rough = mix(rough, float(0.97), wSand);
+  rough = mix(rough, float(0.88), wGrass);
+  rough = mix(rough, float(0.8), wRock);
+  rough = mix(rough, float(0.58), wSnow);
+  // Structure modulates sheen too — crests/troughs of the per-type pattern catch the sun
+  // slightly differently, giving specular life instead of a uniform matte field.
+  rough = rough.add(structCenter.mul(0.07)).clamp(float(0.3), float(1));
+  rough = mix(rough, float(0.6), max(max(wet, activity.z), lapWet).min(float(1)));
+  mat.roughnessNode = rough;
   return mat;
 }
