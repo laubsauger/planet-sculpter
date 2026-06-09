@@ -238,7 +238,6 @@ export class FlatEngine {
     t.add(flatSeaLevel, 'value', 0, 0.7, 0.01).name('sea level');
     t.add(detailStrength, 'value', 0, 1.5, 0.02).name('detail strength');
     t.add(detailFreq, 'value', 1, 24, 0.5).name('detail freq');
-    t.add({ shoreWet: true }, 'shoreWet').name('lapping wet sand').onChange((v: boolean) => { shoreWetEnabled.value = v ? 1 : 0; });
     const wf = gui.addFolder('Water');
     wf.add(this.water, 'rainOn').name('rain [r]');
     wf.add(this.water, 'rainRate', 0, 0.004, 0.00005).name('rain rate');
@@ -251,6 +250,7 @@ export class FlatEngine {
     fx.add({ caustics: true }, 'caustics').onChange((v: boolean) => { causticsEnabled.value = v ? 1 : 0; });
     fx.add({ shoreFoam: true }, 'shoreFoam').name('shore foam').onChange((v: boolean) => { shoreFoamEnabled.value = v ? 1 : 0; });
     fx.add({ oceanSwell: true }, 'oceanSwell').name('ocean swell').onChange((v: boolean) => { oceanSwellEnabled.value = v ? 1 : 0; });
+    fx.add({ shoreWet: true }, 'shoreWet').name('lapping wet sand').onChange((v: boolean) => { shoreWetEnabled.value = v ? 1 : 0; });
     wf.add({ riverTool: () => { this.riverMode = !this.riverMode; if (this.riverMode && !this.sculptMode) { this.sculptMode = true; this.orbit.controls.enableRotate = false; } } }, 'riverTool').name('river source tool');
     wf.add(this.river, 'rate', 0, 4, 0.05).name('river discharge');
     wf.add(this.river, 'radius', 0.008, 0.08, 0.002).name('spring radius');
