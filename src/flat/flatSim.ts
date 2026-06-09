@@ -34,7 +34,7 @@ const cX = (x: any, w: number) => x.toFloat().max(float(0)).min(float(w - 1)).to
 const cY = (y: any, h: number) => y.toFloat().max(float(0)).min(float(h - 1)).toInt();
 
 /** Pipe outflow flux (L,R,T,B). */
-function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture, source: StorageTexture, fPrev: StorageTexture, fOut: StorageTexture, w: number, h: number): CN {
+function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture, source: StorageTexture, activity: StorageTexture, fPrev: StorageTexture, fOut: StorageTexture, w: number, h: number): CN {
   const p = waterUniforms;
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
@@ -86,6 +86,20 @@ function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture
     fR = fR.mul(edgeAbsorb);
     fT = fT.mul(edgeAbsorb);
     fB = fB.mul(edgeAbsorb);
+    // Fresh unconsolidated deposits are hydraulically rougher than an established
+    // channel bed. This feeds uneven material anchoring back into routing: bars
+    // divert some discharge, while weak gaps capture it and can become channels.
+    // The activity field decays, so a stable route regains full conductance.
+    const depositAt = (cx: any, cy: any) => textureLoad(activity, ivec2(cX(cx, w), cY(cy, h))).y;
+    const roughFace = (nx: any, ny: any) => smoothstep(
+      float(0.08),
+      float(0.72),
+      max(depositAt(ix, iy), depositAt(nx, ny)),
+    );
+    fL = fL.mul(mix(float(1), float(0.68), roughFace(ix.sub(1), iy)));
+    fR = fR.mul(mix(float(1), float(0.68), roughFace(ix.add(1), iy)));
+    fT = fT.mul(mix(float(1), float(0.68), roughFace(ix, iy.add(1))));
+    fB = fB.mul(mix(float(1), float(0.68), roughFace(ix, iy.sub(1))));
     // Keep the literal final cell sealed so neighbor reads stay in-bounds.
     fL = ix.lessThan(int(1)).select(float(0), fL);
     fR = ix.greaterThan(int(w - 2)).select(float(0), fR);
@@ -558,6 +572,14 @@ function flatErosion(
       const volumetricErodibility = float(1).add(hardnessVariation.mul(u.hardness3dAmp))
         .clamp(float(0.35), float(1.3));
       const hard = materialErodibility.mul(volumetricErodibility);
+      // The same persistent volumetric material structure also governs whether
+      // incoming grains readily anchor or remain mobile. This is not a delta mask:
+      // it applies to every depositional environment and exposes new structure as
+      // the surface moves through the 3D field.
+      const depositAnchoring = float(0.5)
+        .add(float(1).sub(materialErodibility).mul(0.28))
+        .add(hardnessVariation.mul(0.48))
+        .clamp(float(0), float(1));
       // Water must establish and transport before terrain visibly moves. A shared
       // 0.0006 cap let five erosion ticks per second cut a deep trench in seconds.
       // Keep incision deliberately slower than loose-sediment deposition; simSpeed
@@ -567,7 +589,11 @@ function flatErosion(
       // for established flow to rework. A shared low cap made delta bars seal the
       // outlet faster than water could cut distributaries through them.
       const ERODE_CAP = mix(float(0.00022), float(0.00062), looseFrac).mul(u.simSpeed);
-      const DEPOSIT_CAP = float(0.00045).mul(u.simSpeed);
+      // A saturated depositional front must not advance by the exact same amount
+      // in every cell. Persistent substrate resistance changes how readily loose
+      // material anchors, so some bars survive while adjacent cells keep routing.
+      const DEPOSIT_CAP = float(0.00045).mul(u.simSpeed)
+        .mul(mix(float(0.35), float(1.35), depositAnchoring));
       const erodeGate = speed.greaterThan(u.erodeSpeedMin).select(float(1), float(0))
         .mul(notSource).mul(establishedFlow);
       const dh = vec2(dbx, dby).mul(-1).add(vec2(1e-5, 1e-5));
@@ -585,6 +611,14 @@ function flatErosion(
       const bedIncision = float(1).sub(smoothstep(float(0.16), float(0.38), tilt));
       const erodeBase = max(float(0), capacity.sub(sc)).mul(u.dissolve).mul(softness)
         .mul(hard).mul(erodeGate).mul(coherentFlow).mul(channelNoise).mul(bedIncision);
+      // A coherent shallow current can entrain its own loose deposits even where
+      // the bed has become locally flat. Bedrock incision remains slope-driven;
+      // this term only reworks mobile earth and lets distributaries pioneer across
+      // a newly deposited fan instead of leaving an uncut uniform arc.
+      const looseReworkCapacity = u.sedimentCapacity.mul(speed).mul(speed)
+        .mul(u.flowTransport).mul(hasWater).mul(conc).mul(looseFrac).mul(directionalFlow);
+      const looseRework = max(float(0), looseReworkCapacity.sub(sc)).mul(u.dissolve)
+        .mul(erodeGate).mul(channelNoise).mul(depthSuppress).min(lc);
       const gentle = float(1).sub(smoothstep(float(0.05), float(0.18), tilt));
       // Lateral cutting needs a coherent current striking a bank. Broad ocean
       // slosh has plenty of opposing pipe flux and an arbitrary velocity vector;
@@ -597,6 +631,14 @@ function flatErosion(
       // bug). Canyons (lower than most, but OPEN downstream) are still allowed.
       const minNb = min(min(bAt(ix.add(1), iy), bAt(ix.sub(1), iy)), min(bAt(ix, iy.add(1)), bAt(ix, iy.sub(1))));
       const noSink = max(float(0), bc.sub(minNb));
+      const routedBed = selfFlux.x.mul(bAt(ix.sub(1), iy))
+        .add(selfFlux.y.mul(bAt(ix.add(1), iy)))
+        .add(selfFlux.z.mul(bAt(ix, iy.add(1))))
+        .add(selfFlux.w.mul(bAt(ix, iy.sub(1))))
+        .div(max(outflow, float(EPS)));
+      const looseChannelAllowance = max(float(0), bc.sub(routedBed)).add(float(0.0035))
+        .mul(looseFrac).mul(directionalFlow);
+      const incisionLimit = max(noSink, looseChannelAllowance);
       // Once a channel is materially below its banks, stop vertical incision and
       // let its discharge continue downstream. Without this brake, every tick lowers
       // the established path until it becomes an unnecessarily deep trench.
@@ -604,8 +646,8 @@ function flatErosion(
         .add(bAt(ix, iy.add(1))).add(bAt(ix, iy.sub(1))).mul(0.25);
       const incisionDepth = max(float(0), bankMean.sub(bc));
       const incisionBrake = float(1).sub(smoothstep(float(0.008), float(0.035), incisionDepth));
-      const erode = erodeBase.add(lateral.mul(incisionBrake))
-        .mul(depthSuppress).mul(incisionBrake).mul(u.simSpeed).min(ERODE_CAP).min(noSink);
+      const erode = erodeBase.add(looseRework).add(lateral.mul(incisionBrake))
+        .mul(depthSuppress).mul(incisionBrake).mul(u.simSpeed).min(ERODE_CAP).min(incisionLimit);
       // ANTI-DAM: never deposit enough to raise the bed above the local water
       // surface. Excess sediment stays suspended -> advects on to deeper water ->
       // spreads a submerged delta fan instead of instantly damming the channel.
@@ -630,10 +672,10 @@ function flatErosion(
         .mul(mix(float(0.3), float(1), spreading));
       // Small persistent substrate variation seeds bars; once a bar forms, flow
       // splits around it and the hydraulic feedback can create distributaries.
-      // Deposition itself stays mostly hydraulic. Terrain resistance determines
-      // which bars survive subsequent erosion/slumping; only a restrained
-      // material-dependent settling variation avoids a perfectly uniform front.
-      const depositPreference = mix(float(0.94), float(1.06), float(1).sub(materialErodibility));
+      // Material anchoring is strong enough to prevent a saturated receiving-water
+      // front from advancing as one row, while flow still decides where sediment
+      // arrives and whether it has lost carrying power.
+      const depositPreference = mix(float(0.42), float(1.28), depositAnchoring);
       const settling = sc.mul(u.stillDeposit).mul(settlingOpportunity).mul(depositPreference);
       // Preserve a thin transport layer in high-throughflow routes. Low-discharge
       // neighbors can still aggrade into bars; the active route remains wet enough
@@ -846,7 +888,7 @@ export class FlatSim {
     renderer.compute(buildGridSeed(looseSeed, this.loose.main, w, h));
     const b = height.main;
     this.nodes = {
-      fluxN: flatFlux(b, this.water.main, this.sediment.main, this.source.main, this.flux.main, this.flux.scratch, w, h),
+      fluxN: flatFlux(b, this.water.main, this.sediment.main, this.source.main, this.activity.main, this.flux.main, this.flux.scratch, w, h),
       fluxC: buildGridCopy(this.flux.scratch, this.flux.main, w, h),
       velN: flatVelocity(this.flux.main, this.water.main, this.velocity.main, this.velocity.scratch, w, h),
       velC: buildGridCopy(this.velocity.scratch, this.velocity.main, w, h),
