@@ -172,11 +172,19 @@ export function makeFlatTerrain(
   // albedo/roughness value structure. World-position driven -> tiles seamlessly across the
   // whole map, randomized by the fractal noise. detailFreq/detailStrength sliders still scale.
   const detFreq = detailFreq.mul(0.4);
+  // One fractal sample, shaped DIFFERENTLY per material so types read distinctly (not one
+  // homogenous noise): sand = smooth directional dunes, grass = soft grain, rock = layered
+  // shale + sharp ridges, snow = very smooth sastrugi, dirt = rough grain.
   const det = (q: any) => {
     const grain = mx_fractal_noise_float(q.mul(detFreq), 3);
-    const dune = sin(q.x.mul(detFreq.mul(0.7)).add(q.z.mul(detFreq.mul(0.4))));
-    const strata = sin(q.y.mul(detFreq.mul(1.6)));
-    return grain.add(wSand.mul(dune).mul(0.7)).add(wRock.mul(strata).mul(0.8));
+    const dune = sin(q.x.mul(detFreq.mul(0.6)).add(q.z.mul(detFreq.mul(0.35))));
+    const strata = sin(q.y.mul(detFreq.mul(1.5)));
+    const ridge = float(0.4).sub(grain.abs()); // sharp angular ridges for rock
+    return wSand.mul(dune.mul(0.7).add(grain.mul(0.3)))
+      .add(wGrass.mul(grain.mul(0.85)))
+      .add(wRock.mul(strata.mul(0.55).add(ridge.mul(0.9))))
+      .add(wSnow.mul(grain.mul(0.35)))
+      .add(wDirt.mul(grain.mul(0.6)));
   };
   const structCenter = det(p);
   const dX = det(p.add(vec3(0.04, 0, 0))).sub(structCenter);
