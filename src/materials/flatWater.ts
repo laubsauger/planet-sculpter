@@ -51,8 +51,16 @@ export function makeFlatWater(
   // ambiguous pipe discharge should fade out instead of drawing a confident lie.
   const outgoing = flux.x.add(flux.y).add(flux.z).add(flux.w);
   const flowVector = vec2(flux.y.sub(flux.x), flux.z.sub(flux.w));
-  const flowDir = normalize(flowVector.add(vec2(1e-6, 0)));
-  const directionConfidence = smoothstep(0.18, 0.72, length(flowVector).div(max(outgoing, float(1e-6))));
+  const pipeDir = normalize(flowVector.add(vec2(1e-6, 0)));
+  const velocityDir = normalize(vec2(vel.x, vel.y).add(vec2(1e-6, 0)));
+  // The direction overlay shows the neighborhood-reconstructed velocity, which can
+  // be clear even when a cell splits its outgoing flux among several pipes. Follow
+  // that clear route and use local pipe flux only to reject a real contradiction.
+  const fluxAgreement = smoothstep(-0.15, 0.3, dot(velocityDir, pipeDir));
+  const flowDir = velocityDir;
+  const directionConfidence = smoothstep(0.008, 0.12, speed)
+    .mul(mix(float(0.35), float(1), fluxAgreement))
+    .mul(smoothstep(0.00001, 0.001, outgoing));
   const visualFlow = flowDir.mul(speed).mul(directionConfidence);
 
   // calm wave + flow normals (subtle ripple, not noise soup).
@@ -78,12 +86,35 @@ export function makeFlatWater(
   const flatWater = float(1).sub(smoothstep(0.006, 0.045, depthGradient));
   const swell = grad(posXZ.add(vec2(time.mul(0.07), time.mul(-0.05))), 1.7)
     .add(grad(posXZ.add(vec2(time.mul(-0.05), time.mul(0.085))), 3.3).mul(0.55))
-    .mul(0.035).mul(still).mul(flatWater);
+    .mul(0.052).mul(still).mul(flatWater).mul(oceanMask);
   const nW: any = normalize(s.worldNormal.add(flowR).add(swell));
 
   // depth color (view-INDEPENDENT base, always visible).
   let col: any = mix(SHALLOW, MID, smoothstep(0.01, 0.09, depth));
   col = mix(col, DEEP, smoothstep(0.09, 0.32, depth));
+  // Large bodies need readable structure even away from a perfect specular angle.
+  // Two crossing, slowly moving wave fields provide broad stylized modulation.
+  const oceanWaveA = sin(posXZ.x.mul(1.15).add(posXZ.y.mul(0.42)).sub(time.mul(0.42)));
+  const oceanWaveB = sin(posXZ.x.mul(-0.38).add(posXZ.y.mul(1.5)).add(time.mul(0.31)));
+  const oceanStructure = oceanWaveA.add(oceanWaveB.mul(0.65)).mul(0.5).add(0.5);
+  col = mix(col, SKY_REFLECT, oceanStructure.mul(0.085).mul(oceanMask).mul(still));
+
+  // Fake shallow-bottom caustics. These are deliberately a color modulation on
+  // the water sheet so they remain cheap and appear to dance over visible seabed.
+  const causticWarp = mx_fractal_noise_float(
+    vec3(posXZ.mul(0.85), time.mul(0.12)), 2,
+  );
+  const causticPhaseA = posXZ.x.mul(6.2).add(posXZ.y.mul(3.7)).add(time.mul(0.8))
+    .add(causticWarp.mul(3.2))
+    .add(sin(posXZ.y.mul(2.1).sub(time.mul(0.3))).mul(1.7));
+  const causticPhaseB = posXZ.x.mul(-3.8).add(posXZ.y.mul(6.9)).sub(time.mul(0.62))
+    .sub(causticWarp.mul(2.7))
+    .add(sin(posXZ.x.mul(1.8).add(time.mul(0.24))).mul(1.5));
+  const causticA = float(1).sub(smoothstep(0.035, 0.2, sin(causticPhaseA).abs()));
+  const causticB = float(1).sub(smoothstep(0.04, 0.22, sin(causticPhaseB).abs()));
+  const caustics = max(causticA, causticB.mul(0.75));
+  const shallowOcean = oceanMask.mul(float(1).sub(smoothstep(0.035, 0.16, depth)));
+  col = col.add(vec3(0.22, 0.48, 0.42).mul(caustics).mul(shallowOcean).mul(0.055));
   const concentration = sediment.div(max(depth, float(0.003)));
   const sedimentLoad = smoothstep(0.012, 0.22, concentration);
   const plumeNoise = mx_fractal_noise_float(
@@ -126,13 +157,13 @@ export function makeFlatWater(
   col = col.add(vec3(1.0, 0.97, 0.9).mul(spec).mul(float(1).sub(turbidity.mul(0.82))));
   // Breakers follow local bathymetry contours instead of a global diagonal wave.
   // They only exist in shallow ocean water with a real shore-facing depth gradient.
-  const shoreBand = smoothstep(0.001, 0.006, depth)
-    .mul(float(1).sub(smoothstep(0.025, 0.075, depth)));
+  const shoreBand = smoothstep(0.001, 0.005, depth)
+    .mul(float(1).sub(smoothstep(0.035, 0.095, depth)));
   const coastSlope = smoothstep(0.004, 0.045, depthGradient);
   const breakerPhase = sin(depth.mul(260).sub(time.mul(2.8))
     .add(mx_fractal_noise_float(vec3(posXZ.mul(1.8), time.mul(0.08)), 2).mul(2.2)))
     .mul(0.5).add(0.5);
-  const breakerCrest = smoothstep(0.72, 0.94, breakerPhase);
+  const breakerCrest = smoothstep(0.62, 0.88, breakerPhase);
   const breakers = shoreBand.mul(coastSlope).mul(oceanMask).mul(breakerCrest);
 
   // Rapids are a moving-land-water effect. Steep depth changes and speed produce
@@ -141,7 +172,7 @@ export function makeFlatWater(
     .mul(smoothstep(0.005, 0.055, depthGradient))
     .mul(smoothstep(0.0004, 0.025, depth))
     .mul(riverMask);
-  const foamAmt = max(breakers.mul(0.72), rapids.mul(0.32))
+  const foamAmt = max(breakers.mul(0.9), rapids.mul(0.32))
     .mul(float(1).sub(turbidity.mul(0.7))).min(float(1));
   col = mix(col, FOAM, foamAmt);
 
@@ -163,7 +194,7 @@ export function makeFlatWater(
   const muddyOpacity = turbidity.mul(smoothstep(0.0005, 0.018, depth)).mul(0.82);
   // OCEAN: clear shallows reveal the sandy seabed, ramping to opaque deep blue (the
   // From-Dust look) instead of a flat turquoise sheet.
-  const oceanOpacity = smoothstep(0.004, 0.22, depth).mul(0.9).add(0.08);
+  const oceanOpacity = smoothstep(0.003, 0.13, depth).mul(0.78).add(0.2);
   // foam (shoreline + rapids) stays opaque even over transparent shallows so it reads.
   // Gate EVERYTHING by water presence so dry land is fully transparent (no phantom
   // water/foam painted over terrain).

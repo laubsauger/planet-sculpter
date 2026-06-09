@@ -5,6 +5,7 @@
 import {
   Scene, PerspectiveCamera, DirectionalLight, HemisphereLight, AmbientLight, Color, Fog,
   Vector2, Vector3, Raycaster, Plane, Mesh, TimestampQuery, DataTexture, RedFormat, FloatType, Object3D,
+  PlaneGeometry, MeshStandardMaterial, DoubleSide,
 } from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import GUI from 'lil-gui';
@@ -80,7 +81,7 @@ export class FlatEngine {
     this.canvas = canvas;
     this.renderer = new WebGPURenderer({ canvas, antialias: true, trackTimestamp: true });
     this.scene.background = new Color(FlatEngine.SCENE_BACKGROUND);
-    this.scene.fog = new Fog(FlatEngine.SCENE_BACKGROUND, FLAT.worldSize * 1.3, FLAT.worldSize * 3.2);
+    this.scene.fog = new Fog(FlatEngine.SCENE_BACKGROUND, FLAT.worldSize * 1.5, FLAT.worldSize * 4.2);
     this.camera = new PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.05, 200);
     this.camera.position.set(0, FLAT.worldSize * 0.7, FLAT.worldSize * 0.85);
     this.orbit = new OrbitController(this.camera, canvas);
@@ -108,11 +109,32 @@ export class FlatEngine {
     this.sky = new HemisphereLight(0xdceeff, 0xb5ad9d, 0.72);
     this.ambient = new AmbientLight(0xffffff, 0.1);
     this.scene.add(this.sun, this.sunTarget, this.fill, this.sky, this.ambient);
+    this.addOceanContinuation();
     // world-space lighting uniforms for the unlit terrain (camera-independent).
     sunDirUniform.value.copy(this.sun.position).normalize();
     sunIntensityU.value = 2.8;
     ambientU.value = 0.55;
     window.addEventListener('resize', this.onResize);
+  }
+
+  private addOceanContinuation(): void {
+    // A single underlay has no inner rectangular handoff for transparent simulated
+    // water to reveal. Opaque terrain covers it; fog conceals its distant extent.
+    const outer = FLAT.worldSize * 12;
+    const span = outer * 2;
+    const seaY = FLAT.seaLevel * FLAT.heightScale - 0.07;
+    const material = new MeshStandardMaterial({
+      color: 0x0f7096,
+      roughness: 0.46,
+      metalness: 0,
+      side: DoubleSide,
+    });
+    const ocean = new Mesh(new PlaneGeometry(span, span), material);
+    ocean.rotation.x = -Math.PI / 2;
+    ocean.position.set(0, seaY, 0);
+    ocean.receiveShadow = true;
+    ocean.renderOrder = -2;
+    this.scene.add(ocean);
   }
 
   async init(): Promise<void> {

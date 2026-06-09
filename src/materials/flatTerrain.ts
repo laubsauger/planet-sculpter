@@ -7,7 +7,7 @@ import { FrontSide, type Texture } from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
 import {
   textureLoad, uv, mix, smoothstep, max, float, vec3, normalize,
-  mx_noise_float, cameraViewMatrix, transformDirection,
+  mx_noise_float, cameraViewMatrix, transformDirection, sin,
 } from 'three/tsl';
 import {
   flatSurface, bilinear, flatSeaLevel, flatGridX, flatGridY, detailFreq, detailStrength,
@@ -62,6 +62,26 @@ export function makeFlatTerrain(
   const exposure = max(smoothstep(0.32, 0.55, slope), float(1).sub(looseRatio)).min(float(1));
   albedo = mix(albedo, rock, exposure);
 
+  // Material-specific world-space structure. Broad warped strata and restrained
+  // fracture lines make exposed rock read as rock; directional ripples distinguish
+  // loose coastal sand from a flat tan color field.
+  const p = s.position;
+  const broadRock = mx_noise_float(p.mul(0.65)).mul(0.5).add(0.5);
+  const rockWarp = mx_noise_float(p.mul(2.1).add(vec3(4.3, 1.7, -2.8)));
+  const strata = sin(p.y.mul(13).add(p.x.mul(0.8)).add(rockWarp.mul(2.8))).mul(0.5).add(0.5);
+  const fracture = float(1).sub(smoothstep(0.02, 0.13,
+    sin(p.x.mul(3.2).add(p.z.mul(2.6)).add(rockWarp.mul(3.5))).abs()));
+  const rockStructure = broadRock.mul(0.16).sub(0.08)
+    .add(strata.mul(0.13).sub(0.065))
+    .sub(fracture.mul(0.12));
+  albedo = albedo.mul(float(1).add(rockStructure.mul(exposure)));
+
+  const sandMask = looseRatio.mul(float(1).sub(exposure))
+    .mul(float(1).sub(smoothstep(0.16, 0.42, h.sub(flatSeaLevel))));
+  const sandWarp = mx_noise_float(p.mul(1.4)).mul(1.4);
+  const sandRipples = sin(p.x.mul(9).add(p.z.mul(3.2)).add(sandWarp)).mul(0.5).add(0.5);
+  albedo = albedo.mul(float(1).add(sandRipples.sub(0.5).mul(0.13).mul(sandMask)));
+
   // Fresh material motion remains visible for a while rather than appearing as
   // an abrupt grid-colored edit.
   albedo = mix(albedo, FRESH_CUT, smoothstep(0.04, 0.65, activity.x).mul(0.62));
@@ -100,6 +120,8 @@ export function makeFlatTerrain(
   mat.positionNode = s.position;
   mat.normalNode = (transformDirection as any)(cameraViewMatrix, bumpedWorldNormal);
   mat.colorNode = albedo;
-  mat.roughnessNode = mix(float(0.95), float(0.72), max(wet, activity.z).min(float(1)));
+  const dryRoughness = mix(float(0.91), float(0.98), sandMask)
+    .sub(fracture.mul(exposure).mul(0.06));
+  mat.roughnessNode = mix(dryRoughness, float(0.7), max(wet, activity.z).min(float(1)));
   return mat;
 }

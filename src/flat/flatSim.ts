@@ -65,12 +65,28 @@ function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture
     const incoming = inL.add(inR).add(inT).add(inB);
     const incomingDir = vec2(inL.sub(inR), inB.sub(inT));
     const coherence = length(incomingDir).div(max(incoming, float(EPS)));
-    const continuation = coherence.mul(0.52);
+    const bedC = textureLoad(b, ivec2(ix, iy)).x;
+    const landToShelf = smoothstep(flatSeaLevel.sub(0.1), flatSeaLevel.add(0.01), bedC);
+    const edgeDistance = min(
+      min(ix.toFloat(), float(w - 1).sub(ix.toFloat())),
+      min(iy.toFloat(), float(h - 1).sub(iy.toFloat())),
+    );
+    const edgeAbsorb = smoothstep(float(1), float(14), edgeDistance);
+    // Retain enough direction to cross a grade break, but deliberately lose it
+    // through the ocean mixing band. The previous stronger continuation made pipe
+    // water slosh and sent narrow sediment jets all the way offshore.
+    const continuation = coherence.mul(0.28).mul(edgeAbsorb)
+      .mul(mix(float(0.18), float(1), landToShelf));
     fL = fL.add(max(float(0), incomingDir.x.mul(-1)).mul(continuation));
     fR = fR.add(max(float(0), incomingDir.x).mul(continuation));
     fT = fT.add(max(float(0), incomingDir.y).mul(continuation));
     fB = fB.add(max(float(0), incomingDir.y.mul(-1)).mul(continuation));
-    // seal the outer boundary (water leaves via the ocean ring, not the wall).
+    // Absorb directional pipe memory before it can reflect from the clamped edge.
+    fL = fL.mul(edgeAbsorb);
+    fR = fR.mul(edgeAbsorb);
+    fT = fT.mul(edgeAbsorb);
+    fB = fB.mul(edgeAbsorb);
+    // Keep the literal final cell sealed so neighbor reads stay in-bounds.
     fL = ix.lessThan(int(1)).select(float(0), fL);
     fR = ix.greaterThan(int(w - 2)).select(float(0), fR);
     fT = iy.greaterThan(int(h - 2)).select(float(0), fT);
@@ -188,9 +204,17 @@ function flatUpdate(d: StorageTexture, f: StorageTexture, b: StorageTexture, sou
     // Keep the beach, shelf, and river mouth fully hydraulic. Only the genuinely
     // deep ocean acts as the infinite-reservoir sink; relaxing at first contact
     // kills mouth momentum and encourages a sediment bar exactly at the shoreline.
+    const submerged = float(1).sub(smoothstep(flatSeaLevel.sub(0.01), flatSeaLevel, bc));
     const offshore = float(1).sub(smoothstep(flatSeaLevel.sub(0.14), flatSeaLevel.sub(0.06), bc));
-    const oceanRelax = smoothstep(float(0), float(0.9), p.dt.mul(8)).mul(offshore);
+    const reservoirCoupling = mix(float(0.12), float(1), offshore).mul(submerged);
+    const oceanRelax = smoothstep(float(0), float(0.9), p.dt.mul(8)).mul(reservoirCoupling);
     next = mix(next, need, oceanRelax);
+    const edgeDistance = min(
+      min(ix.toFloat(), float(w - 1).sub(ix.toFloat())),
+      min(iy.toFloat(), float(h - 1).sub(iy.toFloat())),
+    );
+    const openOceanEdge = float(1).sub(smoothstep(float(2), float(18), edgeDistance)).mul(submerged);
+    next = mix(next, need, openOceanEdge);
     textureStore(dOut, uvec2(x, y), vec4(max(next, float(0)), 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
@@ -309,7 +333,20 @@ function flatMomentumUpdate(
     next.y.assign(next.y.mul(float(0.992)).mul(speedScale).mul(wet));
     next.z.assign(next.z.mul(float(0.992)).mul(speedScale).mul(wet));
 
-    // Sealed boundaries. The ocean ring remains the explicit depth reservoir.
+    // Absorbing ocean boundary: relax depth to sea datum and remove momentum
+    // before waves can reflect from the finite scenario edge.
+    const edgeDistance = min(
+      min(ix.toFloat(), float(w - 1).sub(ix.toFloat())),
+      min(iy.toFloat(), float(h - 1).sub(iy.toFloat())),
+    );
+    const submerged = bed(ix, iy).lessThan(flatSeaLevel).select(float(1), float(0));
+    const edgeAbsorb = smoothstep(float(2), float(20), edgeDistance);
+    const openOceanEdge = float(1).sub(edgeAbsorb).mul(submerged);
+    next.x.assign(mix(next.x, need, openOceanEdge));
+    next.y.assign(next.y.mul(edgeAbsorb));
+    next.z.assign(next.z.mul(edgeAbsorb));
+
+    // Keep the literal final cell sealed so neighbor reads stay in-bounds.
     next.y.assign(ix.lessThan(int(1)).or(ix.greaterThan(int(w - 2))).select(float(0), next.y));
     next.z.assign(iy.lessThan(int(1)).or(iy.greaterThan(int(h - 2))).select(float(0), next.z));
     textureStore(dOut, uvec2(x, y), vec4(next.x, 0, 0, 1)).toWriteOnly();
@@ -390,8 +427,13 @@ function flatMomentumSediment(
     const sB = upwind(qB, concentration(ix, iy.sub(1)), concentration(ix, iy));
     const sT = upwind(qT, concentration(ix, iy), concentration(ix, iy.add(1)));
     const current = textureLoad(sediment, ivec2(ix, iy)).x;
-    const next = current.sub(sR.sub(sL).add(sT.sub(sB)).mul(p.dt));
-    textureStore(sedimentOut, uvec2(x, y), vec4(max(next, float(0)), 0, 0, 1)).toWriteOnly();
+    let next: any = max(current.sub(sR.sub(sL).add(sT.sub(sB)).mul(p.dt)), float(0));
+    const edgeDistance = min(
+      min(ix.toFloat(), float(w - 1).sub(ix.toFloat())),
+      min(iy.toFloat(), float(h - 1).sub(iy.toFloat())),
+    );
+    next = next.mul(smoothstep(float(2), float(22), edgeDistance));
+    textureStore(sedimentOut, uvec2(x, y), vec4(next, 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
 }
@@ -517,7 +559,11 @@ function flatErosion(
       // 0.0006 cap let five erosion ticks per second cut a deep trench in seconds.
       // Keep incision deliberately slower than loose-sediment deposition; simSpeed
       // can accelerate both for diagnostics without changing their relationship.
-      const ERODE_CAP = float(0.00022).mul(u.simSpeed);
+      const looseFrac = lc.div(u.looseFull).min(float(1));
+      // Bedrock incision is slow, but recently deposited/mobile earth must be easy
+      // for established flow to rework. A shared low cap made delta bars seal the
+      // outlet faster than water could cut distributaries through them.
+      const ERODE_CAP = mix(float(0.00022), float(0.00062), looseFrac).mul(u.simSpeed);
       const DEPOSIT_CAP = float(0.00045).mul(u.simSpeed);
       const erodeGate = speed.greaterThan(u.erodeSpeedMin).select(float(1), float(0))
         .mul(notSource).mul(establishedFlow);
@@ -560,21 +606,36 @@ function flatErosion(
       // from capacity-driven deposition: lakes and sheltered coastal water should
       // clarify even when they are not evaporating.
       const calm = float(1).sub(smoothstep(float(0.025), float(0.22), speed));
-      // Sediment should ride through a connected river and settle where discharge
-      // spreads across a lake/shelf. Previously slow local velocity near the source
-      // dumped the load there even while substantial pipe flow passed through.
-      // Capacity-driven deposition belongs where a transported load decelerates,
-      // not simply anywhere flow is low. The old low-throughflow gate dumped the
-      // load at the first ocean cell after ocean relaxation reduced its discharge.
-      const deceleration = max(float(0), inflow.sub(outflow)).div(max(inflow, float(EPS)));
+      // Deposition follows general loss of carrying power, not a coastline test.
+      // A coherent channel keeps its load moving; when directional discharge fans
+      // into several outlets, the flow loses coherence and bars can nucleate. This
+      // applies equally to floodplains, lakes, and ocean shelves.
       const carriedLoad = smoothstep(float(0.00015), float(0.0025), inflow);
-      const depositZone = carriedLoad.mul(smoothstep(float(0.04), float(0.65), deceleration));
-      const settling = sc.mul(u.stillDeposit).mul(calm)
-        .mul(smoothstep(float(0.02), float(0.12), dc));
+      const netOut = length(vec2(selfFlux.y.sub(selfFlux.x), selfFlux.z.sub(selfFlux.w)));
+      const flowCoherence = netOut.div(max(outflow, float(EPS))).min(float(1));
+      const spreading = float(1).sub(smoothstep(float(0.38), float(0.88), flowCoherence));
+      const transportLoss = max(float(0), sc.sub(capCarry));
+      const depositOpportunity = mix(float(0.12), float(1), spreading.mul(carriedLoad));
+      // Settling fraction is larger in shallow, slow water because grains have a
+      // shorter distance to the bed. The previous rule increased settling with
+      // depth, carrying sediment past shallow fans and dumping it offshore.
+      const shallowResidence = float(1).sub(smoothstep(float(0.035), float(0.18), dc));
+      const wetEnough = smoothstep(float(0.002), float(0.012), dc);
+      const settlingOpportunity = calm.mul(shallowResidence).mul(wetEnough)
+        .mul(mix(float(0.3), float(1), spreading));
+      // Small persistent substrate variation seeds bars; once a bar forms, flow
+      // splits around it and the hydraulic feedback can create distributaries.
+      const depositPreference = float(1).add(nMid.mul(0.1)).clamp(float(0.88), float(1.12));
+      const settling = sc.mul(u.stillDeposit).mul(settlingOpportunity).mul(depositPreference);
+      // Preserve a thin transport layer in high-throughflow routes. Low-discharge
+      // neighbors can still aggrade into bars; the active route remains wet enough
+      // to carry sediment, split around bars, and avulse naturally.
+      const channelClearance = smoothstep(float(0.00025), float(0.003), throughFlow).mul(0.006);
+      const availableWaterColumn = max(float(0), dc.sub(channelClearance));
       const dep = max(
-        max(float(0), sc.sub(capCarry)).mul(u.deposit).mul(u.simSpeed).mul(depositZone),
+        transportLoss.mul(u.deposit).mul(u.simSpeed).mul(depositOpportunity).mul(depositPreference),
         settling,
-      ).min(DEPOSIT_CAP).min(dc.mul(0.22)).mul(notSource);
+      ).min(DEPOSIT_CAP).min(dc.mul(0.22)).min(availableWaterColumn).mul(notSource);
       bNew.assign(max(bc.sub(erode).add(dep), float(0)));
       looseNew.assign(max(lc.sub(erode), float(0)).add(dep));
       sNew.assign(max(float(0), sc.add(erode).sub(dep)).min(float(2)));
@@ -631,7 +692,23 @@ function flatSedimentTransport(d: StorageTexture, f: StorageTexture, s: StorageT
       .add(at(f, ix, iy.add(1)).w.mul(conc(ix, iy.add(1))).mul(mT))
       .add(at(f, ix, iy.sub(1)).z.mul(conc(ix, iy.sub(1))).mul(mB))
       .mul(volumeScale);
-    const next = max(float(0), sc.sub(outgoingSediment).add(incomingSediment));
+    let next: any = max(float(0), sc.sub(outgoingSediment).add(incomingSediment));
+    // Symmetric pairwise mixing feathers suspended river plumes after they enter
+    // deeper receiving water. Using min(gateC, gateNeighbor) gives both cells the
+    // same pair coefficient, so each exchange remains conservative.
+    const mixGate = (cx: any, cy: any) => smoothstep(float(0.025), float(0.14), at(d, cx, cy).x).mul(0.018);
+    const gateC = mixGate(ix, iy);
+    const diffusePair = (nx: any, ny: any) => at(s, nx, ny).x.sub(sc).mul(min(gateC, mixGate(nx, ny)));
+    const plumeMix = diffusePair(ix.sub(1), iy).add(diffusePair(ix.add(1), iy))
+      .add(diffusePair(ix, iy.sub(1))).add(diffusePair(ix, iy.add(1)));
+    next = max(float(0), next.add(plumeMix));
+    // Suspended material reaching the open-ocean edge leaves the modeled scenario.
+    // Otherwise clamped edge sampling builds an unphysical sediment perimeter.
+    const edgeDistance = min(
+      min(ix.toFloat(), float(w - 1).sub(ix.toFloat())),
+      min(iy.toFloat(), float(h - 1).sub(iy.toFloat())),
+    );
+    next = next.mul(smoothstep(float(2), float(22), edgeDistance));
     textureStore(sOut, uvec2(x, y), vec4(next, 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
@@ -643,7 +720,7 @@ function flatThermal(b: StorageTexture, loose: StorageTexture, d: StorageTexture
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
     const at = (tex: StorageTexture, cx: any, cy: any) => textureLoad(tex, ivec2(cX(cx, w), cY(cy, h))).x;
-    const transfer = (sx: any, sy: any, tx: any, ty: any) => {
+    const transfer = (sx: any, sy: any, tx: any, ty: any, targetDistance: number) => {
       const sourceHeight = at(b, sx, sy);
       const sourceLoose = at(loose, sx, sy);
       // Loose sediment (sand/silt) has a GENTLER angle of repose than bedrock and can't
@@ -654,12 +731,14 @@ function flatThermal(b: StorageTexture, loose: StorageTexture, d: StorageTexture
       // Deposited sand/silt has a much shallower angle of repose than rock.
       // Deep loose deposits approach a broad alluvial slope instead of a cliff.
       const talusEff = u.talus.mul(float(1).sub(looseFrac.mul(0.9)));
-      const request = (nx: any, ny: any) => max(float(0), sourceHeight.sub(at(b, nx, ny)).sub(talusEff));
-      const reqL = request(sx.sub(1), sy);
-      const reqR = request(sx.add(1), sy);
-      const reqT = request(sx, sy.add(1));
-      const reqB = request(sx, sy.sub(1));
-      const total = reqL.add(reqR).add(reqT).add(reqB);
+      const request = (nx: any, ny: any, distance: number) =>
+        max(float(0), sourceHeight.sub(at(b, nx, ny)).sub(talusEff.mul(distance)));
+      const total = request(sx.sub(1), sy, 1).add(request(sx.add(1), sy, 1))
+        .add(request(sx, sy.add(1), 1)).add(request(sx, sy.sub(1), 1))
+        .add(request(sx.sub(1), sy.sub(1), Math.SQRT2))
+        .add(request(sx.add(1), sy.sub(1), Math.SQRT2))
+        .add(request(sx.sub(1), sy.add(1), Math.SQRT2))
+        .add(request(sx.add(1), sy.add(1), Math.SQRT2));
       // bedrock channels stay suppressed underwater (don't heal flat), but LOOSE delta
       // sediment keeps slumping underwater so it fans out instead of damming a plateau.
       const wet = smoothstep(float(0), u.channelDepthRef, at(d, sx, sy));
@@ -667,23 +746,25 @@ function flatThermal(b: StorageTexture, loose: StorageTexture, d: StorageTexture
       const looseSpread = mix(float(1), float(3.2), looseFrac);
       const rate = u.thermalRate.mul(float(1).sub(wetSuppress)).mul(looseSpread).mul(u.simSpeed).mul(0.25);
       const scale = min(rate, sourceLoose.div(max(total, float(EPS))));
-      const dx = tx.sub(sx);
-      const dy = ty.sub(sy);
-      let requested: any = reqL;
-      requested = dx.greaterThan(int(0)).select(reqR, requested);
-      requested = dy.greaterThan(int(0)).select(reqT, requested);
-      requested = dy.lessThan(int(0)).select(reqB, requested);
-      return requested.mul(scale);
+      return request(tx, ty, targetDistance).mul(scale);
     };
 
-    const outflow = transfer(ix, iy, ix.sub(1), iy)
-      .add(transfer(ix, iy, ix.add(1), iy))
-      .add(transfer(ix, iy, ix, iy.add(1)))
-      .add(transfer(ix, iy, ix, iy.sub(1)));
-    const inflow = transfer(ix.sub(1), iy, ix, iy)
-      .add(transfer(ix.add(1), iy, ix, iy))
-      .add(transfer(ix, iy.add(1), ix, iy))
-      .add(transfer(ix, iy.sub(1), ix, iy));
+    const outflow = transfer(ix, iy, ix.sub(1), iy, 1)
+      .add(transfer(ix, iy, ix.add(1), iy, 1))
+      .add(transfer(ix, iy, ix, iy.add(1), 1))
+      .add(transfer(ix, iy, ix, iy.sub(1), 1))
+      .add(transfer(ix, iy, ix.sub(1), iy.sub(1), Math.SQRT2))
+      .add(transfer(ix, iy, ix.add(1), iy.sub(1), Math.SQRT2))
+      .add(transfer(ix, iy, ix.sub(1), iy.add(1), Math.SQRT2))
+      .add(transfer(ix, iy, ix.add(1), iy.add(1), Math.SQRT2));
+    const inflow = transfer(ix.sub(1), iy, ix, iy, 1)
+      .add(transfer(ix.add(1), iy, ix, iy, 1))
+      .add(transfer(ix, iy.add(1), ix, iy, 1))
+      .add(transfer(ix, iy.sub(1), ix, iy, 1))
+      .add(transfer(ix.sub(1), iy.sub(1), ix, iy, Math.SQRT2))
+      .add(transfer(ix.add(1), iy.sub(1), ix, iy, Math.SQRT2))
+      .add(transfer(ix.sub(1), iy.add(1), ix, iy, Math.SQRT2))
+      .add(transfer(ix.add(1), iy.add(1), ix, iy, Math.SQRT2));
     const delta = inflow.sub(outflow);
     const c = at(b, ix, iy);
     const lc = at(loose, ix, iy);

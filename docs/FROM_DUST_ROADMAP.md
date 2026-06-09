@@ -119,6 +119,14 @@ evaluated against the same targets instead of being lost during tuning.
 - The infinite-ocean level relaxation must happen offshore, not in the first
   shallow coastal cells. The shelf and mouth need to remain part of the
   hydraulic domain so discharge can fan out before excess water is removed.
+- The outer ocean band is currently a sealed/clamped boundary. It reflects
+  hydraulic disturbances back into the map and lets suspended sediment collect
+  into a perimeter wall. It must absorb excess water, flux/momentum, and
+  suspended sediment.
+- The dam-break benchmark still reads as viscous stretching rather than a
+  pressure-driven surge. It is the required comparison case for deciding whether
+  the production end state remains an enhanced pipe solver or moves to the
+  shallow-water momentum solver.
 
 Acceptance checks:
 
@@ -126,6 +134,8 @@ Acceptance checks:
 - A river crossing a modest grade reduction remains visibly connected.
 - Mouth discharge spreads laterally and offshore instead of stopping at the
   coastline.
+- Long runs do not create inward-moving edge waves or perimeter sediment walls.
+- Dam-break water accelerates and pushes downstream rather than slowly elongating.
 
 ### Sediment and erosion
 
@@ -141,6 +151,12 @@ Acceptance checks:
   not all respond to the same local speed/slope product.
 - Terrain-height changes must preserve the free water surface and visual
   turbidity should be temporally stable enough not to flicker as the bed changes.
+- River-to-ocean ingress needs a soft mixing/deceleration band. Sediment should
+  feather into a shallow fan and lose momentum offshore instead of stopping at
+  the mouth or travelling frictionlessly to the map edge.
+- Current incision/deposition tends to mirror the initial route in straight
+  lengthwise cuts and lines. Preferred erodibility routes and lateral migration
+  must create restrained asymmetry and eventual meanders.
 
 Acceptance checks:
 
@@ -159,12 +175,41 @@ Acceptance checks:
 - River water and ocean water need one continuous depth/turbidity response at
   mouths. The mouth must not look like a separate translucent sheet pasted onto
   the ocean.
+- Large flat water bodies need stylized structure: broad swell, intersecting
+  wave scales, restrained specular variation, and animated fake caustics visible
+  on shallow seabeds.
+- The nearly transparent coastal band is too wide. Transparency should tighten
+  while retaining readable tropical shallows.
+- Coastal breakers are too subdued and need a more visible but still
+  bathymetry-following crest/foam treatment.
+- The bounded simulation currently renders as a detached square tile. Render a
+  non-simulated ocean continuation outside the playable bounds and let distance
+  fog conceal the far extent; the simulation boundary remains explicit and
+  absorbing underneath.
 
 Acceptance checks:
 
 - Animated river marks travel downstream in the river-to-sea benchmark.
 - No static or uphill chevrons appear at confluences and obstacles.
 - Clear, muddy, shallow, deep, river, and ocean water remain recognizably water.
+- Ocean and lake surfaces remain interesting away from rivers and
+  specular-perfect camera angles.
+- Normal gameplay cameras cannot see the square simulation edge or a floating
+  slab against the background.
+
+### Terrain materials
+
+- Terrain albedo currently reads as smooth solid-color blends. Rock needs broad
+  strata/fracture structure plus finer roughness variation; sand needs subtle
+  ripples/grain and wet/dry variation; grass/soil need restrained patch structure.
+- Detail must be material-specific and world-space stable. One shared noise bump
+  cannot make rock, sand, and soil read as distinct materials.
+
+Acceptance checks:
+
+- Rock faces show readable structure at medium distance without noisy silhouettes.
+- Beaches and exposed sand are distinguishable from dry soil.
+- Material detail remains stable under camera rotation and lighting changes.
 
 ### Dispatch cadence
 
@@ -182,6 +227,18 @@ preventing a bed-height change from becoming a fake hydraulic impulse.
 Keep the flat map as the canonical game path for the next milestones. Treat the
 older planet paths as reference implementations until the core material system,
 simulation tests, and performance budget are stable.
+
+Use the shallow-water momentum solver as the intended production fluid core.
+The pipe solver remains a useful cheap runoff/reference mode, but extending it
+with pseudo-momentum creates reflected/sloshy feedback and still cannot represent
+dam-break pressure, surges, or convincing obstacle interactions. The current
+momentum prototype is more coherent in the dam-break comparison but still needs:
+
+- well-balanced wet/dry and bed-step handling;
+- stronger terrain routing without excessive numerical diffusion;
+- the same absorbing ocean boundary as pipe mode;
+- river-source, erosion, sediment, and rendering validation before becoming the
+  default.
 
 Use a layered cell state:
 
