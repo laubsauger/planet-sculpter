@@ -16,8 +16,8 @@ import { FLAT } from '../config';
 export const flatHeightScale = uniform(FLAT.heightScale);
 export const flatSeaLevel = uniform(FLAT.seaLevel);
 /** Fragment detail-normal strength + frequency (subtle surface texture). */
-export const detailStrength = uniform(0.4);
-export const detailFreq = uniform(8);
+export const detailStrength = uniform(0.08);
+export const detailFreq = uniform(17);
 
 const W = FLAT.gridW;
 const H = FLAT.gridH;

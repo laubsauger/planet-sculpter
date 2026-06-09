@@ -41,10 +41,12 @@ export function makeFlatWater(
   // bicubic depth -> smooth (C1) color + alpha edge instead of grid-aligned bilinear
   // stair-steps that read as pixelation along the waterline.
   const depth = bicubicClamped((c: any) => textureLoad(waterTex, c).x, fx, fy);
-  const depthL = bicubicClamped((c: any) => textureLoad(waterTex, c).x, fx.sub(2), fy);
-  const depthR = bicubicClamped((c: any) => textureLoad(waterTex, c).x, fx.add(2), fy);
-  const depthB = bicubicClamped((c: any) => textureLoad(waterTex, c).x, fx, fy.sub(2));
-  const depthT = bicubicClamped((c: any) => textureLoad(waterTex, c).x, fx, fy.add(2));
+  // Gradient neighbours use cheap BILINEAR (not bicubic) — 4 taps each vs 16. The waterline
+  // smoothness comes from the bicubic `depth`; the gradient only needs an approximate slope.
+  const depthL = bilinear((c: any) => textureLoad(waterTex, c).x, fx.sub(2), fy);
+  const depthR = bilinear((c: any) => textureLoad(waterTex, c).x, fx.add(2), fy);
+  const depthB = bilinear((c: any) => textureLoad(waterTex, c).x, fx, fy.sub(2));
+  const depthT = bilinear((c: any) => textureLoad(waterTex, c).x, fx, fy.add(2));
   const depthGradient = length(vec2(depthR.sub(depthL), depthT.sub(depthB)));
   // Wide spatial blur of depth, used ONLY for the deep color/opacity cues. The bathymetric
   // shelf is steep (depth jumps over a few cells), so any sharp depth->color/opacity ramp
@@ -52,17 +54,15 @@ export function makeFlatWater(
   // smoothly across the surface. `depthColor` stays CRISP in the shallows (clean waterline +
   // caustics + foam keep their sharp `depth`) and blends to the blurred field in deeper water.
   const dW = (ox: number, oy: number) => bilinear((c: any) => textureLoad(waterTex, c).x, fx.add(ox), fy.add(oy));
-  const depthWide = dW(11, 0).add(dW(-11, 0)).add(dW(0, 11)).add(dW(0, -11))
-    .add(dW(8, 8)).add(dW(-8, 8)).add(dW(8, -8)).add(dW(-8, -8)).mul(1 / 8);
+  const depthWide = dW(10, 10).add(dW(-10, 10)).add(dW(10, -10)).add(dW(-10, -10)).mul(1 / 4);
   const depthColor = mix(depth, depthWide, smoothstep(0.02, 0.12, depth));
   const vel = bilinear((c: any) => textureLoad(velTex, c).xy, fx, fy);
   const flux = bilinear((c: any) => textureLoad(fluxTex, c), fx, fy);
   // Center-weighted blur of sediment so muddy plumes have SOFT edges that merge into the
   // ocean, instead of hard-contrast shapes. (Turbidity ramp below is also widened.)
   const sed = (ox: number, oy: number) => bilinear((c: any) => textureLoad(sedimentTex, c).x, fx.add(ox), fy.add(oy));
-  const sediment = sed(0, 0).mul(0.36)
-    .add(sed(3, 0).add(sed(-3, 0)).add(sed(0, 3)).add(sed(0, -3)).mul(0.11))
-    .add(sed(5, 5).add(sed(-5, 5)).add(sed(5, -5)).add(sed(-5, -5)).mul(0.05));
+  const sediment = sed(0, 0).mul(0.5)
+    .add(sed(4, 0).add(sed(-4, 0)).add(sed(0, 4)).add(sed(0, -4)).mul(0.125));
   const speed = length(vec2(vel.x, vel.y));
   // Use the production solver's actual outgoing discharge for visual direction.
   // Reconstructed velocity can point upstream around confluences and obstacles;
@@ -143,18 +143,20 @@ export function makeFlatWater(
 
   // Fake shallow-bottom caustics. These are deliberately a color modulation on
   // the water sheet so they remain cheap and appear to dance over visible seabed.
+  // ~2x smaller cells (doubled frequencies, same reach), THINNER lines, and BOTH axes equal
+  // so the caustic network reads as a grid rather than one-directional streaks.
   const causticWarp = mx_fractal_noise_float(
-    vec3(posXZ.mul(0.85), time.mul(0.12)), 2,
+    vec3(posXZ.mul(1.6), time.mul(0.12)), 2,
   );
-  const causticPhaseA = posXZ.x.mul(6.2).add(posXZ.y.mul(3.7)).add(time.mul(0.8))
-    .add(causticWarp.mul(3.2))
-    .add(sin(posXZ.y.mul(2.1).sub(time.mul(0.3))).mul(1.7));
-  const causticPhaseB = posXZ.x.mul(-3.8).add(posXZ.y.mul(6.9)).sub(time.mul(0.62))
-    .sub(causticWarp.mul(2.7))
-    .add(sin(posXZ.x.mul(1.8).add(time.mul(0.24))).mul(1.5));
-  const causticA = float(1).sub(smoothstep(0.035, 0.2, sin(causticPhaseA).abs()));
-  const causticB = float(1).sub(smoothstep(0.04, 0.22, sin(causticPhaseB).abs()));
-  const caustics = max(causticA, causticB.mul(0.75));
+  const causticPhaseA = posXZ.x.mul(12.4).add(posXZ.y.mul(7.4)).add(time.mul(0.8))
+    .add(causticWarp.mul(2.6))
+    .add(sin(posXZ.y.mul(4.0).sub(time.mul(0.3))).mul(1.4));
+  const causticPhaseB = posXZ.x.mul(-7.6).add(posXZ.y.mul(13.8)).sub(time.mul(0.62))
+    .sub(causticWarp.mul(2.2))
+    .add(sin(posXZ.x.mul(3.6).add(time.mul(0.24))).mul(1.3));
+  const causticA = float(1).sub(smoothstep(0.015, 0.1, sin(causticPhaseA).abs()));
+  const causticB = float(1).sub(smoothstep(0.015, 0.1, sin(causticPhaseB).abs()));
+  const caustics = max(causticA, causticB);
   // SHARP depth + tight fade so caustics live only in the genuine shallows and disappear in
   // deep water (a blurred/wide fade made them shimmer across the whole ocean). Bright + bold
   // so the dancing light genuinely reads on the visible shallow seabed.
