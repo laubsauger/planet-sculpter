@@ -4,9 +4,14 @@
 // hardness, with a coastal sand band. Sediment (loose) shades toward sand.
 
 import { FrontSide, type Texture } from 'three';
-import { MeshPhysicalNodeMaterial } from 'three/webgpu';
-import { textureLoad, uv, mix, smoothstep, max, float, vec3 } from 'three/tsl';
-import { flatSurface, bilinear, flatSeaLevel, flatGridX, flatGridY } from '../tsl/flatSurface';
+import { MeshStandardNodeMaterial } from 'three/webgpu';
+import {
+  textureLoad, uv, mix, smoothstep, max, float, vec3, normalize,
+  mx_noise_float, cameraViewMatrix, transformDirection,
+} from 'three/tsl';
+import {
+  flatSurface, bilinear, flatSeaLevel, flatGridX, flatGridY, detailFreq, detailStrength,
+} from '../tsl/flatSurface';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -30,7 +35,7 @@ export function makeFlatTerrain(
   waterTex: Texture,
   sedimentTex: Texture,
   activityTex: Texture,
-): MeshPhysicalNodeMaterial {
+): MeshStandardNodeMaterial {
   const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
   const bl = (t: Texture) => bilinear((c: any) => textureLoad(t, c).x, fx, fy);
   const blVec = (t: Texture) => bilinear((c: any) => textureLoad(t, c), fx, fy);
@@ -77,15 +82,24 @@ export function makeFlatTerrain(
   albedo = mix(albedo, SAND, smoothstep(0.035, 0.0, above.abs()).mul(0.7));
   albedo = albedo.mul(mix(float(1), float(0.55), smoothstep(0.0, -0.06, above)));
 
-  const mat = new MeshPhysicalNodeMaterial({
+  // Material-scale bump belongs in the fragment normal, separate from the large
+  // heightfield normal. This gives rock/sand surface texture without changing the
+  // silhouette or producing broad interpolated lighting blobs.
+  const bumpE = float(0.025);
+  const bumpAt = (p: any) => mx_noise_float(p.mul(detailFreq));
+  const bumpX = bumpAt(s.position.add(vec3(bumpE, 0, 0))).sub(bumpAt(s.position.sub(vec3(bumpE, 0, 0))));
+  const bumpZ = bumpAt(s.position.add(vec3(0, 0, bumpE))).sub(bumpAt(s.position.sub(vec3(0, 0, bumpE))));
+  const bumpAmount = mix(float(0.025), float(0.13), exposure).mul(detailStrength);
+  const bumpedWorldNormal = normalize(s.worldNormal.sub(vec3(bumpX, 0, bumpZ).mul(bumpAmount)));
+
+  const mat = new MeshStandardNodeMaterial({
     side: FrontSide,
-    roughness: 0.98,
+    roughness: 0.94,
     metalness: 0,
-    specularIntensity: 0.12,
   });
   mat.positionNode = s.position;
-  mat.normalNode = s.viewNormal;
+  mat.normalNode = (transformDirection as any)(cameraViewMatrix, bumpedWorldNormal);
   mat.colorNode = albedo;
-  mat.roughnessNode = mix(float(0.93), float(0.5), max(wet, activity.z).min(float(1)));
+  mat.roughnessNode = mix(float(0.95), float(0.72), max(wet, activity.z).min(float(1)));
   return mat;
 }

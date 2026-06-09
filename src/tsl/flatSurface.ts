@@ -111,7 +111,7 @@ export function flatSurface(sampleHeight: (coord: any) => any, clampCubic = fals
     // `normalNode` contract is view space, so apply only world -> view here.
     // Using modelViewMatrix treated this world normal as object-local and made
     // the diffuse response change under camera rotation.
-    viewNormal: transformDirection(cameraViewMatrix, nObj),
+    viewNormal: transformDirection(cameraViewMatrix as any, nObj),
     height: hAt(u, v),
     slope: float(1).sub(nObj.y.clamp(0, 1)),
   };

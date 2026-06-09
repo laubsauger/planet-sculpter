@@ -21,8 +21,8 @@ const DEEP = vec3(0.015, 0.12, 0.3);
 const SKY_REFLECT = vec3(0.6, 0.78, 0.95);
 const FOAM = vec3(0.95, 0.98, 1.0);
 const SILT = vec3(0.27, 0.2, 0.11);
-export const flowBandStrength = uniform(0.18);
-export const flowBandScale = uniform(10.0);
+export const flowBandStrength = uniform(0.42);
+export const flowBandScale = uniform(7.0);
 
 export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Texture, sedimentTex: Texture): MeshBasicNodeMaterial {
   const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
@@ -58,6 +58,7 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   const flowDir = normalize(mix(rawFlowDir, downhillDir, uphillCorrection));
   const visualFlow = flowDir.mul(speed);
   const directionConfidence = max(downhillStrength, downhillAgreement);
+  const visibleDirection = directionConfidence.mul(0.65).add(0.35);
 
   // calm wave + flow normals (subtle ripple, not noise soup).
   const posXZ = vec2(s.position.x, s.position.z);
@@ -70,8 +71,8 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   // each follows its own direction (not a shared global wave).
   const shallowFlow = float(1).sub(smoothstep(0.025, 0.08, depth));
   const flowR = grad(posXZ.sub(visualFlow.mul(time.mul(0.22))), 1.5)
-    .mul(speed.min(float(1.2)).mul(0.08).add(0.008))
-    .mul(shallowFlow).mul(directionConfidence);
+    .mul(speed.min(float(1.2)).mul(0.11).add(0.012))
+    .mul(shallowFlow).mul(visibleDirection);
   // Ambient swell belongs to the OPEN OCEAN ONLY (bedrock below sea level). All water
   // on land — rivers, rain runoff, puddles — must read by its OWN flow (flowR), never
   // share one global wave. Gate the swell by an ocean-basin mask so it can't bleed onto
@@ -109,13 +110,14 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   const lanes = sin(across.mul(flowBandScale).add(laneWarp)).mul(0.5).add(0.5);
   const movingSegments = sin(along.mul(3.4).sub(travel.mul(2.0))
     .add(sin(across.mul(1.8)).mul(0.5))).mul(0.5).add(0.5);
-  const streak = smoothstep(0.74, 0.96, lanes).mul(smoothstep(0.35, 0.78, movingSegments));
-  const movingWater = smoothstep(0.015, 0.55, speed);
+  const streak = smoothstep(0.58, 0.9, lanes).mul(smoothstep(0.22, 0.72, movingSegments));
+  const movingWater = smoothstep(0.008, 0.32, speed);
   const riverMask = float(1).sub(oceanMask);
-  const streakStrength = streak.mul(movingWater).mul(directionConfidence).mul(riverMask)
+  const streakStrength = streak.mul(movingWater).mul(visibleDirection).mul(riverMask)
     .mul(smoothstep(0.00006, 0.05, depth))
     .mul(float(1).sub(smoothstep(0.04, 0.2, depth)));
   col = mix(col, FOAM, streakStrength.mul(flowBandStrength));
+  col = col.mul(float(1).sub(streakStrength.mul(0.08).mul(float(1).sub(movingSegments))));
 
   // world-space lighting: gentle sun diffuse keeps base bright + readable any angle.
   const viewW = normalize(cameraPosition.sub(s.position));
@@ -123,10 +125,10 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   col = col.mul(ndl.mul(0.35).add(0.75));
   // fresnel sky reflection (rim, additive bonus).
   const fres = pow(float(1).sub(max(float(0), dot(nW, viewW))), float(4));
-  col = mix(col, SKY_REFLECT, fres.mul(0.45).mul(float(1).sub(turbidity.mul(0.75))));
+  col = mix(col, SKY_REFLECT, fres.mul(0.18).mul(float(1).sub(turbidity.mul(0.75))));
   // sun specular glint (Blinn-Phong, additive sparkle).
   const half = normalize(sunDirUniform.add(viewW));
-  const spec = pow(max(float(0), dot(nW, half)), float(40)).mul(sunIntensityU.mul(0.28));
+  const spec = pow(max(float(0), dot(nW, half)), float(55)).mul(sunIntensityU.mul(0.1));
   col = col.add(vec3(1.0, 0.97, 0.9).mul(spec).mul(float(1).sub(turbidity.mul(0.82))));
   // Breakers follow local bathymetry contours instead of a global diagonal wave.
   // They only exist in shallow ocean water with a real shore-facing depth gradient.
@@ -173,7 +175,10 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   // water/foam painted over terrain).
   const hasWater = smoothstep(0.00015, 0.001, depth);
   const opacity = clamp(
-    max(max(max(mix(landOpacity, oceanOpacity, oceanMask), waterBodyOpacity), muddyOpacity), foamAmt.mul(0.85)).mul(hasWater),
+    max(
+      max(max(max(mix(landOpacity, oceanOpacity, oceanMask), waterBodyOpacity), muddyOpacity), foamAmt.mul(0.85)),
+      streakStrength.mul(0.32),
+    ).mul(hasWater),
     float(0), float(0.97),
   );
 

@@ -87,7 +87,7 @@ export class FlatEngine {
     this.orbit.controls.target.set(0, 0, 0);
     this.hud = document.getElementById('hud');
 
-    this.sun = new DirectionalLight(0xfff4e2, 3.0);
+    this.sun = new DirectionalLight(0xfff7e8, 3.2);
     this.sun.position.set(6, 9, 4);
     this.sunTarget = new Object3D();
     this.sunTarget.position.set(0, 0, 0);
@@ -103,10 +103,10 @@ export class FlatEngine {
     this.sun.shadow.camera.far = FLAT.worldSize * 4;
     this.sun.shadow.bias = -0.0004;
     this.sun.shadow.normalBias = 0.02;
-    this.fill = new DirectionalLight(0x8faac7, 0.55);
+    this.fill = new DirectionalLight(0xd9e5ee, 0.12);
     this.fill.position.set(-5, 4, -3);
-    this.sky = new HemisphereLight(0xcce6ff, 0x8b7654, 1.05);
-    this.ambient = new AmbientLight(0xdbe7ed, 0.38);
+    this.sky = new HemisphereLight(0xdceeff, 0xb5ad9d, 0.72);
+    this.ambient = new AmbientLight(0xffffff, 0.1);
     this.scene.add(this.sun, this.sunTarget, this.fill, this.sky, this.ambient);
     // world-space lighting uniforms for the unlit terrain (camera-independent).
     sunDirUniform.value.copy(this.sun.position).normalize();

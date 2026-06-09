@@ -104,6 +104,75 @@ Not publicly confirmed:
    diverging behavior. Continued tuning across all three will slow progress and
    make correctness hard to establish.
 
+## Active Water, Erosion, And Rendering Defects
+
+This section records the current visual and simulation failures so fixes are
+evaluated against the same targets instead of being lost during tuning.
+
+### Hydraulic transport
+
+- The production pipe solver preserves water volume but does not transfer
+  downstream momentum between cells. At a steep-to-flat transition, incoming
+  discharge stops and must build a pressure mound before it can leave again.
+- Waterfall feet and river mouths consequently pile far above the receiving
+  water surface and read as viscous material rather than water.
+- The infinite-ocean level relaxation must happen offshore, not in the first
+  shallow coastal cells. The shelf and mouth need to remain part of the
+  hydraulic domain so discharge can fan out before excess water is removed.
+
+Acceptance checks:
+
+- A waterfall entering the ocean does not maintain a large terminal mound.
+- A river crossing a modest grade reduction remains visibly connected.
+- Mouth discharge spreads laterally and offshore instead of stopping at the
+  coastline.
+
+### Sediment and erosion
+
+- Capacity-driven deposition currently favors low-throughflow cells. This can
+  dump sediment at the first ocean contact cell, build a bar, and dam the outlet.
+  Deposition should respond to actual deceleration/divergence, water depth, and
+  settling time.
+- Erodibility variation needs broad, medium, and fine volumetric scales with
+  restrained amplitudes. The goal is persistent preferred channels and branching,
+  not noisy per-cell pits.
+- Bed incision, bank erosion, vertical cliff weathering, and waterfall plunge
+  erosion need separate gates. They are different natural processes and should
+  not all respond to the same local speed/slope product.
+- Terrain-height changes must preserve the free water surface and visual
+  turbidity should be temporally stable enough not to flicker as the bed changes.
+
+Acceptance checks:
+
+- Delta sediment forms a shallow fan with multiple preferred routes rather than
+  a uniform front or outlet dam.
+- A connected river does not excavate a homogeneous row-wide trench.
+- Erosion does not make water depth/color visibly pulse every erosion tick.
+
+### Water rendering
+
+- River flow marks must derive from directional pipe discharge, not reconstructed
+  velocity plus a local downhill correction. Ambiguous confluences should show
+  less directional marking rather than confidently point upstream.
+- White foam belongs at breakers, rapids, plunge impacts, and strong shear. Normal
+  river flow should use subtle refractive streaks instead of white contour lines.
+- River water and ocean water need one continuous depth/turbidity response at
+  mouths. The mouth must not look like a separate translucent sheet pasted onto
+  the ocean.
+
+Acceptance checks:
+
+- Animated river marks travel downstream in the river-to-sea benchmark.
+- No static or uphill chevrons appear at confluences and obstacles.
+- Clear, muddy, shallow, deep, river, and ocean water remain recognizably water.
+
+### Dispatch cadence
+
+The HUD reports the latest frame that performed compute work. In pipe mode a
+normal water tick is 8 dispatches. Erosion runs every fourth water tick and adds
+10 dispatches, so an erosion-enabled run alternating between `8` and `18` is
+expected. This is a cadence indicator, not a random workload spike.
+
 ## Recommended Technical Direction
 
 Keep the flat map as the canonical game path for the next milestones. Treat the

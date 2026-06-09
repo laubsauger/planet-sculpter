@@ -46,6 +46,10 @@ function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture
     const hc = surf(ix, iy).add(emit.mul(0.04));
     const dc = textureLoad(d, ivec2(ix, iy)).x;
     const prev = textureLoad(fPrev, ivec2(ix, iy));
+    const prevL = textureLoad(fPrev, ivec2(cX(ix.sub(1), w), iy));
+    const prevR = textureLoad(fPrev, ivec2(cX(ix.add(1), w), iy));
+    const prevT = textureLoad(fPrev, ivec2(ix, cY(iy.add(1), h)));
+    const prevB = textureLoad(fPrev, ivec2(ix, cY(iy.sub(1), h)));
     const concentration = textureLoad(sediment, ivec2(ix, iy)).x.div(max(dc, float(EPS)));
     const viscosity = float(1).add(concentration.mul(mudViscosityFactor)).min(float(8));
     const k: any = p.dt.mul(p.pipeArea).mul(p.gravity).div(p.pipeLength).div(viscosity);
@@ -53,6 +57,19 @@ function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture
     let fR = max(float(0), prev.y.mul(p.damping).add(k.mul(hc.sub(surf(ix.add(1), iy)))));
     let fT = max(float(0), prev.z.mul(p.damping).add(k.mul(hc.sub(surf(ix, iy.add(1))))));
     let fB = max(float(0), prev.w.mul(p.damping).add(k.mul(hc.sub(surf(ix, iy.sub(1))))));
+    // A pipe cell normally forgets the direction of water entering from its
+    // neighbors. At a grade break that makes discharge stop until a pressure mound
+    // grows high enough to restart it. Transfer the coherent part of incoming flux
+    // into the forward outlet; the volume clamp below keeps the update conservative.
+    const inL = prevL.y, inR = prevR.x, inT = prevT.w, inB = prevB.z;
+    const incoming = inL.add(inR).add(inT).add(inB);
+    const incomingDir = vec2(inL.sub(inR), inB.sub(inT));
+    const coherence = length(incomingDir).div(max(incoming, float(EPS)));
+    const continuation = coherence.mul(0.52);
+    fL = fL.add(max(float(0), incomingDir.x.mul(-1)).mul(continuation));
+    fR = fR.add(max(float(0), incomingDir.x).mul(continuation));
+    fT = fT.add(max(float(0), incomingDir.y).mul(continuation));
+    fB = fB.add(max(float(0), incomingDir.y.mul(-1)).mul(continuation));
     // seal the outer boundary (water leaves via the ocean ring, not the wall).
     fL = ix.lessThan(int(1)).select(float(0), fL);
     fR = ix.greaterThan(int(w - 2)).select(float(0), fR);
@@ -168,7 +185,10 @@ function flatUpdate(d: StorageTexture, f: StorageTexture, b: StorageTexture, sou
     // Sediment is not removed here; it remains available to settle and build deltas.
     const need = bc.mul(-1).add(flatSeaLevel).max(float(0));
     next = next.max(need);
-    const offshore = float(1).sub(smoothstep(flatSeaLevel.sub(0.07), flatSeaLevel.sub(0.015), bc));
+    // Keep the beach, shelf, and river mouth fully hydraulic. Only the genuinely
+    // deep ocean acts as the infinite-reservoir sink; relaxing at first contact
+    // kills mouth momentum and encourages a sediment bar exactly at the shoreline.
+    const offshore = float(1).sub(smoothstep(flatSeaLevel.sub(0.14), flatSeaLevel.sub(0.06), bc));
     const oceanRelax = smoothstep(float(0), float(0.9), p.dt.mul(8)).mul(offshore);
     next = mix(next, need, oceanRelax);
     textureStore(dOut, uvec2(x, y), vec4(max(next, float(0)), 0, 0, 1)).toWriteOnly();
@@ -528,9 +548,14 @@ function flatErosion(
       // Sediment should ride through a connected river and settle where discharge
       // spreads across a lake/shelf. Previously slow local velocity near the source
       // dumped the load there even while substantial pipe flow passed through.
-      const depositZone = float(1).sub(smoothstep(float(0.0002), float(0.002), throughFlow));
+      // Capacity-driven deposition belongs where a transported load decelerates,
+      // not simply anywhere flow is low. The old low-throughflow gate dumped the
+      // load at the first ocean cell after ocean relaxation reduced its discharge.
+      const deceleration = max(float(0), inflow.sub(outflow)).div(max(inflow, float(EPS)));
+      const carriedLoad = smoothstep(float(0.00015), float(0.0025), inflow);
+      const depositZone = carriedLoad.mul(smoothstep(float(0.04), float(0.65), deceleration));
       const settling = sc.mul(u.stillDeposit).mul(calm)
-        .mul(smoothstep(float(0.012), float(0.08), dc)).mul(depositZone);
+        .mul(smoothstep(float(0.02), float(0.12), dc));
       const dep = max(
         max(float(0), sc.sub(capCarry)).mul(u.deposit).mul(u.simSpeed).mul(depositZone),
         settling,
