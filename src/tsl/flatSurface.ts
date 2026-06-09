@@ -6,7 +6,7 @@
 
 import {
   uv, ivec2, float, vec3, normalize, cross, mix, sign, textureLoad, uniform,
-  cameraViewMatrix, mx_fractal_noise_float, varying,
+  cameraViewMatrix, transformDirection, varying,
 } from 'three/tsl';
 import type { Texture } from 'three';
 import { FLAT } from '../config';
@@ -83,20 +83,7 @@ export function bilinear(sample: (c: any) => any, fx: any, fy: any): any {
   return mix(mix(h00, h10, tx), mix(h01, h11, tx), ty);
 }
 
-/** Procedural detail-normal: perturb n by the horizontal gradient of fbm at p. */
-function perturb(n: any, p: any): any {
-  const e = float(0.05);
-  const nz = (q: any) => mx_fractal_noise_float(q.mul(detailFreq), 4);
-  const dx = nz(p.add(vec3(e, 0, 0))).sub(nz(p.sub(vec3(e, 0, 0))));
-  const dz = nz(p.add(vec3(0, 0, e))).sub(nz(p.sub(vec3(0, 0, e))));
-  // Flat sand/soil should read as broad smooth masses; strong relief belongs on
-  // exposed slopes and cliffs. This also prevents PBR lighting from turning the
-  // same procedural normal into a repeated embossed pattern across the whole map.
-  const relief = float(0.14).add(float(0.86).mul(float(1).sub(n.y.clamp(0, 1))));
-  return normalize(n.sub(vec3(dx, float(0), dz).mul(detailStrength).mul(relief)));
-}
-
-export function flatSurface(sampleHeight: (coord: any) => any, detail = true, clampCubic = false): FlatSurface {
+export function flatSurface(sampleHeight: (coord: any) => any, clampCubic = false): FlatSurface {
   const u = uv().x, v = uv().y;
   // BICUBIC height (C1-smooth) -> smooth geometry AND smooth normals, no per-cell
   // facets/blocks regardless of grid resolution.
@@ -113,7 +100,6 @@ export function flatSurface(sampleHeight: (coord: any) => any, detail = true, cl
   const pz = worldPos(u, v.add(e)), pzm = worldPos(u, v.sub(e));
   let n = normalize(cross(pz.sub(pzm), px.sub(pxm)));
   n = n.mul(sign(n.y)); // force upward
-  if (detail) n = perturb(n, p);
   // PERF: compute the (bicubic, ~64-tap) normal PER-VERTEX and interpolate, not
   // per-fragment — that was the 15fps killer. varying() moves it to the vertex stage.
   const nObj: any = varying(n);
@@ -125,7 +111,7 @@ export function flatSurface(sampleHeight: (coord: any) => any, detail = true, cl
     // `normalNode` contract is view space, so apply only world -> view here.
     // Using modelViewMatrix treated this world normal as object-local and made
     // the diffuse response change under camera rotation.
-    viewNormal: nObj.transformDirection(cameraViewMatrix),
+    viewNormal: transformDirection(cameraViewMatrix, nObj),
     height: hAt(u, v),
     slope: float(1).sub(nObj.y.clamp(0, 1)),
   };

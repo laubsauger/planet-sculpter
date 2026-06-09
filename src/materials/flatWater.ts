@@ -27,7 +27,7 @@ export const flowBandScale = uniform(10.0);
 export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Texture, sedimentTex: Texture): MeshBasicNodeMaterial {
   const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
 
-  const s = flatSurface((c: any) => textureLoad(heightTex, c).x.add(textureLoad(waterTex, c).x), false, true);
+  const s = flatSurface((c: any) => textureLoad(heightTex, c).x.add(textureLoad(waterTex, c).x), true);
   // bicubic depth -> smooth (C1) color + alpha edge instead of grid-aligned bilinear
   // stair-steps that read as pixelation along the waterline.
   const depth = bicubicClamped((c: any) => textureLoad(waterTex, c).x, fx, fy);
