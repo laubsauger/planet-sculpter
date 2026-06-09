@@ -170,8 +170,12 @@ Acceptance checks:
 
 The HUD reports the latest frame that performed compute work. In pipe mode a
 normal water tick is 8 dispatches. Erosion runs every fourth water tick and adds
-10 dispatches, so an erosion-enabled run alternating between `8` and `18` is
-expected. This is a cadence indicator, not a random workload spike.
+12 dispatches, so an erosion-enabled run alternating between `8` and `20` is
+expected when one simulation tick lands in a render frame. Slow render frames can
+contain multiple simulation ticks and report combinations such as `36`
+(`8 + 8 + 20`). This is a cadence indicator, not a random workload spike. The
+extra two erosion dispatches preserve the water surface after thermal slumping,
+preventing a bed-height change from becoming a fake hydraulic impulse.
 
 ## Recommended Technical Direction
 

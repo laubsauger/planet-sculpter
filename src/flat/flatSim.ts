@@ -492,19 +492,33 @@ function flatErosion(
       );
       const notSource = float(1).sub(smoothstep(float(0), float(0.003), srcNear));
       const softness = max(u.rockErodibility, lc.div(u.looseFull).min(float(1)));
-      // 3D volumetric hardness at the bedrock point (world x,height,z).
-      // broad volumetric hardness (low freq -> regional hard/soft provinces, NOT a
-      // per-cell spike lattice). bc weighted up so it varies with depth too.
+      // 3D volumetric hardness at the bedrock point (world x,height,z). Blend
+      // broad provinces, channel-scale structure, and weak fine variation. All
+      // samples include elevation, so incision exposes new material rather than
+      // repeatedly reading a fixed 2D surface mask.
       const p3 = vec3(ix.toFloat().div(float(w)), bc.mul(3), iy.toFloat().div(float(h)));
-      const n3 = mx_fractal_noise_float(p3.mul(u.hardness3dFreq), 3);
+      const nBroad = mx_fractal_noise_float(p3.mul(u.hardness3dFreq), 3);
+      const nMid = mx_fractal_noise_float(
+        p3.mul(u.hardness3dFreq.mul(4.2)).add(vec3(7.1, -3.7, 11.3)), 2,
+      );
+      const nFine = mx_fractal_noise_float(
+        p3.mul(u.hardness3dFreq.mul(12.5)).add(vec3(-13.7, 9.2, 5.4)), 2,
+      );
       const hardValue = textureLoad(hardness, ivec2(ix, iy)).x;
       // The seed texture stores HARDNESS, not erodibility. High values must resist
       // erosion. The previous multiplication inverted that meaning and made hard
       // slopes disappear fastest.
       const materialErodibility = mix(float(1), float(0.18), smoothstep(float(0.25), float(1.85), hardValue));
-      const volumetricErodibility = float(1).add(n3.mul(u.hardness3dAmp)).clamp(float(0.2), float(1.35));
+      const hardnessVariation = nBroad.mul(0.55).add(nMid.mul(0.3)).add(nFine.mul(0.15));
+      const volumetricErodibility = float(1).add(hardnessVariation.mul(u.hardness3dAmp))
+        .clamp(float(0.35), float(1.3));
       const hard = materialErodibility.mul(volumetricErodibility);
-      const CAP = float(0.0006).mul(u.simSpeed); // small per-step carve: flow outruns erosion
+      // Water must establish and transport before terrain visibly moves. A shared
+      // 0.0006 cap let five erosion ticks per second cut a deep trench in seconds.
+      // Keep incision deliberately slower than loose-sediment deposition; simSpeed
+      // can accelerate both for diagnostics without changing their relationship.
+      const ERODE_CAP = float(0.00022).mul(u.simSpeed);
+      const DEPOSIT_CAP = float(0.00045).mul(u.simSpeed);
       const erodeGate = speed.greaterThan(u.erodeSpeedMin).select(float(1), float(0))
         .mul(notSource).mul(establishedFlow);
       const dh = vec2(dbx, dby).mul(-1).add(vec2(1e-5, 1e-5));
@@ -513,14 +527,15 @@ function flatErosion(
       // Prefer coherent downhill channels and introduce broad deterministic
       // susceptibility variation. This breaks sheet erosion into pioneering streams
       // without injecting temporal noise or changing water mass.
-      const channelNoise = mx_fractal_noise_float(vec3(
-        ix.toFloat().div(float(w)).mul(7),
-        iy.toFloat().div(float(h)).mul(7),
-        bc.mul(2),
-      ), 3).mul(0.45).add(0.72).clamp(float(0.35), float(1.15));
+      const channelNoise = float(0.82).add(nMid.mul(0.22)).add(nFine.mul(0.08))
+        .clamp(float(0.5), float(1.12));
       const coherentFlow = smoothstep(float(0.15), float(0.85), align).mul(0.82).add(0.18);
+      // Ordinary bed incision is driven by shear along a bed. Near-vertical faces
+      // are waterfall/cliff processes and must not be uniformly shaved by the same
+      // rule; plunge-foot and weathering erosion can be modeled separately.
+      const bedIncision = float(1).sub(smoothstep(float(0.16), float(0.38), tilt));
       const erodeBase = max(float(0), capacity.sub(sc)).mul(u.dissolve).mul(softness)
-        .mul(hard).mul(erodeGate).mul(coherentFlow).mul(channelNoise);
+        .mul(hard).mul(erodeGate).mul(coherentFlow).mul(channelNoise).mul(bedIncision);
       const gentle = float(1).sub(smoothstep(float(0.05), float(0.18), tilt));
       const lateral = discharge.mul(float(1).sub(align)).mul(gentle).mul(u.lateralErosion).mul(softness).mul(hard).mul(erodeGate);
       // NO-SINK: never carve a cell below its LOWEST neighbor. A closed pit (lower
@@ -537,7 +552,7 @@ function flatErosion(
       const incisionDepth = max(float(0), bankMean.sub(bc));
       const incisionBrake = float(1).sub(smoothstep(float(0.008), float(0.035), incisionDepth));
       const erode = erodeBase.add(lateral.mul(incisionBrake))
-        .mul(depthSuppress).mul(incisionBrake).mul(u.simSpeed).min(CAP).min(noSink);
+        .mul(depthSuppress).mul(incisionBrake).mul(u.simSpeed).min(ERODE_CAP).min(noSink);
       // ANTI-DAM: never deposit enough to raise the bed above the local water
       // surface. Excess sediment stays suspended -> advects on to deeper water ->
       // spreads a submerged delta fan instead of instantly damming the channel.
@@ -559,12 +574,12 @@ function flatErosion(
       const dep = max(
         max(float(0), sc.sub(capCarry)).mul(u.deposit).mul(u.simSpeed).mul(depositZone),
         settling,
-      ).min(CAP).min(dc.mul(0.22)).mul(notSource);
+      ).min(DEPOSIT_CAP).min(dc.mul(0.22)).mul(notSource);
       bNew.assign(max(bc.sub(erode).add(dep), float(0)));
       looseNew.assign(max(lc.sub(erode), float(0)).add(dep));
       sNew.assign(max(float(0), sc.add(erode).sub(dep)).min(float(2)));
-      erodeViz.assign(max(erodeViz, erode.div(CAP)));
-      depositViz.assign(max(depositViz, dep.div(CAP)));
+      erodeViz.assign(max(erodeViz, erode.div(ERODE_CAP)));
+      depositViz.assign(max(depositViz, dep.div(DEPOSIT_CAP)));
     });
     textureStore(bOut, uvec2(x, y), vec4(bNew, 0, 0, 1)).toWriteOnly();
     textureStore(looseOut, uvec2(x, y), vec4(looseNew, 0, 0, 1)).toWriteOnly();
@@ -832,7 +847,12 @@ export class FlatSim {
       // before bC overwrites height.main; wEC then lands the compensated water depth.
       r.compute(n.settleN); r.compute(n.wEC);
       r.compute(n.bC); r.compute(n.loC); r.compute(n.sEC); r.compute(n.actC);
-      r.compute(n.thN); r.compute(n.bTC); r.compute(n.loTC);
+      r.compute(n.thN);
+      // Thermal slumping changes the bed after the hydraulic settle above. Preserve
+      // the free surface a second time or each slump becomes a fake pressure pulse
+      // that flickers depth/turbidity and can shove water upstream.
+      r.compute(n.settleN); r.compute(n.wEC);
+      r.compute(n.bTC); r.compute(n.loTC);
     }
   }
 }

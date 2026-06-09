@@ -164,7 +164,13 @@ export class FlatEngine {
     this.terrainMesh.receiveShadow = true;
     this.scene.add(this.terrainMesh);
 
-    const water = makeFlatWater(this.heightField.main, this.sim.water.main, this.sim.velocity.main, this.sim.sediment.main);
+    const water = makeFlatWater(
+      this.heightField.main,
+      this.sim.water.main,
+      this.sim.flux.main,
+      this.sim.velocity.main,
+      this.sim.sediment.main,
+    );
     this.waterMesh = buildFlatMesh(mW, mH, water);
     this.waterMesh.renderOrder = 1;
     this.scene.add(this.waterMesh);
