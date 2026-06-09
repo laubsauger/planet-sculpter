@@ -37,6 +37,9 @@ export const materialDebugGrid = uniform(0);
 // Height-contour line overlay (on by default — an elegant elevation read).
 export const contourOverlay = uniform(1);
 export const contourCount = uniform(44);
+// Caustics now live on the SEABED (terrain), not the water sheet, so they project on the
+// real surface and stay put from any angle. Toggle shared with the Water FX GUI group.
+export const causticsEnabled = uniform(1);
 
 export function makeFlatTerrain(
   heightTex: Texture,
@@ -160,9 +163,23 @@ export function makeFlatTerrain(
   const bedRipple = sin(p.x.mul(7.0).add(p.z.mul(2.6)).add(mx_noise_float(p.mul(1.8)).mul(2.0))).mul(0.5).add(0.5);
   const bedMottle = mx_noise_float(p.mul(2.6).add(vec3(5, 0, 5))).mul(0.5).add(0.5);
   const rippleFade = float(1).sub(smoothstep(0.03, 0.13, sub));
-  const seabedTex = seabed.mul(float(1).add(bedRipple.sub(0.5).mul(0.14).add(bedMottle.sub(0.5).mul(0.1)).mul(rippleFade)));
+  const seabedTex: any = seabed.mul(float(1).add(bedRipple.sub(0.5).mul(0.14).add(bedMottle.sub(0.5).mul(0.1)).mul(rippleFade)));
+  // Caustics projected onto the ACTUAL seabed surface (correct from every angle, unlike the
+  // old water-sheet hack). Thin dancing grid (both axes) in the clear shallows, fading out
+  // with depth where light can't reach.
+  const cWarp = mx_fractal_noise_float(vec3(p.x.mul(1.6), p.z.mul(1.6), time.mul(0.12)), 2);
+  const cpA = p.x.mul(12.4).add(p.z.mul(7.4)).add(time.mul(0.8)).add(cWarp.mul(2.6)).add(sin(p.z.mul(4.0).sub(time.mul(0.3))).mul(1.4));
+  const cpB = p.x.mul(-7.6).add(p.z.mul(13.8)).sub(time.mul(0.62)).sub(cWarp.mul(2.2)).add(sin(p.x.mul(3.6).add(time.mul(0.24))).mul(1.3));
+  const caustics = max(float(1).sub(smoothstep(0.015, 0.1, sin(cpA).abs())), float(1).sub(smoothstep(0.015, 0.1, sin(cpB).abs())));
+  const causticZone = smoothstep(0.001, 0.012, sub).mul(float(1).sub(smoothstep(0.05, 0.16, sub)));
+  // Broad, slowly DRIFTING noise mask so the caustic intensity isn't a uniform sheet at the
+  // same opacity everywhere — bright pools and dim patches move across the world like light
+  // filtering through a rippling surface.
+  const causticMask = mx_fractal_noise_float(vec3(p.x.mul(0.55), p.z.mul(0.55), time.mul(0.07)), 2).mul(0.5).add(0.5);
+  const causticGain = mix(float(0.15), float(1.0), smoothstep(0.25, 0.85, causticMask));
+  const litBed = seabedTex.add(vec3(0.32, 0.6, 0.55).mul(caustics).mul(causticZone).mul(causticsEnabled).mul(causticGain).mul(0.34));
   const underwater = smoothstep(0.001, 0.012, sub);
-  albedo = mix(albedo, seabedTex, underwater);
+  albedo = mix(albedo, litBed, underwater);
 
   // Unified PERFORMANT multi-scale detail. ONE fractal field (3 octaves) at a HIGH base
   // frequency — high enough to read as real surface texture given the large world stretch

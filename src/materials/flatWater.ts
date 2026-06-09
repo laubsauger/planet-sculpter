@@ -24,7 +24,7 @@ const SILT = vec3(0.27, 0.2, 0.11);
 export const flowBandStrength = uniform(0.24);
 export const flowBandScale = uniform(7.0);
 // Perf / A-B toggles for potentially heavy stylized effects (1 = on, 0 = off).
-export const causticsEnabled = uniform(1);
+// (causticsEnabled moved to flatTerrain — caustics now render on the seabed.)
 export const shoreFoamEnabled = uniform(1);
 export const oceanSwellEnabled = uniform(1);
 
@@ -113,8 +113,6 @@ export function makeFlatWater(
   const deepOcean = oceanMask.mul(smoothstep(0.015, 0.32, depthColor)).mul(still).mul(oceanSwellEnabled);
   const swellDir = normalize(vec2(0.82, 0.57));
   const swellPhase = dot(posXZ, swellDir).mul(1.05).sub(time.mul(0.5));
-  const chopPhase = dot(posXZ, vec2(swellDir.y.mul(-1), swellDir.x)).mul(2.3).add(time.mul(0.7));
-  const swellHeight = sin(swellPhase).add(sin(chopPhase).mul(0.4)).mul(0.5).add(0.5);
   // crest slope tilts the normal along the wave direction -> specular/fresnel travel.
   const swellSlope = cos(swellPhase).mul(1.05);
   const oceanSwellNormal = vec3(swellDir.x.mul(swellSlope), float(0), swellDir.y.mul(swellSlope))
@@ -132,36 +130,17 @@ export function makeFlatWater(
   // mid-turquoise while fresnel lit the distance -> looked inverted).
   let col: any = mix(SHALLOW, MID, smoothstep(0.008, 0.1, depthColor));
   col = mix(col, DEEP, smoothstep(0.06, 0.32, depthColor)); // tight enough that deep reads DARK
-  // Rolling crest/trough shading from the coherent swell breaks the homogeneous deep-blue
-  // sheet: crests catch sky light, troughs deepen. Stylized whitecaps fleck the steepest
-  // crests in open water. All gated to deepOcean so shallows/land water are untouched.
-  // Gentle crest/trough shading ONLY — no painted white crests (those read as big white
-  // discs walking across the water). Liveliness instead comes from the swell-tilted
-  // normal's travelling specular/fresnel below.
-  col = mix(col, DEEP.mul(0.72), smoothstep(0.5, 0.0, swellHeight).mul(0.18).mul(deepOcean));
-  col = mix(col, SKY_REFLECT, smoothstep(0.78, 1.0, swellHeight).mul(0.05).mul(deepOcean));
+  // Open-ocean shade: ORGANIC low-frequency drifting fractal noise, NOT crossing sines. Two
+  // pure sines interfered into a regular grid of oval blobs that looked awful at distance.
+  // Fractal noise gives irregular, gently moving light/dark patches; kept subtle so the deep
+  // ocean stays calm rather than homogeneous. Travelling specular glints still come from the
+  // swell-tilted normal below.
+  const swellShade = mx_fractal_noise_float(vec3(posXZ.mul(0.45), time.mul(0.035)), 3);
+  col = mix(col, DEEP.mul(0.85), smoothstep(0.1, -0.5, swellShade).mul(0.08).mul(deepOcean));
+  col = mix(col, SKY_REFLECT, smoothstep(0.2, 0.6, swellShade).mul(0.03).mul(deepOcean));
 
-  // Fake shallow-bottom caustics. These are deliberately a color modulation on
-  // the water sheet so they remain cheap and appear to dance over visible seabed.
-  // ~2x smaller cells (doubled frequencies, same reach), THINNER lines, and BOTH axes equal
-  // so the caustic network reads as a grid rather than one-directional streaks.
-  const causticWarp = mx_fractal_noise_float(
-    vec3(posXZ.mul(1.6), time.mul(0.12)), 2,
-  );
-  const causticPhaseA = posXZ.x.mul(12.4).add(posXZ.y.mul(7.4)).add(time.mul(0.8))
-    .add(causticWarp.mul(2.6))
-    .add(sin(posXZ.y.mul(4.0).sub(time.mul(0.3))).mul(1.4));
-  const causticPhaseB = posXZ.x.mul(-7.6).add(posXZ.y.mul(13.8)).sub(time.mul(0.62))
-    .sub(causticWarp.mul(2.2))
-    .add(sin(posXZ.x.mul(3.6).add(time.mul(0.24))).mul(1.3));
-  const causticA = float(1).sub(smoothstep(0.015, 0.1, sin(causticPhaseA).abs()));
-  const causticB = float(1).sub(smoothstep(0.015, 0.1, sin(causticPhaseB).abs()));
-  const caustics = max(causticA, causticB);
-  // SHARP depth + tight fade so caustics live only in the genuine shallows and disappear in
-  // deep water (a blurred/wide fade made them shimmer across the whole ocean). Bright + bold
-  // so the dancing light genuinely reads on the visible shallow seabed.
-  const shallowOcean = oceanMask.mul(float(1).sub(smoothstep(0.05, 0.18, depth)));
-  col = col.add(vec3(0.34, 0.66, 0.58).mul(caustics).mul(shallowOcean).mul(causticsEnabled).mul(0.22));
+  // (Caustics moved to the SEABED in flatTerrain — projected on the real surface, so they
+  // stay put from any angle instead of sliding around on the transparent water sheet.)
   const concentration = sediment.div(max(depth, float(0.003)));
   // WIDE, gentle ramps everywhere on the turbidity path. The previous tight thresholds,
   // modulated by the animated plume noise, sat right at their edge for marginal sediment

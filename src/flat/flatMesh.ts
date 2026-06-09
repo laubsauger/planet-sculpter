@@ -2,7 +2,7 @@
 // fully overridden by the material's positionNode (flatSurface), so the plane's
 // own size/orientation are irrelevant — only the uv grid + vertex count matter.
 
-import { Mesh, PlaneGeometry } from 'three';
+import { Mesh, PlaneGeometry, BufferGeometry, Float32BufferAttribute } from 'three';
 import type { Material } from 'three';
 
 export function buildFlatMesh(w: number, h: number, material: Material): Mesh {
@@ -21,5 +21,37 @@ export function buildFlatMesh(w: number, h: number, material: Material): Mesh {
   index.needsUpdate = true;
   const mesh = new Mesh(geo, material);
   mesh.frustumCulled = false;
+  return mesh;
+}
+
+/** Ocean skirt: a 4-quad FRAME around the grid hole [-size/2, size/2]², reaching out to
+ *  `extent` world units. Uses the SAME water material — its positionNode maps uv -> world XZ
+ *  and the texture samplers CLAMP, so uv beyond [0,1] reproduces the deep border ocean at the
+ *  sea surface. Gives a dynamic (swell/colour) ocean continuing seamlessly to the horizon,
+ *  with NO separate static plane and NO seabed occlusion. Material is DoubleSide so winding is
+ *  irrelevant; the surface normal is forced upward in flatSurface. */
+export function buildOceanSkirt(material: Material, size: number, extent: number): Mesh {
+  const half = size * 0.5;
+  const toUv = (c: number) => c / size + 0.5; // inverse of position = (uv-0.5)*size
+  const quads: number[][][] = [
+    [[-extent, extent], [extent, extent], [extent, half], [-extent, half]],   // north
+    [[-extent, -half], [extent, -half], [extent, -extent], [-extent, -extent]], // south
+    [[half, half], [extent, half], [extent, -half], [half, -half]],            // east
+    [[-extent, half], [-half, half], [-half, -half], [-extent, -half]],        // west
+  ];
+  const positions: number[] = [], uvs: number[] = [], indices: number[] = [];
+  let base = 0;
+  for (const q of quads) {
+    for (const [x, z] of q) { positions.push(x, 0, z); uvs.push(toUv(x), toUv(z)); }
+    indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    base += 4;
+  }
+  const geo = new BufferGeometry();
+  geo.setAttribute('position', new Float32BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  const mesh = new Mesh(geo, material);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = -1; // behind the full-res grid water
   return mesh;
 }

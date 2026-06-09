@@ -5,15 +5,15 @@
 import {
   Scene, PerspectiveCamera, DirectionalLight, HemisphereLight, AmbientLight, Color, Fog,
   Vector2, Vector3, Raycaster, Plane, Mesh, TimestampQuery, DataTexture, RedFormat, FloatType, Object3D,
-  Shape, Path, ShapeGeometry, MeshBasicMaterial, DoubleSide,
+  PlaneGeometry, MeshBasicMaterial, DoubleSide,
 } from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import GUI from 'lil-gui';
 import { OrbitController } from '../app/OrbitController';
 import { buildFlatSeed } from './flatSeed';
-import { buildFlatMesh } from './flatMesh';
-import { makeFlatTerrain, shoreWetEnabled, materialDebugGrid, contourOverlay, contourCount } from '../materials/flatTerrain';
-import { flowBandScale, flowBandStrength, makeFlatWater, causticsEnabled, shoreFoamEnabled, oceanSwellEnabled } from '../materials/flatWater';
+import { buildFlatMesh, buildOceanSkirt } from './flatMesh';
+import { makeFlatTerrain, shoreWetEnabled, materialDebugGrid, contourOverlay, contourCount, causticsEnabled } from '../materials/flatTerrain';
+import { flowBandScale, flowBandStrength, makeFlatWater, shoreFoamEnabled, oceanSwellEnabled } from '../materials/flatWater';
 import { makeFlatDebug, FLAT_DEBUG_MODES, flatDebugMode } from '../materials/flatDebug';
 import { FlatBrush } from './FlatBrush';
 import { FlatSim, FLAT_WATER_SOLVERS } from './flatSim';
@@ -118,33 +118,21 @@ export class FlatEngine {
   }
 
   private addOceanContinuation(): void {
-    // Seamless infinite ocean: a FRAME (huge quad with a grid-sized hole) at the true sea
-    // surface, ringing the sim grid. INSIDE the grid the simulated water + seabed render the
-    // ocean; the frame only fills the horizon BEYOND the grid, so it can never occlude the
-    // in-grid seabed — that occlusion (a fixed-Y plane under the whole grid cutting the
-    // sloped seabed) was the hard straight "deep ocean starts" blue line. Opaque deep-ocean
-    // colour matched to the simulated deep water; distance fog blends it to sky at the horizon.
-    const half = FLAT.worldSize * 0.5;
-    const inner = half - 0.25; // tuck just under the grid's edge water so there is no gap seam
-    const outer = FLAT.worldSize * 30; // effectively the horizon
-    const seaY = FLAT.seaLevel * FLAT.heightScale;
-    const shape = new Shape();
-    shape.moveTo(-outer, -outer);
-    shape.lineTo(outer, -outer);
-    shape.lineTo(outer, outer);
-    shape.lineTo(-outer, outer);
-    const hole = new Path();
-    hole.moveTo(-inner, -inner);
-    hole.lineTo(-inner, inner);
-    hole.lineTo(inner, inner);
-    hole.lineTo(inner, -inner);
-    shape.holes.push(hole);
-    const ocean = new Mesh(new ShapeGeometry(shape), new MeshBasicMaterial({ color: 0x1b5278, side: DoubleSide }));
-    ocean.rotation.x = -Math.PI / 2; // XY shape -> XZ ground plane, facing up
-    ocean.position.y = seaY;
-    ocean.renderOrder = -2;
-    ocean.frustumCulled = false;
-    this.scene.add(ocean);
+    // Dark ocean FLOOR far below the deepest seabed, spanning past the ocean skirt. The
+    // transparent deep skirt water reveals it (so the open ocean reads dark, not sky), while
+    // INSIDE the grid the opaque terrain seabed always occludes it. Because it sits well below
+    // every seabed cell it can never produce the old fixed-contour "hard blue line".
+    const span = FLAT.worldSize * 12;
+    const floorY = -FLAT.worldSize * 0.2; // safely beneath all seabed
+    const floor = new Mesh(
+      new PlaneGeometry(span, span),
+      new MeshBasicMaterial({ color: 0x123047, side: DoubleSide }),
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = floorY;
+    floor.renderOrder = -3;
+    floor.frustumCulled = false;
+    this.scene.add(floor);
   }
 
   async init(): Promise<void> {
@@ -206,6 +194,10 @@ export class FlatEngine {
     this.waterMesh = buildFlatMesh(mW, mH, water);
     this.waterMesh.renderOrder = 1;
     this.scene.add(this.waterMesh);
+    // Same water material, extended to the horizon as a frame around the grid -> seamless
+    // dynamic ocean (swell/colour) continuing past the sim, no static plane, no seam.
+    const skirt = buildOceanSkirt(water, FLAT.worldSize, FLAT.worldSize * 4);
+    this.scene.add(skirt);
 
     this.buildGui();
     this.sidebar = new Sidebar({
