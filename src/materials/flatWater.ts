@@ -156,9 +156,10 @@ export function makeFlatWater(
   const causticB = float(1).sub(smoothstep(0.04, 0.22, sin(causticPhaseB).abs()));
   const caustics = max(causticA, causticB.mul(0.75));
   // SHARP depth + tight fade so caustics live only in the genuine shallows and disappear in
-  // deep water (a blurred/wide fade made them shimmer across the whole ocean).
-  const shallowOcean = oceanMask.mul(float(1).sub(smoothstep(0.04, 0.16, depth)));
-  col = col.add(vec3(0.22, 0.48, 0.42).mul(caustics).mul(shallowOcean).mul(causticsEnabled).mul(0.09));
+  // deep water (a blurred/wide fade made them shimmer across the whole ocean). Bright + bold
+  // so the dancing light genuinely reads on the visible shallow seabed.
+  const shallowOcean = oceanMask.mul(float(1).sub(smoothstep(0.05, 0.18, depth)));
+  col = col.add(vec3(0.34, 0.66, 0.58).mul(caustics).mul(shallowOcean).mul(causticsEnabled).mul(0.22));
   const concentration = sediment.div(max(depth, float(0.003)));
   // WIDE, gentle ramps everywhere on the turbidity path. The previous tight thresholds,
   // modulated by the animated plume noise, sat right at their edge for marginal sediment
@@ -266,7 +267,7 @@ export function makeFlatWater(
   // SEABED shows through and supplies the deep-blue (no opaque plane under the grid anymore
   // — the ocean continuation is now a frame around the grid, so deep water just reveals the
   // dark seabed). depthColor (blurred) keeps the shallow->deep ramp smooth across the shelf.
-  const oceanOpacity = smoothstep(0.004, 0.34, depthColor).mul(0.46).add(0.28);
+  const oceanOpacity = smoothstep(0.004, 0.2, depthColor).mul(0.6).add(0.27);
   // foam (shoreline + rapids) stays opaque even over transparent shallows so it reads.
   // Gate EVERYTHING by water presence so dry land is fully transparent (no phantom
   // water/foam painted over terrain).

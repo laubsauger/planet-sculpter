@@ -239,7 +239,7 @@ export class FlatEngine {
     t.add(detailStrength, 'value', 0, 1.5, 0.02).name('detail strength');
     t.add(detailFreq, 'value', 1, 24, 0.5).name('detail freq');
     t.add({ matGrid: false }, 'matGrid').name('material debug grid').onChange((v: boolean) => { materialDebugGrid.value = v ? 1 : 0; });
-    t.add({ contours: false }, 'contours').name('contour lines').onChange((v: boolean) => { contourOverlay.value = v ? 1 : 0; });
+    t.add({ contours: true }, 'contours').name('contour lines').onChange((v: boolean) => { contourOverlay.value = v ? 1 : 0; });
     t.add(contourCount, 'value', 8, 120, 1).name('contour count');
     const wf = gui.addFolder('Water');
     wf.add(this.water, 'rainOn').name('rain [r]');
