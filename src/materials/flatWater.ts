@@ -15,12 +15,12 @@ import { sunDirUniform, sunIntensityU } from '../tsl/lighting';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-const SHALLOW = vec3(0.18, 0.82, 0.76);
-const MID = vec3(0.035, 0.5, 0.66);
-const DEEP = vec3(0.02, 0.15, 0.34);
+const SHALLOW = vec3(0.1, 0.65, 0.64);
+const MID = vec3(0.025, 0.4, 0.58);
+const DEEP = vec3(0.015, 0.12, 0.3);
 const SKY_REFLECT = vec3(0.6, 0.78, 0.95);
 const FOAM = vec3(0.95, 0.98, 1.0);
-const SILT = vec3(0.31, 0.19, 0.085);
+const SILT = vec3(0.27, 0.2, 0.11);
 export const flowBandStrength = uniform(0.18);
 export const flowBandScale = uniform(10.0);
 
@@ -40,7 +40,24 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   const sediment = bilinear((c: any) => textureLoad(sedimentTex, c).x, fx, fy);
   const flow = vec2(vel.x, vel.y);
   const speed = length(flow);
-  const flowDir = normalize(flow.add(vec2(1e-5, 0)));
+  const surfaceAt = (x: any, y: any) => bicubicClamped(
+    (c: any) => textureLoad(heightTex, c).x.add(textureLoad(waterTex, c).x),
+    x, y,
+  );
+  const surfaceL = surfaceAt(fx.sub(2), fy), surfaceR = surfaceAt(fx.add(2), fy);
+  const surfaceB = surfaceAt(fx, fy.sub(2)), surfaceT = surfaceAt(fx, fy.add(2));
+  const downhill = vec2(surfaceL.sub(surfaceR), surfaceB.sub(surfaceT));
+  const downhillDir = normalize(downhill.add(vec2(1e-5, 0)));
+  const rawFlowDir = normalize(flow.add(vec2(1e-5, 0)));
+  // Pipe inertia can locally point into an obstacle or uphill at confluences.
+  // Correct it only where a meaningful free-surface gradient exists; on flats,
+  // retain measured pipe flow instead of normalizing noise into a fixed direction.
+  const downhillStrength = smoothstep(0.0005, 0.012, length(downhill));
+  const downhillAgreement = smoothstep(0.0, 0.35, dot(rawFlowDir, downhillDir));
+  const uphillCorrection = downhillStrength.mul(float(1).sub(downhillAgreement));
+  const flowDir = normalize(mix(rawFlowDir, downhillDir, uphillCorrection));
+  const visualFlow = flowDir.mul(speed);
+  const directionConfidence = max(downhillStrength, downhillAgreement);
 
   // calm wave + flow normals (subtle ripple, not noise soup).
   const posXZ = vec2(s.position.x, s.position.z);
@@ -52,9 +69,9 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   // Flow ripples: noise advected ALONG the local flow -> rivers ripple downstream,
   // each follows its own direction (not a shared global wave).
   const shallowFlow = float(1).sub(smoothstep(0.025, 0.08, depth));
-  const flowR = grad(posXZ.sub(flow.mul(time.mul(0.3))), 3.0)
-    .mul(speed.min(float(1.2)).mul(0.22).add(0.02))
-    .mul(shallowFlow);
+  const flowR = grad(posXZ.sub(visualFlow.mul(time.mul(0.22))), 1.5)
+    .mul(speed.min(float(1.2)).mul(0.08).add(0.008))
+    .mul(shallowFlow).mul(directionConfidence);
   // Ambient swell belongs to the OPEN OCEAN ONLY (bedrock below sea level). All water
   // on land — rivers, rain runoff, puddles — must read by its OWN flow (flowR), never
   // share one global wave. Gate the swell by an ocean-basin mask so it can't bleed onto
@@ -72,28 +89,30 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
   let col: any = mix(SHALLOW, MID, smoothstep(0.01, 0.09, depth));
   col = mix(col, DEEP, smoothstep(0.09, 0.32, depth));
   const concentration = sediment.div(max(depth, float(0.003)));
-  const turbidity = smoothstep(0.012, 0.22, concentration);
-  col = mix(col, SILT, turbidity.mul(0.92));
+  const sedimentLoad = smoothstep(0.012, 0.22, concentration);
+  const plumeNoise = mx_fractal_noise_float(
+    vec3(posXZ.sub(visualFlow.mul(time.mul(0.12))).mul(2.4), time.mul(0.035)), 3,
+  ).mul(0.5).add(0.5);
+  // Suspended sediment forms warm plumes within still-readable blue-green water,
+  // rather than replacing the entire surface with a flat brown sheet.
+  const turbidity = smoothstep(0.18, 0.72, sedimentLoad.mul(plumeNoise.mul(0.75).add(0.4)));
+  col = mix(col, SILT, turbidity.mul(0.66));
 
-  // Broad flow-aligned bands remain readable from overhead and in flat light.
-  // Variation is mostly across the flow, with a moving along-flow breakup.
+  // Long, narrow streaks run ALONG the validated downhill flow and their phase
+  // travels downstream. Avoid transverse contour bands: those read as uphill
+  // waves even when the velocity vector itself is correct.
   const acrossDir = vec2(flowDir.y.mul(-1), flowDir.x);
   const along = dot(posXZ, flowDir);
   const across = dot(posXZ, acrossDir);
-  const travel = time.mul(speed.mul(2.4).add(0.8));
-  // bend/breakup carry the DOWNSTREAM motion (phase moves with +along). The bands
-  // themselves (spacing, across-flow axis) must NOT carry a global -travel or they
-  // slide sideways/against the flow. Lower spatial freqs -> readable when zoomed out
-  // (no moiré), still clearly flow-aligned.
-  const bend = sin(along.mul(1.3).sub(travel.mul(0.55))).mul(1.35)
-    .add(sin(along.mul(3.2).add(across.mul(0.6)).sub(travel.mul(0.2))).mul(0.42));
-  const spacing = across.mul(flowBandScale).add(sin(along.mul(0.5)).mul(1.8));
-  const ridges = sin(spacing.add(bend)).mul(0.5).add(0.5);
-  const breakup = sin(along.mul(5).sub(travel.mul(2.2))).mul(0.5).add(0.5);
-  const streak = smoothstep(0.64, 0.94, ridges).mul(breakup.mul(0.45).add(0.55));
+  const travel = time.mul(speed.mul(1.7).add(0.25));
+  const laneWarp = sin(along.mul(1.15).sub(travel.mul(0.35))).mul(0.55);
+  const lanes = sin(across.mul(flowBandScale).add(laneWarp)).mul(0.5).add(0.5);
+  const movingSegments = sin(along.mul(3.4).sub(travel.mul(2.0))
+    .add(sin(across.mul(1.8)).mul(0.5))).mul(0.5).add(0.5);
+  const streak = smoothstep(0.74, 0.96, lanes).mul(smoothstep(0.35, 0.78, movingSegments));
   const movingWater = smoothstep(0.015, 0.55, speed);
   const riverMask = float(1).sub(oceanMask);
-  const streakStrength = streak.mul(movingWater).mul(riverMask)
+  const streakStrength = streak.mul(movingWater).mul(directionConfidence).mul(riverMask)
     .mul(smoothstep(0.00006, 0.05, depth))
     .mul(float(1).sub(smoothstep(0.04, 0.2, depth)));
   col = mix(col, FOAM, streakStrength.mul(flowBandStrength));
@@ -144,16 +163,17 @@ export function makeFlatWater(heightTex: Texture, waterTex: Texture, velTex: Tex
     depthOpacity.mul(channelOrPool).mul(mix(float(1), float(0.12), steepRunoff)),
     flowOpacity.mul(channelOrPool),
   );
-  const muddyOpacity = turbidity.mul(smoothstep(0.0005, 0.018, depth)).mul(0.72);
+  const waterBodyOpacity = smoothstep(0.0005, 0.018, depth).mul(0.22);
+  const muddyOpacity = turbidity.mul(smoothstep(0.0005, 0.018, depth)).mul(0.82);
   // OCEAN: clear shallows reveal the sandy seabed, ramping to opaque deep blue (the
   // From-Dust look) instead of a flat turquoise sheet.
-  const oceanOpacity = smoothstep(0.004, 0.22, depth).mul(0.9).add(0.05);
+  const oceanOpacity = smoothstep(0.004, 0.22, depth).mul(0.9).add(0.08);
   // foam (shoreline + rapids) stays opaque even over transparent shallows so it reads.
   // Gate EVERYTHING by water presence so dry land is fully transparent (no phantom
   // water/foam painted over terrain).
   const hasWater = smoothstep(0.00015, 0.001, depth);
   const opacity = clamp(
-    max(max(mix(landOpacity, oceanOpacity, oceanMask), muddyOpacity), foamAmt.mul(0.85)).mul(hasWater),
+    max(max(max(mix(landOpacity, oceanOpacity, oceanMask), waterBodyOpacity), muddyOpacity), foamAmt.mul(0.85)).mul(hasWater),
     float(0), float(0.97),
   );
 

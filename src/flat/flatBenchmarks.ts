@@ -76,12 +76,15 @@ export function buildFlatBenchmark(name: Exclude<FlatBenchmark, 'default'>, w: n
         const center = 0.5 + Math.sin(v * Math.PI * 3.2) * 0.055 + Math.sin(v * Math.PI * 7.1) * 0.014;
         const channel = Math.exp(-((u - center) * (u - center)) / (0.032 * 0.032));
         const floodplain = Math.exp(-((u - center) * (u - center)) / (0.11 * 0.11));
-        // steeper upper grade, then a SMOOTH coastal ramp into the ocean basin (not a
-        // cliff) so a delta can build out on a gentle underwater slope and be visible.
+        // Steeper upper grade, then a broad shallow shelf for mouth flow and delta
+        // growth. Only the final offshore strip drops into the deep basin.
         const land = 0.68 - v * 0.46 - channel * 0.04 - floodplain * 0.012;
+        const shelf = 0.215;
         const basin = 0.16;
-        const toOcean = smoothstep(0.7, 0.95, v);
-        height[k] = Math.max(0.12, land * (1 - toOcean) + basin * toOcean);
+        const toShelf = smoothstep(0.7, 0.94, v);
+        const toBasin = smoothstep(0.96, 1, v);
+        const coast = land * (1 - toShelf) + shelf * toShelf;
+        height[k] = Math.max(0.12, coast * (1 - toBasin) + basin * toBasin);
         // source sits well below the sealed top edge — against the wall it just pools
         // upslope into the corner and evaporates instead of running downhill.
         const srcV = 0.22;
@@ -93,7 +96,12 @@ export function buildFlatBenchmark(name: Exclude<FlatBenchmark, 'default'>, w: n
         // Warm-start the visual/routing benchmark with a shallow connected river.
         // Spring-only routing from a dry bed remains a separate solver acceptance case.
         if (v >= srcV && v <= 0.84) water[k] = channel * 0.012;
-        if (name === 'delta') sediment[k] = normalizedGaussian(u, v, sourceX, 0.15, 0.04, w, h, 35);
+        if (name === 'delta') {
+          const sedimentV = srcV + 0.04;
+          const sedimentX = 0.5 + Math.sin(sedimentV * Math.PI * 3.2) * 0.055
+            + Math.sin(sedimentV * Math.PI * 7.1) * 0.014;
+          sediment[k] = normalizedGaussian(u, v, sedimentX, sedimentV, 0.025, w, h, 35);
+        }
       } else if (name === 'damBreak') {
         const ridge = gaussian(u, v, 0.5, 0.52, 0.035);
         height[k] = 0.28 + (0.72 - v) * 0.12 + ridge * 0.28;

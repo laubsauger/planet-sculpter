@@ -3,8 +3,8 @@
 // river springs, rain, realistic water with flow normals.
 
 import {
-  Scene, PerspectiveCamera, DirectionalLight, HemisphereLight, Color, Fog,
-  Vector2, Vector3, Raycaster, Plane, Mesh, TimestampQuery, DataTexture, RedFormat, FloatType,
+  Scene, PerspectiveCamera, DirectionalLight, HemisphereLight, AmbientLight, Color, Fog,
+  Vector2, Vector3, Raycaster, Plane, Mesh, TimestampQuery, DataTexture, RedFormat, FloatType, Object3D,
 } from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import GUI from 'lil-gui';
@@ -43,7 +43,10 @@ export class FlatEngine {
   private defaultState!: FlatBenchmarkData;
   private sidebar!: Sidebar;
   private sun!: DirectionalLight;
+  private sunTarget!: Object3D;
+  private fill!: DirectionalLight;
   private sky!: HemisphereLight;
+  private ambient!: AmbientLight;
   private hud: HTMLElement | null;
   private fpsEma = RENDER.targetFps;
   private lastTime = 0;
@@ -71,7 +74,7 @@ export class FlatEngine {
   private riverMode = false;
   private readonly brushSettings = { mode: 'raise' as BrushMode, radius: 0.06, strength: 0.02, rate: 0.4, target: 0.4 };
   private readonly water = { rainOn: false, rainRate: SIM.rainRate };
-  private readonly river = { rate: 1.2, radius: 0.009 };
+  private readonly river = { rate: 0.5, radius: 0.009 };
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -86,6 +89,9 @@ export class FlatEngine {
 
     this.sun = new DirectionalLight(0xfff4e2, 3.0);
     this.sun.position.set(6, 9, 4);
+    this.sunTarget = new Object3D();
+    this.sunTarget.position.set(0, 0, 0);
+    this.sun.target = this.sunTarget;
     this.sun.castShadow = true;
     this.sun.shadow.mapSize.set(2048, 2048);
     const shadowExtent = FLAT.worldSize * 0.7;
@@ -97,8 +103,11 @@ export class FlatEngine {
     this.sun.shadow.camera.far = FLAT.worldSize * 4;
     this.sun.shadow.bias = -0.0004;
     this.sun.shadow.normalBias = 0.02;
-    this.sky = new HemisphereLight(0xcce6ff, 0x8b7654, 0.82);
-    this.scene.add(this.sun, this.sky);
+    this.fill = new DirectionalLight(0x8faac7, 0.55);
+    this.fill.position.set(-5, 4, -3);
+    this.sky = new HemisphereLight(0xcce6ff, 0x8b7654, 1.05);
+    this.ambient = new AmbientLight(0xdbe7ed, 0.38);
+    this.scene.add(this.sun, this.sunTarget, this.fill, this.sky, this.ambient);
     // world-space lighting uniforms for the unlit terrain (camera-independent).
     sunDirUniform.value.copy(this.sun.position).normalize();
     sunIntensityU.value = 2.8;

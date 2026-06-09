@@ -6,6 +6,7 @@
 import {
   DataTexture, RedFormat, FloatType, LinearFilter, ClampToEdgeWrapping,
 } from 'three';
+import { FLAT } from '../config';
 
 export interface FlatTexture {
   texture: DataTexture;
@@ -76,13 +77,16 @@ export function buildFlatSeed(w: number, h: number) {
       // distance to the NEAREST edge so a uniform ocean ring wraps all four sides.
       // Organic coastline: warp the edge-distance with noise (broad bays/capes + finer
       // wiggle) so the shore meanders and corners round off instead of a straight square.
-      // Wider band so coastal mountains slope into the sea rather than forming a wall.
-      const rawEdge = Math.min(u, 1 - u, v, 1 - v); // 0 at border .. 0.5 centre
+      const edgeX = Math.min(u, 1 - u);
+      const edgeY = Math.min(v, 1 - v);
+      // Rounded-rectangle distance: exactly zero on every world edge, but unlike
+      // min(edgeX, edgeY) it has no diagonal derivative seam through the corners.
+      const rawEdge = Math.SQRT2 * edgeX * edgeY
+        / Math.sqrt(edgeX * edgeX + edgeY * edgeY + 1e-9);
       const coastWarp = (fbm(u * 0.9 + 5, v * 0.9 + 9, 3) - 0.5) * 0.16
         + (fbm(u * 2.6 + 41, v * 2.6 + 17, 4) - 0.5) * 0.1;
-      // outer hard cutoff guarantees the true world edge is always ocean even if the
-      // warp pushes a cape outward; the warped band shapes the coastline inside that.
-      const frame = smooth(0.03, 0.24, rawEdge + coastWarp) * smooth(0.0, 0.03, rawEdge);
+      const coast = rawEdge + coastWarp;
+      const frame = smooth(0.025, 0.315, coast) * smooth(0.0, 0.03, rawEdge);
       // domain warp -> organic, non-radial shapes.
       const wu = u + fbm(u * 1.5 + 1.3, v * 1.5 + 4.7, 3) * 0.3;
       const wv = v + fbm(u * 1.5 + 7.1, v * 1.5 + 2.2, 3) * 0.3;
@@ -93,21 +97,31 @@ export function buildFlatSeed(w: number, h: number) {
       // MOUNTAIN RANGES: ridged, cubed = sharp steep peaks, gated to mtn regions.
       const rg = fbm(wu * 3.2 + 11, wv * 3.2 + 7, 6, true);
       const region = ex(fbm(wu * 1.2 + 3, wv * 1.2 + 8, 3), 2.2);
-      // squared (not cubed) + lower amp -> broader rolling ranges instead of a few
-      // spiky peaks dominating; leaves more midland between valley and summit.
-      const mtn = rg * rg * 0.62 * region;
-      // base land 0.4 (above sea 0.3) + continental variation + mountains.
-      let e = (0.4 + (cont - 0.5) * 0.6 + mtn) * island;
+      // Fade mountain-scale relief before the existing organic shoreline. This keeps
+      // the old island silhouette while making more coastal lowland and fewer cliffs.
+      const coastalRelief = smooth(0.17, 0.32, coast);
+      const mtn = rg * rg * 0.56 * region * coastalRelief;
+      let e = (0.4 + (cont - 0.5) * (0.46 + coastalRelief * 0.1) + mtn) * island;
+      const coastalLowland = (0.36 + (cont - 0.5) * 0.14) * island;
+      e = coastalLowland + (e - coastalLowland) * coastalRelief;
       // PLATEAUS: terrace some midland patches (mesas/tablelands).
       const plat = fbm(wu * 2.4 + 20, wv * 2.4 + 30, 3);
       const terr = Math.round(e * 5) / 5;
-      e += (terr - e) * smooth(0.65, 0.85, plat) * 0.4;
-      e *= frame; // force sub-sea-level along the world edges -> ocean ring
+      e += (terr - e) * smooth(0.65, 0.85, plat) * 0.32 * coastalRelief;
+      e *= frame;
+      // Preserve the organic sea-level contour, but compress elevations around it
+      // so the same coastline has real horizontal beach space and a shallow shelf.
+      // Inland mountains and the deep ocean remain unchanged.
+      const seaDelta = e - FLAT.seaLevel;
+      const coastFlatten = smooth(0.018, 0.16, Math.abs(seaDelta));
+      e = FLAT.seaLevel + seaDelta * (0.38 + coastFlatten * 0.62);
       height[j * w + i] = Math.min(1, Math.max(0, e));
       const mst = (fbm(u * 2.3 + 31, v * 2.3 + 19, 5) - 0.5) * 2.2 + 0.5;
       moisture[j * w + i] = Math.min(1, Math.max(0, mst));
-      hardness[j * w + i] = 0.25 + fbm(u * 3.0 + 51, v * 3.0 + 67, 5) * 1.6;
-      loose[j * w + i] = fbm(u * 6 + 3, v * 6 + 91, 4) * 0.022;
+      const beachBand = 1 - smooth(0.018, 0.085, Math.abs(e - FLAT.seaLevel));
+      hardness[j * w + i] = (0.25 + fbm(u * 3.0 + 51, v * 3.0 + 67, 5) * 1.6)
+        * (1 - beachBand * 0.3);
+      loose[j * w + i] = fbm(u * 6 + 3, v * 6 + 91, 4) * 0.022 + beachBand * 0.012;
     }
   }
   return {

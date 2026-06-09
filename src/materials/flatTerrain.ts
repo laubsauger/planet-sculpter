@@ -3,8 +3,8 @@
 // flatSurface. Material blend: sand/grass/rock/snow by height, slope, moisture,
 // hardness, with a coastal sand band. Sediment (loose) shades toward sand.
 
-import { DoubleSide, type Texture } from 'three';
-import { MeshStandardNodeMaterial } from 'three/webgpu';
+import { FrontSide, type Texture } from 'three';
+import { MeshPhysicalNodeMaterial } from 'three/webgpu';
 import { textureLoad, uv, mix, smoothstep, max, float, vec3 } from 'three/tsl';
 import { flatSurface, bilinear, flatSeaLevel, flatGridX, flatGridY } from '../tsl/flatSurface';
 
@@ -30,7 +30,7 @@ export function makeFlatTerrain(
   waterTex: Texture,
   sedimentTex: Texture,
   activityTex: Texture,
-): MeshStandardNodeMaterial {
+): MeshPhysicalNodeMaterial {
   const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
   const bl = (t: Texture) => bilinear((c: any) => textureLoad(t, c).x, fx, fy);
   const blVec = (t: Texture) => bilinear((c: any) => textureLoad(t, c), fx, fy);
@@ -77,7 +77,12 @@ export function makeFlatTerrain(
   albedo = mix(albedo, SAND, smoothstep(0.035, 0.0, above.abs()).mul(0.7));
   albedo = albedo.mul(mix(float(1), float(0.55), smoothstep(0.0, -0.06, above)));
 
-  const mat = new MeshStandardNodeMaterial({ side: DoubleSide, roughness: 0.93, metalness: 0 });
+  const mat = new MeshPhysicalNodeMaterial({
+    side: FrontSide,
+    roughness: 0.98,
+    metalness: 0,
+    specularIntensity: 0.12,
+  });
   mat.positionNode = s.position;
   mat.normalNode = s.viewNormal;
   mat.colorNode = albedo;

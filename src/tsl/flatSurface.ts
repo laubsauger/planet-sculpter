@@ -6,7 +6,7 @@
 
 import {
   uv, ivec2, float, vec3, normalize, cross, mix, sign, textureLoad, uniform,
-  modelViewMatrix, mx_fractal_noise_float, varying,
+  cameraViewMatrix, mx_fractal_noise_float, varying,
 } from 'three/tsl';
 import type { Texture } from 'three';
 import { FLAT } from '../config';
@@ -121,7 +121,11 @@ export function flatSurface(sampleHeight: (coord: any) => any, detail = true, cl
   return {
     position: p,
     worldNormal: nObj,
-    viewNormal: nObj.transformDirection(modelViewMatrix),
+    // `p` and its derived normal are already in world coordinates. PBR's
+    // `normalNode` contract is view space, so apply only world -> view here.
+    // Using modelViewMatrix treated this world normal as object-local and made
+    // the diffuse response change under camera rotation.
+    viewNormal: nObj.transformDirection(cameraViewMatrix),
     height: hAt(u, v),
     slope: float(1).sub(nObj.y.clamp(0, 1)),
   };

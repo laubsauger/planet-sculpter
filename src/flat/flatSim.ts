@@ -117,11 +117,15 @@ function flatUpdate(d: StorageTexture, f: StorageTexture, b: StorageTexture, sou
       const hs = surfaceAt(sx, sy);
       const sourceHere = sourceAt(sx, sy);
       const drop = (nx: any, ny: any) => {
-        const downhill = max(float(0.0002), hs.sub(surfaceAt(nx, ny)).add(float(0.001)));
+        // A spring on a slope should choose the lowest outlet immediately rather
+        // than inflate a symmetric source pond. Retain only a tiny flat-ground
+        // pressure path so a source can still escape a genuinely level cell.
+        const downhill = max(float(0.00002), hs.sub(surfaceAt(nx, ny)).add(float(0.00015)));
+        const downhillBias = downhill.mul(downhill.add(float(0.0008)));
         // Prefer moving down the radial source gradient, out of the emitter
         // footprint. A small baseline preserves routing on a flat source plateau.
         const outward = max(float(0), sourceHere.sub(sourceAt(nx, ny))).mul(120).add(float(0.08));
-        return downhill.mul(outward);
+        return downhillBias.mul(outward);
       };
       const l = drop(sx.sub(1), sy), r = drop(sx.add(1), sy);
       const t = drop(sx, sy.add(1)), bot = drop(sx, sy.sub(1));
@@ -157,12 +161,16 @@ function flatUpdate(d: StorageTexture, f: StorageTexture, b: StorageTexture, sou
     const deepKeep = smoothstep(evapShallowRef, evapDeepRef, next).mul(evapDeepReduce);
     const keep = max(flowKeep, deepKeep).min(float(0.97));
     next = next.mul(max(float(0), float(1).sub(p.evapProp.mul(float(1).sub(keep)).mul(p.dt))));
-    // sea fill: ocean (below sea level) must hold AT LEAST sea level (flat sea), but
-    // do NOT pin it down — that instantly swallowed incoming river water+sediment.
-    // Letting it rise lets a river plume spread across the surface (and carry its
-    // sediment out) before the pipe flow + evap level it back to the sea. -> deltas.
+    // The ocean is an effectively infinite reservoir. Keep its datum at sea level
+    // and relax excess river water once it reaches deeper offshore cells. Without
+    // this outlet the sealed map's entire ocean slowly rises, creating artificial
+    // backwater at every mouth and eventually stopping otherwise healthy rivers.
+    // Sediment is not removed here; it remains available to settle and build deltas.
     const need = bc.mul(-1).add(flatSeaLevel).max(float(0));
     next = next.max(need);
+    const offshore = float(1).sub(smoothstep(flatSeaLevel.sub(0.07), flatSeaLevel.sub(0.015), bc));
+    const oceanRelax = smoothstep(float(0), float(0.9), p.dt.mul(8)).mul(offshore);
+    next = mix(next, need, oceanRelax);
     textureStore(dOut, uvec2(x, y), vec4(max(next, float(0)), 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
@@ -376,6 +384,7 @@ function flatErosion(
   s: StorageTexture,
   vel: StorageTexture,
   d: StorageTexture,
+  flux: StorageTexture,
   hardness: StorageTexture,
   source: StorageTexture,
   activity: StorageTexture,
@@ -419,12 +428,35 @@ function flatErosion(
       const discharge = erodeDepth.mul(speed);
       const conc = mix(float(1), smoothstep(float(0), u.channelDischarge, discharge), u.channelFocus);
       const hasWater = dc.greaterThan(float(0.0012)).select(float(1), float(0));
+      const fAt = (cx: any, cy: any) => textureLoad(flux, ivec2(cX(cx, w), cY(cy, h)));
+      const selfFlux = fAt(ix, iy);
+      const outflow = selfFlux.x.add(selfFlux.y).add(selfFlux.z).add(selfFlux.w);
+      const inflow = fAt(ix.sub(1), iy).y
+        .add(fAt(ix.add(1), iy).x)
+        .add(fAt(ix, iy.add(1)).w)
+        .add(fAt(ix, iy.sub(1)).z);
+      const throughFlow = min(inflow, outflow);
+      // A newly wetted front can report high velocity while having no downstream
+      // receiver yet. Eroding there digs a bowl before the river has had a chance
+      // to advance. Require actual water passing through the cell and into already
+      // wet terrain before allowing it to carve.
+      const dAt = (cx: any, cy: any) => textureLoad(d, ivec2(cX(cx, w), cY(cy, h))).x;
+      const downstreamWet = selfFlux.x.mul(dAt(ix.sub(1), iy))
+        .add(selfFlux.y.mul(dAt(ix.add(1), iy)))
+        .add(selfFlux.z.mul(dAt(ix, iy.add(1))))
+        .add(selfFlux.w.mul(dAt(ix, iy.sub(1))))
+        .div(max(outflow, float(EPS)));
+      const establishedFlow = smoothstep(float(0.00015), float(0.0025), throughFlow)
+        .mul(smoothstep(float(0.0005), float(0.004), downstreamWet));
       // DECOUPLED capacities (hysteresis). Erosion uses the slope-based capacity so
       // fast FLATS don't get carved (no source moat / mid-slope gouging). Deposition
       // uses a HIGHER transport capacity (flow keeps sediment alive on flats) so the
       // river carries its load further and deposits gradually instead of dumping a
       // plateau the instant the slope eases. Between the two -> sediment just rides.
-      const capacity = u.sedimentCapacity.mul(sinTilt).mul(speed).mul(hasWater).mul(conc);
+      // Incision must use the REAL slope. Clamping it to minSlope let a broad,
+      // slow-moving wet front excavate flat ground row by row at every grade break.
+      // minSlope remains useful below for transport, so sediment can cross flats.
+      const capacity = u.sedimentCapacity.mul(tilt).mul(speed).mul(hasWater).mul(conc);
       const transport = max(sinTilt, speed.mul(u.flowTransport));
       const capCarry = u.sedimentCapacity.mul(transport).mul(speed).mul(hasWater).mul(conc);
       // The actual spring footprint is infrastructure, not erodible terrain. Protect
@@ -445,13 +477,30 @@ function flatErosion(
       // per-cell spike lattice). bc weighted up so it varies with depth too.
       const p3 = vec3(ix.toFloat().div(float(w)), bc.mul(3), iy.toFloat().div(float(h)));
       const n3 = mx_fractal_noise_float(p3.mul(u.hardness3dFreq), 3);
-      const hard = textureLoad(hardness, ivec2(ix, iy)).x.mul(float(1).add(n3.mul(u.hardness3dAmp)).max(float(0.05)));
+      const hardValue = textureLoad(hardness, ivec2(ix, iy)).x;
+      // The seed texture stores HARDNESS, not erodibility. High values must resist
+      // erosion. The previous multiplication inverted that meaning and made hard
+      // slopes disappear fastest.
+      const materialErodibility = mix(float(1), float(0.18), smoothstep(float(0.25), float(1.85), hardValue));
+      const volumetricErodibility = float(1).add(n3.mul(u.hardness3dAmp)).clamp(float(0.2), float(1.35));
+      const hard = materialErodibility.mul(volumetricErodibility);
       const CAP = float(0.0006).mul(u.simSpeed); // small per-step carve: flow outruns erosion
-      const erodeGate = speed.greaterThan(u.erodeSpeedMin).select(float(1), float(0)).mul(notSource);
-      const erodeBase = max(float(0), capacity.sub(sc)).mul(u.dissolve).mul(softness).mul(hard).mul(erodeGate);
+      const erodeGate = speed.greaterThan(u.erodeSpeedMin).select(float(1), float(0))
+        .mul(notSource).mul(establishedFlow);
       const dh = vec2(dbx, dby).mul(-1).add(vec2(1e-5, 1e-5));
       const fdir = vec2(v.x, v.y).add(vec2(1e-6, 1e-6));
       const align = max(float(0), fdir.normalize().dot(dh.normalize()));
+      // Prefer coherent downhill channels and introduce broad deterministic
+      // susceptibility variation. This breaks sheet erosion into pioneering streams
+      // without injecting temporal noise or changing water mass.
+      const channelNoise = mx_fractal_noise_float(vec3(
+        ix.toFloat().div(float(w)).mul(7),
+        iy.toFloat().div(float(h)).mul(7),
+        bc.mul(2),
+      ), 3).mul(0.45).add(0.72).clamp(float(0.35), float(1.15));
+      const coherentFlow = smoothstep(float(0.15), float(0.85), align).mul(0.82).add(0.18);
+      const erodeBase = max(float(0), capacity.sub(sc)).mul(u.dissolve).mul(softness)
+        .mul(hard).mul(erodeGate).mul(coherentFlow).mul(channelNoise);
       const gentle = float(1).sub(smoothstep(float(0.05), float(0.18), tilt));
       const lateral = discharge.mul(float(1).sub(align)).mul(gentle).mul(u.lateralErosion).mul(softness).mul(hard).mul(erodeGate);
       // NO-SINK: never carve a cell below its LOWEST neighbor. A closed pit (lower
@@ -460,7 +509,15 @@ function flatErosion(
       // bug). Canyons (lower than most, but OPEN downstream) are still allowed.
       const minNb = min(min(bAt(ix.add(1), iy), bAt(ix.sub(1), iy)), min(bAt(ix, iy.add(1)), bAt(ix, iy.sub(1))));
       const noSink = max(float(0), bc.sub(minNb));
-      const erode = erodeBase.add(lateral).mul(depthSuppress).mul(u.simSpeed).min(CAP).min(noSink);
+      // Once a channel is materially below its banks, stop vertical incision and
+      // let its discharge continue downstream. Without this brake, every tick lowers
+      // the established path until it becomes an unnecessarily deep trench.
+      const bankMean = bAt(ix.add(1), iy).add(bAt(ix.sub(1), iy))
+        .add(bAt(ix, iy.add(1))).add(bAt(ix, iy.sub(1))).mul(0.25);
+      const incisionDepth = max(float(0), bankMean.sub(bc));
+      const incisionBrake = float(1).sub(smoothstep(float(0.008), float(0.035), incisionDepth));
+      const erode = erodeBase.add(lateral.mul(incisionBrake))
+        .mul(depthSuppress).mul(incisionBrake).mul(u.simSpeed).min(CAP).min(noSink);
       // ANTI-DAM: never deposit enough to raise the bed above the local water
       // surface. Excess sediment stays suspended -> advects on to deeper water ->
       // spreads a submerged delta fan instead of instantly damming the channel.
@@ -468,9 +525,14 @@ function flatErosion(
       // from capacity-driven deposition: lakes and sheltered coastal water should
       // clarify even when they are not evaporating.
       const calm = float(1).sub(smoothstep(float(0.025), float(0.22), speed));
-      const settling = sc.mul(u.stillDeposit).mul(calm).mul(smoothstep(float(0.012), float(0.08), dc));
+      // Sediment should ride through a connected river and settle where discharge
+      // spreads across a lake/shelf. Previously slow local velocity near the source
+      // dumped the load there even while substantial pipe flow passed through.
+      const depositZone = float(1).sub(smoothstep(float(0.0002), float(0.002), throughFlow));
+      const settling = sc.mul(u.stillDeposit).mul(calm)
+        .mul(smoothstep(float(0.012), float(0.08), dc)).mul(depositZone);
       const dep = max(
-        max(float(0), sc.sub(capCarry)).mul(u.deposit).mul(u.simSpeed),
+        max(float(0), sc.sub(capCarry)).mul(u.deposit).mul(u.simSpeed).mul(depositZone),
         settling,
       ).min(CAP).min(dc.mul(0.22)).mul(notSource);
       bNew.assign(max(bc.sub(erode).add(dep), float(0)));
@@ -483,6 +545,25 @@ function flatErosion(
     textureStore(looseOut, uvec2(x, y), vec4(looseNew, 0, 0, 1)).toWriteOnly();
     textureStore(sOut, uvec2(x, y), vec4(sNew, 0, 0, 1)).toWriteOnly();
     textureStore(activityOut, uvec2(x, y), vec4(erodeViz, depositViz, wetViz, 1)).toWriteOnly();
+  });
+  return fn().compute(w * h) as CN;
+}
+
+/** Surface-preserving water settle. The erosion pass moves the bed (deposition raises,
+ *  incision lowers) but leaves water depth untouched, so the free surface b+d jumps by
+ *  the bed delta. The NEXT flux pass then reads that jump as hydraulic head and shoves
+ *  water outward (incl. UPSTREAM) — a backfiring impulse opposite the flow, the cause of
+ *  river weirdness near deltas. Suspended sediment occupies volume in the column, so
+ *  settling/lifting it must NOT move the surface. Compensate d by -(bNew-bOld) to hold
+ *  b+d invariant across the bed exchange. Reads OLD bed (b) + NEW bed (bNext, erosion's
+ *  scratch output) before the bed copy lands. Kept a separate 1-write pass so erosion
+ *  stays at the 4-storage-texture-per-stage WebGPU baseline. */
+function flatSurfaceSettle(b: StorageTexture, bNext: StorageTexture, d: StorageTexture, dOut: StorageTexture, w: number, h: number): CN {
+  const fn = Fn(() => {
+    const { x, y, ix, iy } = coords(w);
+    const dc = textureLoad(d, ivec2(ix, iy)).x;
+    const delta = textureLoad(bNext, ivec2(ix, iy)).x.sub(textureLoad(b, ivec2(ix, iy)).x);
+    textureStore(dOut, uvec2(x, y), vec4(max(dc.sub(delta), float(0)), 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
 }
@@ -530,7 +611,9 @@ function flatThermal(b: StorageTexture, loose: StorageTexture, d: StorageTexture
       // a cell holds, the lower its talus -> deposited deltas push outward instead of
       // piling up vertically.
       const looseFrac = sourceLoose.div(u.looseFull).min(float(1));
-      const talusEff = u.talus.mul(float(1).sub(looseFrac.mul(0.7)));
+      // Deposited sand/silt has a much shallower angle of repose than rock.
+      // Deep loose deposits approach a broad alluvial slope instead of a cliff.
+      const talusEff = u.talus.mul(float(1).sub(looseFrac.mul(0.9)));
       const request = (nx: any, ny: any) => max(float(0), sourceHeight.sub(at(b, nx, ny)).sub(talusEff));
       const reqL = request(sx.sub(1), sy);
       const reqR = request(sx.add(1), sy);
@@ -540,8 +623,9 @@ function flatThermal(b: StorageTexture, loose: StorageTexture, d: StorageTexture
       // bedrock channels stay suppressed underwater (don't heal flat), but LOOSE delta
       // sediment keeps slumping underwater so it fans out instead of damming a plateau.
       const wet = smoothstep(float(0), u.channelDepthRef, at(d, sx, sy));
-      const wetSuppress = wet.mul(0.85).mul(float(1).sub(looseFrac.mul(0.75)));
-      const rate = u.thermalRate.mul(float(1).sub(wetSuppress)).mul(u.simSpeed).mul(0.25);
+      const wetSuppress = wet.mul(0.85).mul(float(1).sub(looseFrac.mul(0.95)));
+      const looseSpread = mix(float(1), float(3.2), looseFrac);
+      const rate = u.thermalRate.mul(float(1).sub(wetSuppress)).mul(looseSpread).mul(u.simSpeed).mul(0.25);
       const scale = min(rate, sourceLoose.div(max(total, float(EPS))));
       const dx = tx.sub(sx);
       const dy = ty.sub(sy);
@@ -580,8 +664,9 @@ export class FlatSim {
   readonly activity: GridField; // rg: recent erosion/deposition
   erosionEnabled = false;
   momentumSubsteps = 1;
+  private tickCount = 0;
   private _waterSolver: FlatWaterSolver = 'pipe';
-  private readonly nodes: { fluxN: CN; fluxC: CN; velN: CN; velC: CN; sedN: CN; sFlowC: CN; updN: CN; watC: CN; momN: CN; momC: CN; momSedN: CN; momSedC: CN; momVelN: CN; momVelC: CN; eroN: CN; bC: CN; loC: CN; sEC: CN; actC: CN; thN: CN; bTC: CN; loTC: CN };
+  private readonly nodes: { fluxN: CN; fluxC: CN; velN: CN; velC: CN; sedN: CN; sFlowC: CN; updN: CN; watC: CN; momN: CN; momC: CN; momSedN: CN; momSedC: CN; momVelN: CN; momVelC: CN; eroN: CN; settleN: CN; wEC: CN; bC: CN; loC: CN; sEC: CN; actC: CN; thN: CN; bTC: CN; loTC: CN };
   private readonly srcCenter = uniform(new Vector2(0.5, 0.5));
   private readonly srcRadius = uniform(0.04);
   private readonly srcRate = uniform(0);
@@ -620,7 +705,11 @@ export class FlatSim {
       momSedC: buildGridCopy(this.sediment.scratch, this.sediment.main, w, h),
       momVelN: flatMomentumVelocity(this.momentum.main, this.water.main, this.velocity.scratch, w, h),
       momVelC: buildGridCopy(this.velocity.scratch, this.velocity.main, w, h),
-      eroN: flatErosion(b, this.loose.main, this.sediment.main, this.velocity.main, this.water.main, hardness, this.source.main, this.activity.main, height.scratch, this.loose.scratch, this.sediment.scratch, this.activity.scratch, w, h),
+      eroN: flatErosion(b, this.loose.main, this.sediment.main, this.velocity.main, this.water.main, this.flux.main, hardness, this.source.main, this.activity.main, height.scratch, this.loose.scratch, this.sediment.scratch, this.activity.scratch, w, h),
+      // Surface-preserving water settle: reads OLD bed (b) + NEW bed (height.scratch) +
+      // current d, writes compensated d to water.scratch. Runs before bC lands the bed.
+      settleN: flatSurfaceSettle(b, height.scratch, this.water.main, this.water.scratch, w, h),
+      wEC: buildGridCopy(this.water.scratch, this.water.main, w, h),
       bC: buildGridCopy(height.scratch, b, w, h),
       loC: buildGridCopy(this.loose.scratch, this.loose.main, w, h),
       sEC: buildGridCopy(this.sediment.scratch, this.sediment.main, w, h),
@@ -633,11 +722,16 @@ export class FlatSim {
       const x = instanceIndex.mod(uint(w)), yy = instanceIndex.div(uint(w));
       const ux = x.toFloat().div(w), uy = yy.toFloat().div(h);
       const dist = length(vec2(ux.sub(this.srcCenter.x), uy.sub(this.srcCenter.y)));
-      const wgt = float(1).sub(smoothstep(float(0), this.srcRadius, dist));
+      // A placed spring is a pressurized outlet, not rainfall over a filled disk.
+      // Concentrate discharge near the footprint boundary so water crosses out of
+      // the source immediately instead of accumulating among interior source cells.
+      const inner = smoothstep(this.srcRadius.mul(0.28), this.srcRadius.mul(0.68), dist);
+      const outer = float(1).sub(smoothstep(this.srcRadius.mul(0.72), this.srcRadius, dist));
+      const wgt = inner.mul(outer);
       const cur = textureLoad(this.source.main, ivec2(int(x), int(yy))).x;
-      // `rate` is total discharge, not a per-cell rate. The radial smoothstep
-      // kernel integrates to roughly 0.3*pi*R² over normalized map coordinates.
-      const kernelAreaCells = this.srcRadius.mul(this.srcRadius).mul(float(0.3 * Math.PI * w * h));
+      // `rate` is total discharge, not a per-cell rate. This annular smoothstep
+      // kernel integrates to roughly 0.36*pi*R² over normalized map coordinates.
+      const kernelAreaCells = this.srcRadius.mul(this.srcRadius).mul(float(0.36 * Math.PI * w * h));
       const normalizedRate = this.srcRate.div(max(kernelAreaCells, float(EPS)));
       textureStore(this.source.scratch, uvec2(x, yy), vec4(max(float(0), cur.add(normalizedRate.mul(wgt))), 0, 0, 1)).toWriteOnly();
     });
@@ -664,6 +758,7 @@ export class FlatSim {
   clearSources() { this.renderer.compute(buildGridFill(this.source.main, this.w, this.h, 0)); }
   loadState(state: { height: any; loose: any; water: any; sediment: any; source: any }) {
     const r = this.renderer;
+    this.tickCount = 0;
     for (const [seed, field] of [
       [state.height, this.height],
       [state.loose, this.loose],
@@ -686,6 +781,7 @@ export class FlatSim {
 
   tick(dt: number) {
     const r = this.renderer, n = this.nodes;
+    this.tickCount++;
     if (this._waterSolver === 'momentum') {
       this.momentumSubsteps = momentumSubstepCount(dt, waterUniforms.gravity.value);
       waterUniforms.dt.value = dt / this.momentumSubsteps;
@@ -702,8 +798,15 @@ export class FlatSim {
       r.compute(n.sedN); r.compute(n.sFlowC);
       r.compute(n.updN); r.compute(n.watC);
     }
-    if (this.erosionEnabled) {
-      r.compute(n.eroN); r.compute(n.bC); r.compute(n.loC); r.compute(n.sEC); r.compute(n.actC);
+    // Water must have time to establish a connected route before terrain responds.
+    // Eroding every 20 Hz water tick lets the bed flatten faster than a river can
+    // hydraulically adjust, especially on modest slopes.
+    if (this.erosionEnabled && this.tickCount % 4 === 0) {
+      r.compute(n.eroN);
+      // settle reads OLD bed (still in height.main) + NEW bed (height.scratch) -> must run
+      // before bC overwrites height.main; wEC then lands the compensated water depth.
+      r.compute(n.settleN); r.compute(n.wEC);
+      r.compute(n.bC); r.compute(n.loC); r.compute(n.sEC); r.compute(n.actC);
       r.compute(n.thN); r.compute(n.bTC); r.compute(n.loTC);
     }
   }
