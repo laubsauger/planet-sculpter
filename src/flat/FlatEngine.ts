@@ -16,7 +16,7 @@ import { makeFlatTerrain, shoreWetEnabled, materialDebugGrid, contourOverlay, co
 import { flowBandScale, flowBandStrength, makeFlatWater, shoreFoamEnabled, oceanSwellEnabled } from '../materials/flatWater';
 import { makeFlatDebug, FLAT_DEBUG_MODES, flatDebugMode } from '../materials/flatDebug';
 import { FlatBrush } from './FlatBrush';
-import { FlatSim, FLAT_WATER_SOLVERS } from './flatSim';
+import { FlatSim, FLAT_WATER_SOLVERS, depositionEnabled, hydraulicErosionEnabled } from './flatSim';
 import { buildFlatBenchmark, FLAT_BENCHMARKS, type FlatBenchmark, type FlatBenchmarkData } from './flatBenchmarks';
 import { Sidebar } from '../ui/Sidebar';
 import { GridField, buildGridSeed } from '../sim/gridStore';
@@ -59,6 +59,10 @@ export class FlatEngine {
   private lastTimingResolve = 0;
   private lastComputeCalls = 0;
   private computeCallsFrame = 0;
+  private lastRenderCalls = 0;
+  private renderCallsFrame = 0;
+  private lastTriangles = 0;
+  private trianglesFrame = 0;
   private debugMode = 0;
   private readonly diagnostics = { benchmark: 'default' as FlatBenchmark };
   private snapshotText = '';
@@ -150,7 +154,7 @@ export class FlatEngine {
       sediment: this.zeroTexture(W, H),
       source: this.zeroTexture(W, H),
       rainOn: false,
-      erosionOn: false,
+      erosionOn: true,
     };
     this.heightField = new GridField(W, H);
     this.renderer.compute(buildGridSeed(seed.height.texture as never, this.heightField.main, W, H));
@@ -253,6 +257,9 @@ export class FlatEngine {
     wf.add({ cs: () => this.sim.clearSources() }, 'cs').name('clear sources');
     const e = gui.addFolder('Erosion');
     e.add(this.sim, 'erosionEnabled').name('enabled').listen();
+    e.add({ hydraulic: true }, 'hydraulic').name('hydraulic erosion').onChange((v: boolean) => { hydraulicErosionEnabled.value = v ? 1 : 0; });
+    e.add({ deposition: true }, 'deposition').name('deposition').onChange((v: boolean) => { depositionEnabled.value = v ? 1 : 0; });
+    e.add(this.sim, 'thermalEnabled').name('thermal slumping');
     e.add(erosionUniforms.simSpeed, 'value', 1, 12, 0.5).name('sim speed');
     e.add(erosionUniforms.sedimentCapacity, 'value', 0, 1, 0.02).name('capacity');
     e.add(erosionUniforms.deposit, 'value', 0, 0.3, 0.01).name('deposit');
@@ -396,6 +403,14 @@ export class FlatEngine {
     if (computeDelta > 0) this.computeCallsFrame = computeDelta;
     this.lastComputeCalls = computeCalls;
     this.renderer.render(this.scene, this.camera);
+    const renderCalls = this.renderer.info.render.calls;
+    const triangles = this.renderer.info.render.triangles;
+    const renderDelta = renderCalls - this.lastRenderCalls;
+    const triangleDelta = triangles - this.lastTriangles;
+    if (renderDelta > 0) this.renderCallsFrame = renderDelta;
+    if (triangleDelta > 0) this.trianglesFrame = triangleDelta;
+    this.lastRenderCalls = renderCalls;
+    this.lastTriangles = triangles;
     if (time - this.lastTimingResolve > 1000) {
       this.lastTimingResolve = time;
       this.resolveGpuTimings();
@@ -403,7 +418,7 @@ export class FlatEngine {
     if (this.hud) {
       this.fpsEma += (1000 / Math.max(dt * 1000, 0.001) - this.fpsEma) * 0.1;
       this.hud.textContent =
-        `fps ${this.fpsEma.toFixed(0)}  FLAT ${FLAT.gridW}x${FLAT.gridH}  cpu-sim ${this.simCpuMsEma.toFixed(2)}ms  gpu compute/render ${this.gpuComputeMs.toFixed(2)}/${this.gpuRenderMs.toFixed(2)}ms  dispatch ${this.computeCallsFrame}\n` +
+        `fps ${this.fpsEma.toFixed(0)}  FLAT ${FLAT.gridW}x${FLAT.gridH}  cpu-sim ${this.simCpuMsEma.toFixed(2)}ms  gpu compute/render ${this.gpuComputeMs.toFixed(2)}/${this.gpuRenderMs.toFixed(2)}ms  dispatch ${this.computeCallsFrame}  draw ${this.renderCallsFrame}  tris ${Math.round(this.trianglesFrame / 1000)}k\n` +
         `benchmark:${this.diagnostics.benchmark}  solver:${this.sim.waterSolver}${this.sim.waterSolver === 'momentum' ? ` x${this.sim.momentumSubsteps}` : ''}  debug:${FLAT_DEBUG_MODES[this.debugMode]} [v]  [g]${this.sculptMode ? 'SCULPT' : 'orbit'} ${this.riverMode ? 'RIVER' : this.brushSettings.mode} [r]rain:${this.water.rainOn ? 'on' : 'off'}\n` +
         this.snapshotText;
     }

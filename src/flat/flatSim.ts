@@ -23,6 +23,8 @@ import { momentumSubstepCount } from './momentumCfl';
 type CN = Parameters<WebGPURenderer['compute']>[0];
 export const FLAT_WATER_SOLVERS = ['pipe', 'momentum'] as const;
 export type FlatWaterSolver = (typeof FLAT_WATER_SOLVERS)[number];
+export const hydraulicErosionEnabled = uniform(1);
+export const depositionEnabled = uniform(1);
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const EPS = 1e-6;
 
@@ -34,7 +36,7 @@ const cX = (x: any, w: number) => x.toFloat().max(float(0)).min(float(w - 1)).to
 const cY = (y: any, h: number) => y.toFloat().max(float(0)).min(float(h - 1)).toInt();
 
 /** Pipe outflow flux (L,R,T,B). */
-function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture, source: StorageTexture, activity: StorageTexture, fPrev: StorageTexture, fOut: StorageTexture, w: number, h: number): CN {
+function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture, source: StorageTexture, fPrev: StorageTexture, fOut: StorageTexture, w: number, h: number): CN {
   const p = waterUniforms;
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
@@ -86,20 +88,6 @@ function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture
     fR = fR.mul(edgeAbsorb);
     fT = fT.mul(edgeAbsorb);
     fB = fB.mul(edgeAbsorb);
-    // Fresh unconsolidated deposits are hydraulically rougher than an established
-    // channel bed. This feeds uneven material anchoring back into routing: bars
-    // divert some discharge, while weak gaps capture it and can become channels.
-    // The activity field decays, so a stable route regains full conductance.
-    const depositAt = (cx: any, cy: any) => textureLoad(activity, ivec2(cX(cx, w), cY(cy, h))).y;
-    const roughFace = (nx: any, ny: any) => smoothstep(
-      float(0.08),
-      float(0.72),
-      max(depositAt(ix, iy), depositAt(nx, ny)),
-    );
-    fL = fL.mul(mix(float(1), float(0.68), roughFace(ix.sub(1), iy)));
-    fR = fR.mul(mix(float(1), float(0.68), roughFace(ix.add(1), iy)));
-    fT = fT.mul(mix(float(1), float(0.68), roughFace(ix, iy.add(1))));
-    fB = fB.mul(mix(float(1), float(0.68), roughFace(ix, iy.sub(1))));
     // Keep the literal final cell sealed so neighbor reads stay in-bounds.
     fL = ix.lessThan(int(1)).select(float(0), fL);
     fR = ix.greaterThan(int(w - 2)).select(float(0), fR);
@@ -636,6 +624,23 @@ function flatErosion(
         .add(selfFlux.z.mul(bAt(ix, iy.add(1))))
         .add(selfFlux.w.mul(bAt(ix, iy.sub(1))))
         .div(max(outflow, float(EPS)));
+      const incomingBed = fAt(ix.sub(1), iy).y.mul(bAt(ix.sub(1), iy))
+        .add(fAt(ix.add(1), iy).x.mul(bAt(ix.add(1), iy)))
+        .add(fAt(ix, iy.add(1)).w.mul(bAt(ix, iy.add(1))))
+        .add(fAt(ix, iy.sub(1)).z.mul(bAt(ix, iy.sub(1))))
+        .div(max(inflow, float(EPS)));
+      const incomingDrop = max(float(0), incomingBed.sub(bc));
+      const outgoingDrop = max(float(0), bc.sub(routedBed));
+      // At the foot of a steep fall, a centered slope sees the high upstream face
+      // and overstates bed shear even though the outgoing route has flattened.
+      // Suppress vertical cutting there so the river keeps its downstream grade
+      // instead of excavating a bowl that captures all subsequent discharge.
+      const gradeBreak = smoothstep(
+        float(0.003),
+        float(0.025),
+        incomingDrop.sub(outgoingDrop.mul(1.35)),
+      ).mul(directionalFlow);
+      const gradeBreakBrake = float(1).sub(gradeBreak.mul(0.88));
       const looseChannelAllowance = max(float(0), bc.sub(routedBed)).add(float(0.0035))
         .mul(looseFrac).mul(directionalFlow);
       const incisionLimit = max(noSink, looseChannelAllowance);
@@ -646,8 +651,9 @@ function flatErosion(
         .add(bAt(ix, iy.add(1))).add(bAt(ix, iy.sub(1))).mul(0.25);
       const incisionDepth = max(float(0), bankMean.sub(bc));
       const incisionBrake = float(1).sub(smoothstep(float(0.008), float(0.035), incisionDepth));
-      const erode = erodeBase.add(looseRework).add(lateral.mul(incisionBrake))
-        .mul(depthSuppress).mul(incisionBrake).mul(u.simSpeed).min(ERODE_CAP).min(incisionLimit);
+      const erode = erodeBase.add(looseRework).mul(gradeBreakBrake).add(lateral.mul(incisionBrake))
+        .mul(depthSuppress).mul(incisionBrake).mul(u.simSpeed).min(ERODE_CAP).min(incisionLimit)
+        .mul(hydraulicErosionEnabled);
       // ANTI-DAM: never deposit enough to raise the bed above the local water
       // surface. Excess sediment stays suspended -> advects on to deeper water ->
       // spreads a submerged delta fan instead of instantly damming the channel.
@@ -685,7 +691,7 @@ function flatErosion(
       const dep = max(
         transportLoss.mul(u.deposit).mul(u.simSpeed).mul(depositOpportunity).mul(depositPreference),
         settling,
-      ).min(DEPOSIT_CAP).min(dc.mul(0.22)).min(availableWaterColumn).mul(notSource);
+      ).min(DEPOSIT_CAP).min(dc.mul(0.22)).min(availableWaterColumn).mul(notSource).mul(depositionEnabled);
       bNew.assign(max(bc.sub(erode).add(dep), float(0)));
       looseNew.assign(max(lc.sub(erode), float(0)).add(dep));
       sNew.assign(max(float(0), sc.add(erode).sub(dep)).min(float(2)));
@@ -858,7 +864,8 @@ export class FlatSim {
   readonly loose: GridField;
   readonly source: GridField;
   readonly activity: GridField; // rg: recent erosion/deposition
-  erosionEnabled = false;
+  erosionEnabled = true;
+  thermalEnabled = true;
   settleEnabled = true; // DEBUG: surface-preserving water settle after erosion
   momentumSubsteps = 1;
   private tickCount = 0;
@@ -888,7 +895,7 @@ export class FlatSim {
     renderer.compute(buildGridSeed(looseSeed, this.loose.main, w, h));
     const b = height.main;
     this.nodes = {
-      fluxN: flatFlux(b, this.water.main, this.sediment.main, this.source.main, this.activity.main, this.flux.main, this.flux.scratch, w, h),
+      fluxN: flatFlux(b, this.water.main, this.sediment.main, this.source.main, this.flux.main, this.flux.scratch, w, h),
       fluxC: buildGridCopy(this.flux.scratch, this.flux.main, w, h),
       velN: flatVelocity(this.flux.main, this.water.main, this.velocity.main, this.velocity.scratch, w, h),
       velC: buildGridCopy(this.velocity.scratch, this.velocity.main, w, h),
@@ -1004,12 +1011,14 @@ export class FlatSim {
       // before bC overwrites height.main; wEC then lands the compensated water depth.
       if (this.settleEnabled) { r.compute(n.settleN); r.compute(n.wEC); }
       r.compute(n.bC); r.compute(n.loC); r.compute(n.sEC); r.compute(n.actC);
-      r.compute(n.thN);
-      // Thermal slumping changes the bed after the hydraulic settle above. Preserve
-      // the free surface a second time or each slump becomes a fake pressure pulse
-      // that flickers depth/turbidity and can shove water upstream.
-      r.compute(n.settleN); r.compute(n.wEC);
-      r.compute(n.bTC); r.compute(n.loTC);
+      if (this.thermalEnabled) {
+        r.compute(n.thN);
+        // Thermal slumping changes the bed after the hydraulic settle above. Preserve
+        // the free surface a second time or each slump becomes a fake pressure pulse
+        // that flickers depth/turbidity and can shove water upstream.
+        r.compute(n.settleN); r.compute(n.wEC);
+        r.compute(n.bTC); r.compute(n.loTC);
+      }
     }
   }
 }

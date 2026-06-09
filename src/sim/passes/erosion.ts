@@ -100,7 +100,7 @@ export const erosionUniforms = {
   vizDecay: uniform(0.95),
   /** wetness decay/tick (slower): ground stays darkened for a few seconds AFTER the
    *  water has run off, then dries back. stored in activity.z. */
-  wetDecay: uniform(0.99),
+  wetDecay: uniform(0.995),
   /** still water settles suspended sediment -> muddy lakes clear, beds build (V35). */
   stillDeposit: uniform(0.04),
   dt: uniform(1 / 60),

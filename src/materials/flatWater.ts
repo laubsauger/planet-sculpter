@@ -234,9 +234,14 @@ export function makeFlatWater(
     smoothstep(0.00045, 0.004, depth.mul(speed)),
     smoothstep(0.012, 0.045, depth),
   );
+  // A thin but connected pipe route is still valid flowing water. Give it a
+  // restrained visibility floor so low-discharge channels can be inspected
+  // without making the simulation physically deeper or more viscous.
+  const connectedFlow = smoothstep(0.00001, 0.0007, outgoing)
+    .mul(smoothstep(0.00012, 0.0012, depth));
   const landOpacity = max(
-    depthOpacity.mul(channelOrPool).mul(mix(float(1), float(0.12), steepRunoff)),
-    flowOpacity.mul(channelOrPool),
+    depthOpacity.mul(max(channelOrPool, connectedFlow.mul(0.62))).mul(mix(float(1), float(0.12), steepRunoff)),
+    flowOpacity.mul(max(channelOrPool, connectedFlow)),
   );
   const waterBodyOpacity = smoothstep(0.0005, 0.018, depth).mul(0.22);
   const muddyOpacity = turbidity.mul(smoothstep(0.0005, 0.018, depth)).mul(0.82);
