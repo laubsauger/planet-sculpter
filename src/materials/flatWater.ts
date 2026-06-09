@@ -8,7 +8,7 @@ import { DoubleSide, type Texture } from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import {
   textureLoad, uv, mix, smoothstep, max, clamp, float, vec2, vec3, length,
-  normalize, dot, pow, sin, time, cameraPosition, mx_fractal_noise_float, uniform,
+  normalize, dot, pow, sin, cos, time, cameraPosition, mx_fractal_noise_float, uniform,
 } from 'three/tsl';
 import { flatSurface, bilinear, bicubicClamped, flatGridX, flatGridY, flatSeaLevel } from '../tsl/flatSurface';
 import { sunDirUniform, sunIntensityU } from '../tsl/lighting';
@@ -84,20 +84,38 @@ export function makeFlatWater(
   const oceanMask = float(1).sub(smoothstep(flatSeaLevel.sub(0.03), flatSeaLevel, bed));
   const still = float(1).sub(smoothstep(0.03, 0.3, speed));
   const flatWater = float(1).sub(smoothstep(0.006, 0.045, depthGradient));
-  const swell = grad(posXZ.add(vec2(time.mul(0.07), time.mul(-0.05))), 1.7)
-    .add(grad(posXZ.add(vec2(time.mul(-0.05), time.mul(0.085))), 3.3).mul(0.55))
-    .mul(0.052).mul(still).mul(flatWater).mul(oceanMask);
-  const nW: any = normalize(s.worldNormal.add(flowR).add(swell));
+  // Open-ocean stylized swell: long rolling crest lines along a fixed wind direction,
+  // plus a finer cross-chop. One COHERENT wave drives both the surface normal (travelling
+  // glints) and crest/trough shading (below) so the ocean reads as moving water instead of
+  // a flat sheet. Gated to genuine ocean depth (not the breaker-zone shoreline) so it can't
+  // bleed onto land water / rivers.
+  const deepOcean = oceanMask.mul(smoothstep(0.03, 0.13, depth)).mul(still).mul(flatWater);
+  const swellDir = normalize(vec2(0.82, 0.57));
+  const swellPhase = dot(posXZ, swellDir).mul(1.05).sub(time.mul(0.5));
+  const chopPhase = dot(posXZ, vec2(swellDir.y.mul(-1), swellDir.x)).mul(2.3).add(time.mul(0.7));
+  const swellHeight = sin(swellPhase).add(sin(chopPhase).mul(0.4)).mul(0.5).add(0.5);
+  // crest slope tilts the normal along the wave direction -> specular/fresnel travel.
+  const swellSlope = cos(swellPhase).mul(1.05);
+  const oceanSwellNormal = vec3(swellDir.x.mul(swellSlope), float(0), swellDir.y.mul(swellSlope))
+    .mul(0.09).mul(deepOcean);
+  // faint noise micro-ripple so crests aren't a perfectly clean machine sine.
+  const microRipple = grad(posXZ.add(vec2(time.mul(0.07), time.mul(-0.05))), 3.0)
+    .mul(0.03).mul(deepOcean);
+  const nW: any = normalize(s.worldNormal.add(flowR).add(oceanSwellNormal).add(microRipple));
 
-  // depth color (view-INDEPENDENT base, always visible).
-  let col: any = mix(SHALLOW, MID, smoothstep(0.01, 0.09, depth));
-  col = mix(col, DEEP, smoothstep(0.09, 0.32, depth));
-  // Large bodies need readable structure even away from a perfect specular angle.
-  // Two crossing, slowly moving wave fields provide broad stylized modulation.
-  const oceanWaveA = sin(posXZ.x.mul(1.15).add(posXZ.y.mul(0.42)).sub(time.mul(0.42)));
-  const oceanWaveB = sin(posXZ.x.mul(-0.38).add(posXZ.y.mul(1.5)).add(time.mul(0.31)));
-  const oceanStructure = oceanWaveA.add(oceanWaveB.mul(0.65)).mul(0.5).add(0.5);
-  col = mix(col, SKY_REFLECT, oceanStructure.mul(0.085).mul(oceanMask).mul(still));
+  // depth color (view-INDEPENDENT base, always visible). Wider ramps than before so the
+  // shallow shelf reads as a turquoise->blue GRADIENT instead of saturating to deep blue
+  // within a couple of cells (the "hard cut" at the steep bathymetric shelf).
+  let col: any = mix(SHALLOW, MID, smoothstep(0.012, 0.13, depth));
+  col = mix(col, DEEP, smoothstep(0.14, 0.55, depth));
+  // Rolling crest/trough shading from the coherent swell breaks the homogeneous deep-blue
+  // sheet: crests catch sky light, troughs deepen. Stylized whitecaps fleck the steepest
+  // crests in open water. All gated to deepOcean so shallows/land water are untouched.
+  // Gentle crest/trough shading ONLY — no painted white crests (those read as big white
+  // discs walking across the water). Liveliness instead comes from the swell-tilted
+  // normal's travelling specular/fresnel below.
+  col = mix(col, DEEP.mul(0.72), smoothstep(0.5, 0.0, swellHeight).mul(0.18).mul(deepOcean));
+  col = mix(col, SKY_REFLECT, smoothstep(0.78, 1.0, swellHeight).mul(0.05).mul(deepOcean));
 
   // Fake shallow-bottom caustics. These are deliberately a color modulation on
   // the water sheet so they remain cheap and appear to dance over visible seabed.
@@ -113,8 +131,10 @@ export function makeFlatWater(
   const causticA = float(1).sub(smoothstep(0.035, 0.2, sin(causticPhaseA).abs()));
   const causticB = float(1).sub(smoothstep(0.04, 0.22, sin(causticPhaseB).abs()));
   const caustics = max(causticA, causticB.mul(0.75));
-  const shallowOcean = oceanMask.mul(float(1).sub(smoothstep(0.035, 0.16, depth)));
-  col = col.add(vec3(0.22, 0.48, 0.42).mul(caustics).mul(shallowOcean).mul(0.055));
+  // Wider + brighter than before so caustics genuinely read across the clear shelf the
+  // softened opacity now exposes, not just a thin sliver at the waterline.
+  const shallowOcean = oceanMask.mul(float(1).sub(smoothstep(0.06, 0.24, depth)));
+  col = col.add(vec3(0.22, 0.48, 0.42).mul(caustics).mul(shallowOcean).mul(0.09));
   const concentration = sediment.div(max(depth, float(0.003)));
   const sedimentLoad = smoothstep(0.012, 0.22, concentration);
   const plumeNoise = mx_fractal_noise_float(
@@ -155,16 +175,29 @@ export function makeFlatWater(
   const half = normalize(sunDirUniform.add(viewW));
   const spec = pow(max(float(0), dot(nW, half)), float(55)).mul(sunIntensityU.mul(0.1));
   col = col.add(vec3(1.0, 0.97, 0.9).mul(spec).mul(float(1).sub(turbidity.mul(0.82))));
-  // Breakers follow local bathymetry contours instead of a global diagonal wave.
-  // They only exist in shallow ocean water with a real shore-facing depth gradient.
-  const shoreBand = smoothstep(0.001, 0.005, depth)
-    .mul(float(1).sub(smoothstep(0.035, 0.095, depth)));
-  const coastSlope = smoothstep(0.004, 0.045, depthGradient);
-  const breakerPhase = sin(depth.mul(260).sub(time.mul(2.8))
-    .add(mx_fractal_noise_float(vec3(posXZ.mul(1.8), time.mul(0.08)), 2).mul(2.2)))
-    .mul(0.5).add(0.5);
-  const breakerCrest = smoothstep(0.62, 0.88, breakerPhase);
-  const breakers = shoreBand.mul(coastSlope).mul(oceanMask).mul(breakerCrest);
+  // Lapping shore foam: several depth-contour wave trains at different wavelengths and
+  // speeds (MULTIPLE patterns, not one ring), warped by noise so each lap is irregular.
+  // Hugs the shore (very shallow band) and fades before open water. Mixed to FOAM (white)
+  // with its own opacity below so it reads as white foam, not tinted sand.
+  const shoreWarp = mx_fractal_noise_float(vec3(posXZ.mul(2.6), time.mul(0.09)), 2).mul(2.0);
+  const shoreWarp2 = mx_fractal_noise_float(vec3(posXZ.mul(5.0).add(11.0), time.mul(0.13)), 2).mul(1.4);
+  const lapA = sin(depth.mul(180).sub(time.mul(1.9)).add(shoreWarp)).mul(0.5).add(0.5);
+  const lapB = sin(depth.mul(360).sub(time.mul(3.1)).add(shoreWarp2)).mul(0.5).add(0.5);
+  const lapC = sin(depth.mul(640).sub(time.mul(4.6)).add(shoreWarp.mul(1.7))).mul(0.5).add(0.5);
+  const lapField = max(
+    max(smoothstep(0.55, 0.9, lapA), smoothstep(0.6, 0.92, lapB).mul(0.75)),
+    smoothstep(0.66, 0.95, lapC).mul(0.5),
+  );
+  // band hugging the shore (very shallow -> closer to shore than before).
+  const shoreBand = smoothstep(0.0006, 0.0035, depth)
+    .mul(float(1).sub(smoothstep(0.016, 0.05, depth)));
+  const breakers = shoreBand.mul(oceanMask).mul(lapField);
+  // Swash sheet: the thinnest film right at the waterline gets a translucent white wash
+  // that pulses up/down the sand (lapping) on its own slow cycle, independent of breakers.
+  const swashPulse = sin(time.mul(1.3).add(shoreWarp.mul(0.6))).mul(0.5).add(0.5);
+  const swash = smoothstep(0.0004, 0.0014, depth)
+    .mul(float(1).sub(smoothstep(0.0035, 0.012, depth)))
+    .mul(oceanMask).mul(mix(float(0.35), float(1), swashPulse));
 
   // Rapids are a moving-land-water effect. Steep depth changes and speed produce
   // broken highlights, without painting every flowing cell white.
@@ -172,7 +205,7 @@ export function makeFlatWater(
     .mul(smoothstep(0.005, 0.055, depthGradient))
     .mul(smoothstep(0.0004, 0.025, depth))
     .mul(riverMask);
-  const foamAmt = max(breakers.mul(0.9), rapids.mul(0.32))
+  const foamAmt = max(max(breakers, swash.mul(0.8)), rapids.mul(0.32))
     .mul(float(1).sub(turbidity.mul(0.7))).min(float(1));
   col = mix(col, FOAM, foamAmt);
 
@@ -192,16 +225,17 @@ export function makeFlatWater(
   );
   const waterBodyOpacity = smoothstep(0.0005, 0.018, depth).mul(0.22);
   const muddyOpacity = turbidity.mul(smoothstep(0.0005, 0.018, depth)).mul(0.82);
-  // OCEAN: clear shallows reveal the sandy seabed, ramping to opaque deep blue (the
-  // From-Dust look) instead of a flat turquoise sheet.
-  const oceanOpacity = smoothstep(0.003, 0.13, depth).mul(0.78).add(0.2);
+  // OCEAN: clear shallows reveal the sandy seabed + caustics, ramping to opaque deep blue
+  // (the From-Dust look). Lower floor (0.12) keeps the shelf genuinely see-through and the
+  // wider ramp (->0.2) softens the shelf so it no longer reads as a hard opacity cut.
+  const oceanOpacity = smoothstep(0.004, 0.2, depth).mul(0.82).add(0.12);
   // foam (shoreline + rapids) stays opaque even over transparent shallows so it reads.
   // Gate EVERYTHING by water presence so dry land is fully transparent (no phantom
   // water/foam painted over terrain).
   const hasWater = smoothstep(0.00015, 0.001, depth);
   const opacity = clamp(
     max(
-      max(max(max(mix(landOpacity, oceanOpacity, oceanMask), waterBodyOpacity), muddyOpacity), foamAmt.mul(0.85)),
+      max(max(max(mix(landOpacity, oceanOpacity, oceanMask), waterBodyOpacity), muddyOpacity), foamAmt.mul(0.96)),
       streakStrength.mul(0.12),
     ).mul(hasWater),
     float(0), float(0.97),

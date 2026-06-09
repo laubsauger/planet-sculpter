@@ -7,7 +7,7 @@ import { FrontSide, type Texture } from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
 import {
   textureLoad, uv, mix, smoothstep, max, float, vec3, normalize,
-  mx_noise_float, cameraViewMatrix, transformDirection, sin,
+  mx_noise_float, cameraViewMatrix, transformDirection, sin, time,
 } from 'three/tsl';
 import {
   flatSurface, bilinear, flatSeaLevel, flatGridX, flatGridY, detailFreq, detailStrength,
