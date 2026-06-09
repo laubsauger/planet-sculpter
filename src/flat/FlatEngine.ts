@@ -5,7 +5,7 @@
 import {
   Scene, PerspectiveCamera, DirectionalLight, HemisphereLight, AmbientLight, Color, Fog,
   Vector2, Vector3, Raycaster, Plane, Mesh, TimestampQuery, DataTexture, RedFormat, FloatType, Object3D,
-  PlaneGeometry, MeshStandardMaterial, DoubleSide,
+  Shape, Path, ShapeGeometry, MeshBasicMaterial, DoubleSide,
 } from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import GUI from 'lil-gui';
@@ -118,22 +118,32 @@ export class FlatEngine {
   }
 
   private addOceanContinuation(): void {
-    // A single underlay has no inner rectangular handoff for transparent simulated
-    // water to reveal. Opaque terrain covers it; fog conceals its distant extent.
-    const outer = FLAT.worldSize * 12;
-    const span = outer * 2;
-    const seaY = FLAT.seaLevel * FLAT.heightScale - 0.07;
-    const material = new MeshStandardMaterial({
-      color: 0x0f7096,
-      roughness: 0.46,
-      metalness: 0,
-      side: DoubleSide,
-    });
-    const ocean = new Mesh(new PlaneGeometry(span, span), material);
-    ocean.rotation.x = -Math.PI / 2;
-    ocean.position.set(0, seaY, 0);
-    ocean.receiveShadow = true;
+    // Seamless infinite ocean: a FRAME (huge quad with a grid-sized hole) at the true sea
+    // surface, ringing the sim grid. INSIDE the grid the simulated water + seabed render the
+    // ocean; the frame only fills the horizon BEYOND the grid, so it can never occlude the
+    // in-grid seabed — that occlusion (a fixed-Y plane under the whole grid cutting the
+    // sloped seabed) was the hard straight "deep ocean starts" blue line. Opaque deep-ocean
+    // colour matched to the simulated deep water; distance fog blends it to sky at the horizon.
+    const half = FLAT.worldSize * 0.5;
+    const inner = half - 0.25; // tuck just under the grid's edge water so there is no gap seam
+    const outer = FLAT.worldSize * 30; // effectively the horizon
+    const seaY = FLAT.seaLevel * FLAT.heightScale;
+    const shape = new Shape();
+    shape.moveTo(-outer, -outer);
+    shape.lineTo(outer, -outer);
+    shape.lineTo(outer, outer);
+    shape.lineTo(-outer, outer);
+    const hole = new Path();
+    hole.moveTo(-inner, -inner);
+    hole.lineTo(-inner, inner);
+    hole.lineTo(inner, inner);
+    hole.lineTo(inner, -inner);
+    shape.holes.push(hole);
+    const ocean = new Mesh(new ShapeGeometry(shape), new MeshBasicMaterial({ color: 0x1b5278, side: DoubleSide }));
+    ocean.rotation.x = -Math.PI / 2; // XY shape -> XZ ground plane, facing up
+    ocean.position.y = seaY;
     ocean.renderOrder = -2;
+    ocean.frustumCulled = false;
     this.scene.add(ocean);
   }
 

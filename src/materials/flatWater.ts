@@ -46,9 +46,23 @@ export function makeFlatWater(
   const depthB = bicubicClamped((c: any) => textureLoad(waterTex, c).x, fx, fy.sub(2));
   const depthT = bicubicClamped((c: any) => textureLoad(waterTex, c).x, fx, fy.add(2));
   const depthGradient = length(vec2(depthR.sub(depthL), depthT.sub(depthB)));
+  // Wide spatial blur of depth, used ONLY for the deep color/opacity cues. The bathymetric
+  // shelf is steep (depth jumps over a few cells), so any sharp depth->color/opacity ramp
+  // draws a hard line right there. Averaging depth over a wide kernel spreads that transition
+  // smoothly across the surface. `depthColor` stays CRISP in the shallows (clean waterline +
+  // caustics + foam keep their sharp `depth`) and blends to the blurred field in deeper water.
+  const dW = (ox: number, oy: number) => bilinear((c: any) => textureLoad(waterTex, c).x, fx.add(ox), fy.add(oy));
+  const depthWide = dW(11, 0).add(dW(-11, 0)).add(dW(0, 11)).add(dW(0, -11))
+    .add(dW(8, 8)).add(dW(-8, 8)).add(dW(8, -8)).add(dW(-8, -8)).mul(1 / 8);
+  const depthColor = mix(depth, depthWide, smoothstep(0.02, 0.12, depth));
   const vel = bilinear((c: any) => textureLoad(velTex, c).xy, fx, fy);
   const flux = bilinear((c: any) => textureLoad(fluxTex, c), fx, fy);
-  const sediment = bilinear((c: any) => textureLoad(sedimentTex, c).x, fx, fy);
+  // Center-weighted blur of sediment so muddy plumes have SOFT edges that merge into the
+  // ocean, instead of hard-contrast shapes. (Turbidity ramp below is also widened.)
+  const sed = (ox: number, oy: number) => bilinear((c: any) => textureLoad(sedimentTex, c).x, fx.add(ox), fy.add(oy));
+  const sediment = sed(0, 0).mul(0.36)
+    .add(sed(3, 0).add(sed(-3, 0)).add(sed(0, 3)).add(sed(0, -3)).mul(0.11))
+    .add(sed(5, 5).add(sed(-5, 5)).add(sed(5, -5)).add(sed(-5, -5)).mul(0.05));
   const speed = length(vec2(vel.x, vel.y));
   // Use the production solver's actual outgoing discharge for visual direction.
   // Reconstructed velocity can point upstream around confluences and obstacles;
@@ -87,13 +101,16 @@ export function makeFlatWater(
   const bed = bilinear((c: any) => textureLoad(heightTex, c).x, fx, fy);
   const oceanMask = float(1).sub(smoothstep(flatSeaLevel.sub(0.03), flatSeaLevel, bed));
   const still = float(1).sub(smoothstep(0.03, 0.3, speed));
-  const flatWater = float(1).sub(smoothstep(0.006, 0.045, depthGradient));
   // Open-ocean stylized swell: long rolling crest lines along a fixed wind direction,
   // plus a finer cross-chop. One COHERENT wave drives both the surface normal (travelling
   // glints) and crest/trough shading (below) so the ocean reads as moving water instead of
   // a flat sheet. Gated to genuine ocean depth (not the breaker-zone shoreline) so it can't
   // bleed onto land water / rivers.
-  const deepOcean = oceanMask.mul(smoothstep(0.03, 0.13, depth)).mul(still).mul(flatWater).mul(oceanSwellEnabled);
+  // WIDE depth fade-in (not 0.03->0.13): a narrow onset made the swell appear abruptly just
+  // past the bathymetric shelf -> a visible line where "deep ocean starts". oceanMask already
+  // restricts to real ocean, so the flatWater(depth-gradient) gate is dropped here — at the
+  // steep shelf that gate notched to 0 and helped draw the very edge we're trying to remove.
+  const deepOcean = oceanMask.mul(smoothstep(0.015, 0.32, depthColor)).mul(still).mul(oceanSwellEnabled);
   const swellDir = normalize(vec2(0.82, 0.57));
   const swellPhase = dot(posXZ, swellDir).mul(1.05).sub(time.mul(0.5));
   const chopPhase = dot(posXZ, vec2(swellDir.y.mul(-1), swellDir.x)).mul(2.3).add(time.mul(0.7));
@@ -113,8 +130,8 @@ export function makeFlatWater(
   // shallow = light turquoise (over bright seabed), deepening to dark blue further out.
   // DEEP is reached by a moderate depth so the OPEN ocean genuinely darkens (was staying
   // mid-turquoise while fresnel lit the distance -> looked inverted).
-  let col: any = mix(SHALLOW, MID, smoothstep(0.01, 0.1, depth));
-  col = mix(col, DEEP, smoothstep(0.08, 0.3, depth));
+  let col: any = mix(SHALLOW, MID, smoothstep(0.008, 0.1, depthColor));
+  col = mix(col, DEEP, smoothstep(0.06, 0.32, depthColor)); // tight enough that deep reads DARK
   // Rolling crest/trough shading from the coherent swell breaks the homogeneous deep-blue
   // sheet: crests catch sky light, troughs deepen. Stylized whitecaps fleck the steepest
   // crests in open water. All gated to deepOcean so shallows/land water are untouched.
@@ -138,9 +155,9 @@ export function makeFlatWater(
   const causticA = float(1).sub(smoothstep(0.035, 0.2, sin(causticPhaseA).abs()));
   const causticB = float(1).sub(smoothstep(0.04, 0.22, sin(causticPhaseB).abs()));
   const caustics = max(causticA, causticB.mul(0.75));
-  // Wider + brighter than before so caustics genuinely read across the clear shelf the
-  // softened opacity now exposes, not just a thin sliver at the waterline.
-  const shallowOcean = oceanMask.mul(float(1).sub(smoothstep(0.06, 0.24, depth)));
+  // SHARP depth + tight fade so caustics live only in the genuine shallows and disappear in
+  // deep water (a blurred/wide fade made them shimmer across the whole ocean).
+  const shallowOcean = oceanMask.mul(float(1).sub(smoothstep(0.04, 0.16, depth)));
   col = col.add(vec3(0.22, 0.48, 0.42).mul(caustics).mul(shallowOcean).mul(causticsEnabled).mul(0.09));
   const concentration = sediment.div(max(depth, float(0.003)));
   // WIDE, gentle ramps everywhere on the turbidity path. The previous tight thresholds,
@@ -183,7 +200,7 @@ export function makeFlatWater(
   // sky-washed lighter, or the distant/grazing open ocean reads lighter than the shallows
   // (inverted). Fade fresnel out with depth so deep stays dark; shallows keep their sheen.
   const fres = pow(float(1).sub(max(float(0), dot(nW, viewW))), float(4));
-  const fresDeepFade = float(1).sub(smoothstep(0.06, 0.22, depth));
+  const fresDeepFade = float(1).sub(smoothstep(0.04, 0.34, depthColor));
   col = mix(col, SKY_REFLECT, fres.mul(0.12).mul(fresDeepFade).mul(float(1).sub(turbidity.mul(0.75))));
   // sun specular glint (Blinn-Phong, additive sparkle).
   const half = normalize(sunDirUniform.add(viewW));
@@ -245,7 +262,11 @@ export function makeFlatWater(
   // depth ramp so the steep bathymetric shelf no longer maps to a hard transparent->opaque
   // CUT (the visible edge). Capped below full opacity so the dark deep seabed keeps showing
   // through -> the depth darkening comes from BOTH water tint and the seabed gradient.
-  const oceanOpacity = smoothstep(0.004, 0.25, depth).mul(0.46).add(0.28);
+  // Floor keeps shallows see-through (seabed + caustics); moderate cap so the dark deep
+  // SEABED shows through and supplies the deep-blue (no opaque plane under the grid anymore
+  // — the ocean continuation is now a frame around the grid, so deep water just reveals the
+  // dark seabed). depthColor (blurred) keeps the shallow->deep ramp smooth across the shelf.
+  const oceanOpacity = smoothstep(0.004, 0.34, depthColor).mul(0.46).add(0.28);
   // foam (shoreline + rapids) stays opaque even over transparent shallows so it reads.
   // Gate EVERYTHING by water presence so dry land is fully transparent (no phantom
   // water/foam painted over terrain).

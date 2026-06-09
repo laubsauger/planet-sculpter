@@ -114,13 +114,16 @@ export function makeFlatTerrain(
   // Band hugs the waterline: top creeps only a few thousandths ABOVE sea level so the wet
   // sand meets the wave/foam zone instead of floating a wide stripe up the dry beach.
   const shoreNoise = mx_noise_float(p.mul(5.0)).mul(0.002);
-  const reachA = mix(float(0.0), float(0.004), sin(time.mul(0.9)).mul(0.5).add(0.5));
-  const reachB = mix(float(0.002), float(0.007), sin(time.mul(1.5).add(1.3)).mul(0.5).add(0.5));
+  // Band sits IN the wave-wash zone: from just under the waterline (where the foam laps) to
+  // only a hair above it. Top barely clears sea level so the wet sand visually connects to
+  // the approaching waves instead of floating a stripe up the dry beach.
+  const reachA = mix(float(-0.006), float(-0.001), sin(time.mul(0.9)).mul(0.5).add(0.5));
+  const reachB = mix(float(-0.004), float(0.002), sin(time.mul(1.5).add(1.3)).mul(0.5).add(0.5));
   const wetLine = max(
     smoothstep(reachA.add(shoreNoise), reachA.sub(float(0.004)), above),
     smoothstep(reachB.add(shoreNoise), reachB.sub(float(0.004)), above).mul(0.7),
   );
-  const nearShore = smoothstep(float(-0.012), float(-0.002), above); // hug the waterline, fade up
+  const nearShore = smoothstep(float(-0.028), float(-0.01), above); // reach under the waterline into the wash
   const lapWet = wetLine.mul(nearShore).min(float(1)).mul(shoreWetEnabled);
   albedo = albedo.mul(mix(float(1), float(0.74), lapWet));
 
