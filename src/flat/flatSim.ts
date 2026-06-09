@@ -498,6 +498,9 @@ function flatErosion(
         .add(fAt(ix, iy.add(1)).w)
         .add(fAt(ix, iy.sub(1)).z);
       const throughFlow = min(inflow, outflow);
+      const netOut = length(vec2(selfFlux.y.sub(selfFlux.x), selfFlux.z.sub(selfFlux.w)));
+      const flowCoherence = netOut.div(max(outflow, float(EPS))).min(float(1));
+      const directionalFlow = smoothstep(float(0.32), float(0.78), flowCoherence);
       // A newly wetted front can report high velocity while having no downstream
       // receiver yet. Eroding there digs a bowl before the river has had a chance
       // to advance. Require actual water passing through the cell and into already
@@ -583,7 +586,11 @@ function flatErosion(
       const erodeBase = max(float(0), capacity.sub(sc)).mul(u.dissolve).mul(softness)
         .mul(hard).mul(erodeGate).mul(coherentFlow).mul(channelNoise).mul(bedIncision);
       const gentle = float(1).sub(smoothstep(float(0.05), float(0.18), tilt));
-      const lateral = discharge.mul(float(1).sub(align)).mul(gentle).mul(u.lateralErosion).mul(softness).mul(hard).mul(erodeGate);
+      // Lateral cutting needs a coherent current striking a bank. Broad ocean
+      // slosh has plenty of opposing pipe flux and an arbitrary velocity vector;
+      // treating that as cross-slope shear planes loose delta fronts smooth.
+      const lateral = discharge.mul(float(1).sub(align)).mul(gentle).mul(u.lateralErosion)
+        .mul(softness).mul(hard).mul(erodeGate).mul(directionalFlow);
       // NO-SINK: never carve a cell below its LOWEST neighbor. A closed pit (lower
       // than all neighbors) traps water + sediment -> flow stalls -> it deposits a bar
       // it can never cut back through (the "digs in after the drop then dams itself"
@@ -611,8 +618,6 @@ function flatErosion(
       // into several outlets, the flow loses coherence and bars can nucleate. This
       // applies equally to floodplains, lakes, and ocean shelves.
       const carriedLoad = smoothstep(float(0.00015), float(0.0025), inflow);
-      const netOut = length(vec2(selfFlux.y.sub(selfFlux.x), selfFlux.z.sub(selfFlux.w)));
-      const flowCoherence = netOut.div(max(outflow, float(EPS))).min(float(1));
       const spreading = float(1).sub(smoothstep(float(0.38), float(0.88), flowCoherence));
       const transportLoss = max(float(0), sc.sub(capCarry));
       const depositOpportunity = mix(float(0.12), float(1), spreading.mul(carriedLoad));
@@ -625,7 +630,10 @@ function flatErosion(
         .mul(mix(float(0.3), float(1), spreading));
       // Small persistent substrate variation seeds bars; once a bar forms, flow
       // splits around it and the hydraulic feedback can create distributaries.
-      const depositPreference = float(1).add(nMid.mul(0.1)).clamp(float(0.88), float(1.12));
+      // Deposition itself stays mostly hydraulic. Terrain resistance determines
+      // which bars survive subsequent erosion/slumping; only a restrained
+      // material-dependent settling variation avoids a perfectly uniform front.
+      const depositPreference = mix(float(0.94), float(1.06), float(1).sub(materialErodibility));
       const settling = sc.mul(u.stillDeposit).mul(settlingOpportunity).mul(depositPreference);
       // Preserve a thin transport layer in high-throughflow routes. Low-discharge
       // neighbors can still aggrade into bars; the active route remains wet enough
@@ -719,7 +727,16 @@ function flatSedimentTransport(d: StorageTexture, f: StorageTexture, s: StorageT
 }
 
 /** Conservative thermal slumping. Only mobile earth moves; rock stays fixed. */
-function flatThermal(b: StorageTexture, loose: StorageTexture, d: StorageTexture, bOut: StorageTexture, looseOut: StorageTexture, w: number, h: number): CN {
+function flatThermal(
+  b: StorageTexture,
+  loose: StorageTexture,
+  d: StorageTexture,
+  hardness: StorageTexture,
+  bOut: StorageTexture,
+  looseOut: StorageTexture,
+  w: number,
+  h: number,
+): CN {
   const u = erosionUniforms;
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
@@ -732,9 +749,17 @@ function flatThermal(b: StorageTexture, loose: StorageTexture, d: StorageTexture
       // a cell holds, the lower its talus -> deposited deltas push outward instead of
       // piling up vertically.
       const looseFrac = sourceLoose.div(u.looseFull).min(float(1));
+      // Reuse the persistent hardness field as within-medium cohesion/resistance.
+      // Harder patches of the same loose material slump less, survive longer, and
+      // redirect flow; softer neighbors spread and erode, producing emergent bars
+      // and distributaries without a delta-specific shape pattern.
+      const materialCohesion = smoothstep(float(0.3), float(1.65), at(hardness, sx, sy));
+      const cohesion = materialCohesion.clamp(float(0), float(1));
       // Deposited sand/silt has a much shallower angle of repose than rock.
-      // Deep loose deposits approach a broad alluvial slope instead of a cliff.
-      const talusEff = u.talus.mul(float(1).sub(looseFrac.mul(0.9)));
+      // It must not approach a perfectly flat sheet, though: persistent cohesion
+      // differences preserve bars and islets while adjacent loose material fans.
+      const looseTalusScale = mix(float(0.22), float(0.58), cohesion);
+      const talusEff = u.talus.mul(mix(float(1), looseTalusScale, looseFrac));
       const request = (nx: any, ny: any, distance: number) =>
         max(float(0), sourceHeight.sub(at(b, nx, ny)).sub(talusEff.mul(distance)));
       const total = request(sx.sub(1), sy, 1).add(request(sx.add(1), sy, 1))
@@ -743,12 +768,16 @@ function flatThermal(b: StorageTexture, loose: StorageTexture, d: StorageTexture
         .add(request(sx.add(1), sy.sub(1), Math.SQRT2))
         .add(request(sx.sub(1), sy.add(1), Math.SQRT2))
         .add(request(sx.add(1), sy.add(1), Math.SQRT2));
-      // bedrock channels stay suppressed underwater (don't heal flat), but LOOSE delta
-      // sediment keeps slumping underwater so it fans out instead of damming a plateau.
+      // Submerged grains can still avalanche, but water drag makes that much slower
+      // than dry collapse. Previously fully-loose sediment bypassed almost all wet
+      // suppression, so every erosion tick graded fresh delta bars into a smooth sheet.
       const wet = smoothstep(float(0), u.channelDepthRef, at(d, sx, sy));
-      const wetSuppress = wet.mul(0.85).mul(float(1).sub(looseFrac.mul(0.95)));
-      const looseSpread = mix(float(1), float(3.2), looseFrac);
-      const rate = u.thermalRate.mul(float(1).sub(wetSuppress)).mul(looseSpread).mul(u.simSpeed).mul(0.25);
+      const submergedMobility = mix(float(0.14), float(0.34), float(1).sub(cohesion));
+      const wetMobility = mix(float(1), submergedMobility, wet.mul(looseFrac));
+      const looseSpread = mix(float(1), mix(float(1.35), float(2.25), float(1).sub(cohesion)), looseFrac);
+      const cohesionHold = mix(float(1), mix(float(0.38), float(0.9), float(1).sub(cohesion)), looseFrac);
+      const rate = u.thermalRate.mul(wetMobility).mul(looseSpread)
+        .mul(cohesionHold).mul(u.simSpeed).mul(0.25);
       const scale = min(rate, sourceLoose.div(max(total, float(EPS))));
       return request(tx, ty, targetDistance).mul(scale);
     };
@@ -840,7 +869,7 @@ export class FlatSim {
       loC: buildGridCopy(this.loose.scratch, this.loose.main, w, h),
       sEC: buildGridCopy(this.sediment.scratch, this.sediment.main, w, h),
       actC: buildGridCopy(this.activity.scratch, this.activity.main, w, h),
-      thN: flatThermal(b, this.loose.main, this.water.main, height.scratch, this.loose.scratch, w, h),
+      thN: flatThermal(b, this.loose.main, this.water.main, hardness, height.scratch, this.loose.scratch, w, h),
       bTC: buildGridCopy(height.scratch, b, w, h),
       loTC: buildGridCopy(this.loose.scratch, this.loose.main, w, h),
     };
