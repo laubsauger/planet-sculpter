@@ -35,6 +35,17 @@ function coords(w: number) {
 const cX = (x: any, w: number) => x.toFloat().max(float(0)).min(float(w - 1)).toInt();
 const cY = (y: any, h: number) => y.toFloat().max(float(0)).min(float(h - 1)).toInt();
 
+/** Seed loose thickness plus its persistent cohesion mass. */
+function flatLooseSeed(seed: StorageTexture, hardness: StorageTexture, out: StorageTexture, w: number, h: number): CN {
+  const fn = Fn(() => {
+    const { x, y, ix, iy } = coords(w);
+    const amount = textureLoad(seed, ivec2(ix, iy)).x;
+    const cohesion = smoothstep(float(0.3), float(1.65), textureLoad(hardness, ivec2(ix, iy)).x);
+    textureStore(out, uvec2(x, y), vec4(amount, amount.mul(cohesion), 0, 1)).toWriteOnly();
+  });
+  return fn().compute(w * h) as CN;
+}
+
 /** Pipe outflow flux (L,R,T,B). */
 function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture, source: StorageTexture, fPrev: StorageTexture, fOut: StorageTexture, w: number, h: number): CN {
   const p = waterUniforms;
@@ -394,9 +405,10 @@ function flatMomentumSediment(
       const wet = depth.greaterThan(float(1e-5)).select(float(1), float(0));
       return vec3(depth, mom.x.mul(wet), mom.y.mul(wet));
     };
-    const concentration = (cx: any, cy: any) => {
+    const concentration = (cx: any, cy: any, material = false) => {
       const depth = textureLoad(d, ivec2(cX(cx, w), cY(cy, h))).x;
-      const mass = textureLoad(sediment, ivec2(cX(cx, w), cY(cy, h))).x;
+      const stored = textureLoad(sediment, ivec2(cX(cx, w), cY(cy, h)));
+      const mass = material ? stored.y : stored.x;
       return mass.div(max(depth, float(1e-5)));
     };
     const massFluxX = (left: any, right: any) => {
@@ -424,18 +436,24 @@ function flatMomentumSediment(
     const qR = massFluxX(c, r);
     const qB = massFluxY(bottom, c);
     const qT = massFluxY(c, top);
-    const sL = upwind(qL, concentration(ix.sub(1), iy), concentration(ix, iy));
-    const sR = upwind(qR, concentration(ix, iy), concentration(ix.add(1), iy));
-    const sB = upwind(qB, concentration(ix, iy.sub(1)), concentration(ix, iy));
-    const sT = upwind(qT, concentration(ix, iy), concentration(ix, iy.add(1)));
-    const current = textureLoad(sediment, ivec2(ix, iy)).x;
-    let next: any = max(current.sub(sR.sub(sL).add(sT.sub(sB)).mul(p.dt)), float(0));
+    const advect = (material: boolean) => {
+      const sL = upwind(qL, concentration(ix.sub(1), iy, material), concentration(ix, iy, material));
+      const sR = upwind(qR, concentration(ix, iy, material), concentration(ix.add(1), iy, material));
+      const sB = upwind(qB, concentration(ix, iy.sub(1), material), concentration(ix, iy, material));
+      const sT = upwind(qT, concentration(ix, iy, material), concentration(ix, iy.add(1), material));
+      const current = material ? textureLoad(sediment, ivec2(ix, iy)).y : textureLoad(sediment, ivec2(ix, iy)).x;
+      return max(current.sub(sR.sub(sL).add(sT.sub(sB)).mul(p.dt)), float(0));
+    };
+    let next: any = advect(false);
+    let nextMaterial: any = advect(true);
     const edgeDistance = min(
       min(ix.toFloat(), float(w - 1).sub(ix.toFloat())),
       min(iy.toFloat(), float(h - 1).sub(iy.toFloat())),
     );
-    next = next.mul(smoothstep(float(2), float(22), edgeDistance));
-    textureStore(sedimentOut, uvec2(x, y), vec4(next, 0, 0, 1)).toWriteOnly();
+    const edgeKeep = smoothstep(float(2), float(22), edgeDistance);
+    next = next.mul(edgeKeep);
+    nextMaterial = nextMaterial.mul(edgeKeep).min(next);
+    textureStore(sedimentOut, uvec2(x, y), vec4(next, nextMaterial, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
 }
@@ -464,12 +482,19 @@ function flatErosion(
     const { x, y, ix, iy } = coords(w);
     const bAt = (cx: any, cy: any) => textureLoad(b, ivec2(cX(cx, w), cY(cy, h))).x;
     const bc = textureLoad(b, ivec2(ix, iy)).x;
-    const lc = textureLoad(loose, ivec2(ix, iy)).x.min(bc);
-    const sc = textureLoad(s, ivec2(ix, iy)).x;
+    const looseState = textureLoad(loose, ivec2(ix, iy));
+    const sedimentState = textureLoad(s, ivec2(ix, iy));
+    const lc = looseState.x.min(bc);
+    const looseMaterial = looseState.y.min(lc);
+    const sc = sedimentState.x;
+    const sedimentMaterial = sedimentState.y.min(sc);
+    const sedimentCohesion = sedimentMaterial.div(max(sc, float(EPS))).clamp(float(0), float(1));
     const dc = textureLoad(d, ivec2(ix, iy)).x;
     const bNew: any = bc.toVar();
     const looseNew: any = lc.toVar();
     const sNew: any = sc.toVar();
+    const looseMaterialNew: any = looseMaterial.toVar();
+    const sedimentMaterialNew: any = sedimentMaterial.toVar();
     const activityPrev = textureLoad(activity, ivec2(ix, iy));
     const erodeViz: any = activityPrev.x.mul(u.vizDecay).toVar();
     const depositViz: any = activityPrev.y.mul(u.vizDecay).toVar();
@@ -568,6 +593,7 @@ function flatErosion(
         .add(float(1).sub(materialErodibility).mul(0.28))
         .add(hardnessVariation.mul(0.48))
         .clamp(float(0), float(1));
+      const carriedMaterial = mix(depositAnchoring, sedimentCohesion, smoothstep(float(1e-5), float(0.01), sc));
       // Water must establish and transport before terrain visibly moves. A shared
       // 0.0006 cap let five erosion ticks per second cut a deep trench in seconds.
       // Keep incision deliberately slower than loose-sediment deposition; simSpeed
@@ -576,12 +602,12 @@ function flatErosion(
       // Bedrock incision is slow, but recently deposited/mobile earth must be easy
       // for established flow to rework. A shared low cap made delta bars seal the
       // outlet faster than water could cut distributaries through them.
-      const ERODE_CAP = mix(float(0.00022), float(0.00062), looseFrac).mul(u.simSpeed);
+      const ERODE_CAP = mix(float(0.00009), float(0.00034), looseFrac).mul(u.simSpeed);
       // A saturated depositional front must not advance by the exact same amount
       // in every cell. Persistent substrate resistance changes how readily loose
       // material anchors, so some bars survive while adjacent cells keep routing.
       const DEPOSIT_CAP = float(0.00045).mul(u.simSpeed)
-        .mul(mix(float(0.35), float(1.35), depositAnchoring));
+        .mul(mix(float(0.35), float(1.35), carriedMaterial));
       const erodeGate = speed.greaterThan(u.erodeSpeedMin).select(float(1), float(0))
         .mul(notSource).mul(establishedFlow);
       const dh = vec2(dbx, dby).mul(-1).add(vec2(1e-5, 1e-5));
@@ -640,9 +666,10 @@ function flatErosion(
         float(0.025),
         incomingDrop.sub(outgoingDrop.mul(1.35)),
       ).mul(directionalFlow);
-      const gradeBreakBrake = float(1).sub(gradeBreak.mul(0.88));
-      const looseChannelAllowance = max(float(0), bc.sub(routedBed)).add(float(0.0035))
-        .mul(looseFrac).mul(directionalFlow);
+      const gradeBreakBrake = float(1).sub(gradeBreak.mul(0.98));
+      const looseChannelAllowance = max(float(0), bc.sub(routedBed)).add(float(0.0012))
+        .mul(looseFrac).mul(directionalFlow)
+        .mul(smoothstep(float(0.0002), float(0.004), outgoingDrop));
       const incisionLimit = max(noSink, looseChannelAllowance);
       // Once a channel is materially below its banks, stop vertical incision and
       // let its discharge continue downstream. Without this brake, every tick lowers
@@ -650,7 +677,7 @@ function flatErosion(
       const bankMean = bAt(ix.add(1), iy).add(bAt(ix.sub(1), iy))
         .add(bAt(ix, iy.add(1))).add(bAt(ix, iy.sub(1))).mul(0.25);
       const incisionDepth = max(float(0), bankMean.sub(bc));
-      const incisionBrake = float(1).sub(smoothstep(float(0.008), float(0.035), incisionDepth));
+      const incisionBrake = float(1).sub(smoothstep(float(0.003), float(0.016), incisionDepth));
       const erode = erodeBase.add(looseRework).mul(gradeBreakBrake).add(lateral.mul(incisionBrake))
         .mul(depthSuppress).mul(incisionBrake).mul(u.simSpeed).min(ERODE_CAP).min(incisionLimit)
         .mul(hydraulicErosionEnabled);
@@ -668,7 +695,7 @@ function flatErosion(
       const carriedLoad = smoothstep(float(0.00015), float(0.0025), inflow);
       const spreading = float(1).sub(smoothstep(float(0.38), float(0.88), flowCoherence));
       const transportLoss = max(float(0), sc.sub(capCarry));
-      const depositOpportunity = mix(float(0.12), float(1), spreading.mul(carriedLoad));
+      const depositOpportunity = mix(float(0.025), float(1), spreading.mul(carriedLoad));
       // Settling fraction is larger in shallow, slow water because grains have a
       // shorter distance to the bed. The previous rule increased settling with
       // depth, carrying sediment past shallow fans and dumping it offshore.
@@ -681,12 +708,12 @@ function flatErosion(
       // Material anchoring is strong enough to prevent a saturated receiving-water
       // front from advancing as one row, while flow still decides where sediment
       // arrives and whether it has lost carrying power.
-      const depositPreference = mix(float(0.42), float(1.28), depositAnchoring);
+      const depositPreference = mix(float(0.42), float(1.28), carriedMaterial);
       const settling = sc.mul(u.stillDeposit).mul(settlingOpportunity).mul(depositPreference);
       // Preserve a thin transport layer in high-throughflow routes. Low-discharge
       // neighbors can still aggrade into bars; the active route remains wet enough
       // to carry sediment, split around bars, and avulse naturally.
-      const channelClearance = smoothstep(float(0.00025), float(0.003), throughFlow).mul(0.006);
+      const channelClearance = smoothstep(float(0.0002), float(0.0025), throughFlow).mul(0.016);
       const availableWaterColumn = max(float(0), dc.sub(channelClearance));
       const dep = max(
         transportLoss.mul(u.deposit).mul(u.simSpeed).mul(depositOpportunity).mul(depositPreference),
@@ -695,12 +722,19 @@ function flatErosion(
       bNew.assign(max(bc.sub(erode).add(dep), float(0)));
       looseNew.assign(max(lc.sub(erode), float(0)).add(dep));
       sNew.assign(max(float(0), sc.add(erode).sub(dep)).min(float(2)));
+      const looseRemoved = min(erode, lc);
+      const bedrockRemoved = max(float(0), erode.sub(looseRemoved));
+      const looseCohesion = looseMaterial.div(max(lc, float(EPS))).clamp(float(0), float(1));
+      const erodedMaterial = looseRemoved.mul(looseCohesion).add(bedrockRemoved.mul(depositAnchoring));
+      const depositedMaterial = dep.mul(sedimentCohesion);
+      looseMaterialNew.assign(max(float(0), looseMaterial.sub(looseRemoved.mul(looseCohesion)).add(depositedMaterial)));
+      sedimentMaterialNew.assign(max(float(0), sedimentMaterial.add(erodedMaterial).sub(depositedMaterial)));
       erodeViz.assign(max(erodeViz, erode.div(ERODE_CAP)));
       depositViz.assign(max(depositViz, dep.div(DEPOSIT_CAP)));
     });
     textureStore(bOut, uvec2(x, y), vec4(bNew, 0, 0, 1)).toWriteOnly();
-    textureStore(looseOut, uvec2(x, y), vec4(looseNew, 0, 0, 1)).toWriteOnly();
-    textureStore(sOut, uvec2(x, y), vec4(sNew, 0, 0, 1)).toWriteOnly();
+    textureStore(looseOut, uvec2(x, y), vec4(looseNew, min(looseMaterialNew, looseNew), 0, 1)).toWriteOnly();
+    textureStore(sOut, uvec2(x, y), vec4(sNew, min(sedimentMaterialNew, sNew), 0, 1)).toWriteOnly();
     textureStore(activityOut, uvec2(x, y), vec4(erodeViz, depositViz, wetViz, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
@@ -736,40 +770,57 @@ function flatSedimentTransport(d: StorageTexture, f: StorageTexture, s: StorageT
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
     const at = (tex: StorageTexture, cx: any, cy: any) => textureLoad(tex, ivec2(cX(cx, w), cY(cy, h)));
-    const conc = (cx: any, cy: any) => at(s, cx, cy).x.div(max(at(d, cx, cy).x, float(EPS)));
+    const conc = (cx: any, cy: any, material = false) => {
+      const stored = at(s, cx, cy);
+      return (material ? stored.y : stored.x).div(max(at(d, cx, cy).x, float(EPS)));
+    };
     const selfF = at(f, ix, iy);
-    const sc = at(s, ix, iy).x;
+    const sediment = at(s, ix, iy);
     const volumeScale = p.dt.div(p.pipeLength.mul(p.pipeLength));
     const outgoingWater = selfF.x.add(selfF.y).add(selfF.z).add(selfF.w).mul(volumeScale);
-    const outgoingSediment = min(sc, outgoingWater.mul(conc(ix, iy)));
 
     const mL = ix.greaterThan(int(0)).select(float(1), float(0));
     const mR = ix.lessThan(int(w - 1)).select(float(1), float(0));
     const mT = iy.lessThan(int(h - 1)).select(float(1), float(0));
     const mB = iy.greaterThan(int(0)).select(float(1), float(0));
-    const incomingSediment = at(f, ix.sub(1), iy).y.mul(conc(ix.sub(1), iy)).mul(mL)
-      .add(at(f, ix.add(1), iy).x.mul(conc(ix.add(1), iy)).mul(mR))
-      .add(at(f, ix, iy.add(1)).w.mul(conc(ix, iy.add(1))).mul(mT))
-      .add(at(f, ix, iy.sub(1)).z.mul(conc(ix, iy.sub(1))).mul(mB))
-      .mul(volumeScale);
-    let next: any = max(float(0), sc.sub(outgoingSediment).add(incomingSediment));
+    const transport = (material: boolean) => {
+      const stored = material ? sediment.y : sediment.x;
+      const outgoing = min(stored, outgoingWater.mul(conc(ix, iy, material)));
+      const incoming = at(f, ix.sub(1), iy).y.mul(conc(ix.sub(1), iy, material)).mul(mL)
+        .add(at(f, ix.add(1), iy).x.mul(conc(ix.add(1), iy, material)).mul(mR))
+        .add(at(f, ix, iy.add(1)).w.mul(conc(ix, iy.add(1), material)).mul(mT))
+        .add(at(f, ix, iy.sub(1)).z.mul(conc(ix, iy.sub(1), material)).mul(mB))
+        .mul(volumeScale);
+      return max(float(0), stored.sub(outgoing).add(incoming));
+    };
+    let next: any = transport(false);
+    let nextMaterial: any = transport(true);
     // Symmetric pairwise mixing feathers suspended river plumes after they enter
     // deeper receiving water. Using min(gateC, gateNeighbor) gives both cells the
     // same pair coefficient, so each exchange remains conservative.
     const mixGate = (cx: any, cy: any) => smoothstep(float(0.025), float(0.14), at(d, cx, cy).x).mul(0.018);
     const gateC = mixGate(ix, iy);
-    const diffusePair = (nx: any, ny: any) => at(s, nx, ny).x.sub(sc).mul(min(gateC, mixGate(nx, ny)));
-    const plumeMix = diffusePair(ix.sub(1), iy).add(diffusePair(ix.add(1), iy))
-      .add(diffusePair(ix, iy.sub(1))).add(diffusePair(ix, iy.add(1)));
-    next = max(float(0), next.add(plumeMix));
+    const diffuse = (material: boolean) => {
+      const current = material ? sediment.y : sediment.x;
+      const diffusePair = (nx: any, ny: any) => {
+        const neighbor = at(s, nx, ny);
+        return (material ? neighbor.y : neighbor.x).sub(current).mul(min(gateC, mixGate(nx, ny)));
+      };
+      return diffusePair(ix.sub(1), iy).add(diffusePair(ix.add(1), iy))
+        .add(diffusePair(ix, iy.sub(1))).add(diffusePair(ix, iy.add(1)));
+    };
+    next = max(float(0), next.add(diffuse(false)));
+    nextMaterial = max(float(0), nextMaterial.add(diffuse(true)));
     // Suspended material reaching the open-ocean edge leaves the modeled scenario.
     // Otherwise clamped edge sampling builds an unphysical sediment perimeter.
     const edgeDistance = min(
       min(ix.toFloat(), float(w - 1).sub(ix.toFloat())),
       min(iy.toFloat(), float(h - 1).sub(iy.toFloat())),
     );
-    next = next.mul(smoothstep(float(2), float(22), edgeDistance));
-    textureStore(sOut, uvec2(x, y), vec4(next, 0, 0, 1)).toWriteOnly();
+    const edgeKeep = smoothstep(float(2), float(22), edgeDistance);
+    next = next.mul(edgeKeep);
+    nextMaterial = nextMaterial.mul(edgeKeep).min(next);
+    textureStore(sOut, uvec2(x, y), vec4(next, nextMaterial, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
 }
@@ -788,7 +839,12 @@ function flatThermal(
   const u = erosionUniforms;
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
-    const at = (tex: StorageTexture, cx: any, cy: any) => textureLoad(tex, ivec2(cX(cx, w), cY(cy, h))).x;
+    const sample = (tex: StorageTexture, cx: any, cy: any) => textureLoad(tex, ivec2(cX(cx, w), cY(cy, h)));
+    const at = (tex: StorageTexture, cx: any, cy: any) => sample(tex, cx, cy).x;
+    const looseCohesionAt = (cx: any, cy: any) => {
+      const state = sample(loose, cx, cy);
+      return state.y.div(max(state.x, float(EPS))).clamp(float(0), float(1));
+    };
     const transfer = (sx: any, sy: any, tx: any, ty: any, targetDistance: number) => {
       const sourceHeight = at(b, sx, sy);
       const sourceLoose = at(loose, sx, sy);
@@ -801,8 +857,8 @@ function flatThermal(
       // Harder patches of the same loose material slump less, survive longer, and
       // redirect flow; softer neighbors spread and erode, producing emergent bars
       // and distributaries without a delta-specific shape pattern.
-      const materialCohesion = smoothstep(float(0.3), float(1.65), at(hardness, sx, sy));
-      const cohesion = materialCohesion.clamp(float(0), float(1));
+      const substrateCohesion = smoothstep(float(0.3), float(1.65), at(hardness, sx, sy));
+      const cohesion = mix(substrateCohesion, looseCohesionAt(sx, sy), looseFrac).clamp(float(0), float(1));
       // Deposited sand/silt has a much shallower angle of repose than rock.
       // It must not approach a perfectly flat sheet, though: persistent cohesion
       // differences preserve bars and islets while adjacent loose material fans.
@@ -827,7 +883,8 @@ function flatThermal(
       const rate = u.thermalRate.mul(wetMobility).mul(looseSpread)
         .mul(cohesionHold).mul(u.simSpeed).mul(0.25);
       const scale = min(rate, sourceLoose.div(max(total, float(EPS))));
-      return request(tx, ty, targetDistance).mul(scale);
+      const amount = request(tx, ty, targetDistance).mul(scale);
+      return vec2(amount, amount.mul(cohesion));
     };
 
     const outflow = transfer(ix, iy, ix.sub(1), iy, 1)
@@ -848,9 +905,13 @@ function flatThermal(
       .add(transfer(ix.add(1), iy.add(1), ix, iy, Math.SQRT2));
     const delta = inflow.sub(outflow);
     const c = at(b, ix, iy);
-    const lc = at(loose, ix, iy);
-    textureStore(bOut, uvec2(x, y), vec4(max(c.add(delta), float(0)), 0, 0, 1)).toWriteOnly();
-    textureStore(looseOut, uvec2(x, y), vec4(max(lc.add(delta), float(0)), 0, 0, 1)).toWriteOnly();
+    const looseState = sample(loose, ix, iy);
+    const lc = looseState.x;
+    const looseMaterial = looseState.y;
+    textureStore(bOut, uvec2(x, y), vec4(max(c.add(delta.x), float(0)), 0, 0, 1)).toWriteOnly();
+    const nextLoose = max(lc.add(delta.x), float(0));
+    const nextMaterial = max(looseMaterial.add(delta.y), float(0)).min(nextLoose);
+    textureStore(looseOut, uvec2(x, y), vec4(nextLoose, nextMaterial, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
 }
@@ -877,13 +938,13 @@ export class FlatSim {
   private readonly srcN: CN;
   private readonly srcC: CN;
 
-  constructor(private readonly renderer: WebGPURenderer, private readonly height: GridField, looseSeed: any, hardness: any, readonly w: number, readonly h: number) {
+  constructor(private readonly renderer: WebGPURenderer, private readonly height: GridField, looseSeed: any, private readonly hardness: any, readonly w: number, readonly h: number) {
     this.water = new GridField(w, h);
     this.flux = new GridField(w, h, true);
     this.momentum = new GridField(w, h, true);
     this.velocity = new GridField(w, h, true);
-    this.sediment = new GridField(w, h);
-    this.loose = new GridField(w, h);
+    this.sediment = new GridField(w, h, true);
+    this.loose = new GridField(w, h, true);
     this.source = new GridField(w, h);
     this.activity = new GridField(w, h, true);
     renderer.compute(buildGridFill(this.water.main, w, h, 0));
@@ -892,7 +953,8 @@ export class FlatSim {
     renderer.compute(buildGridFill(this.sediment.main, w, h, 0));
     renderer.compute(buildGridFill(this.source.main, w, h, 0));
     renderer.compute(buildGridFill(this.activity.main, w, h, 0));
-    renderer.compute(buildGridSeed(looseSeed, this.loose.main, w, h));
+    renderer.compute(flatLooseSeed(looseSeed, hardness, this.loose.main, w, h));
+    renderer.compute(flatLooseSeed(looseSeed, hardness, this.loose.scratch, w, h));
     const b = height.main;
     this.nodes = {
       fluxN: flatFlux(b, this.water.main, this.sediment.main, this.source.main, this.flux.main, this.flux.scratch, w, h),
@@ -909,7 +971,7 @@ export class FlatSim {
       momSedC: buildGridCopy(this.sediment.scratch, this.sediment.main, w, h),
       momVelN: flatMomentumVelocity(this.momentum.main, this.water.main, this.velocity.scratch, w, h),
       momVelC: buildGridCopy(this.velocity.scratch, this.velocity.main, w, h),
-      eroN: flatErosion(b, this.loose.main, this.sediment.main, this.velocity.main, this.water.main, this.flux.main, hardness, this.source.main, this.activity.main, height.scratch, this.loose.scratch, this.sediment.scratch, this.activity.scratch, w, h),
+      eroN: flatErosion(b, this.loose.main, this.sediment.main, this.velocity.main, this.water.main, this.flux.main, this.hardness, this.source.main, this.activity.main, height.scratch, this.loose.scratch, this.sediment.scratch, this.activity.scratch, w, h),
       // Surface-preserving water settle: reads OLD bed (b) + NEW bed (height.scratch) +
       // current d, writes compensated d to water.scratch. Runs before bC lands the bed.
       settleN: flatSurfaceSettle(b, height.scratch, this.water.main, this.water.scratch, w, h),
@@ -918,7 +980,7 @@ export class FlatSim {
       loC: buildGridCopy(this.loose.scratch, this.loose.main, w, h),
       sEC: buildGridCopy(this.sediment.scratch, this.sediment.main, w, h),
       actC: buildGridCopy(this.activity.scratch, this.activity.main, w, h),
-      thN: flatThermal(b, this.loose.main, this.water.main, hardness, height.scratch, this.loose.scratch, w, h),
+      thN: flatThermal(b, this.loose.main, this.water.main, this.hardness, height.scratch, this.loose.scratch, w, h),
       bTC: buildGridCopy(height.scratch, b, w, h),
       loTC: buildGridCopy(this.loose.scratch, this.loose.main, w, h),
     };
@@ -965,7 +1027,6 @@ export class FlatSim {
     this.tickCount = 0;
     for (const [seed, field] of [
       [state.height, this.height],
-      [state.loose, this.loose],
       [state.water, this.water],
       [state.sediment, this.sediment],
       [state.source, this.source],
@@ -973,6 +1034,8 @@ export class FlatSim {
       r.compute(buildGridSeed(seed, field.main, this.w, this.h));
       r.compute(buildGridSeed(seed, field.scratch, this.w, this.h));
     }
+    r.compute(flatLooseSeed(state.loose, this.hardness, this.loose.main, this.w, this.h));
+    r.compute(flatLooseSeed(state.loose, this.hardness, this.loose.scratch, this.w, this.h));
     for (const field of [this.flux, this.momentum, this.velocity, this.activity]) {
       r.compute(buildGridFill(field.main, this.w, this.h, 0));
       r.compute(buildGridFill(field.scratch, this.w, this.h, 0));

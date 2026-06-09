@@ -304,17 +304,17 @@ export class FlatEngine {
       copyTextureToBuffer(texture: unknown, x: number, y: number, w: number, h: number, face: number): Promise<{ readonly length: number; readonly [index: number]: number }>;
     };
     const backend = this.renderer.backend as unknown as ReadbackBackend;
-    const sum = async (field: GridField): Promise<number> => {
+    const sum = async (field: GridField, rgba = false): Promise<number> => {
       const data = await backend.copyTextureToBuffer(field.main, 0, 0, FLAT.gridW, FLAT.gridH, 0);
       let total = 0;
-      for (let i = 0; i < data.length; i++) total += Number(data[i]);
+      for (let i = 0; i < data.length; i += rgba ? 4 : 1) total += Number(data[i]);
       return total;
     };
     const [height, loose, water, sediment] = await Promise.all([
       sum(this.heightField),
-      sum(this.sim.loose),
+      sum(this.sim.loose, true),
       sum(this.sim.water),
-      sum(this.sim.sediment),
+      sum(this.sim.sediment, true),
     ]);
     const earth = height + sediment;
     const earthDelta = this.previousEarthMass === null ? 0 : earth - this.previousEarthMass;
