@@ -20,7 +20,12 @@ async function main(): Promise<void> {
     if (import.meta.env.DEV) {
       const { erosionUniforms } = await import('./sim/passes/erosion');
       const { waterUniforms } = await import('./sim/passes/water');
-      Object.assign(window as object, { engine, erosionUniforms, waterUniforms });
+      const { shoreWetEnabled } = await import('./materials/flatTerrain');
+      const fw = await import('./materials/flatWater');
+      Object.assign(window as object, {
+        engine, erosionUniforms, waterUniforms, shoreWetEnabled,
+        causticsEnabled: fw.causticsEnabled, shoreFoamEnabled: fw.shoreFoamEnabled, oceanSwellEnabled: fw.oceanSwellEnabled,
+      });
     }
   } catch (err) {
     console.error('Init failed:', err);

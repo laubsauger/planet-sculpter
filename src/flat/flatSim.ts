@@ -650,21 +650,25 @@ function flatErosion(
   return fn().compute(w * h) as CN;
 }
 
-/** Surface-preserving water settle. The erosion pass moves the bed (deposition raises,
- *  incision lowers) but leaves water depth untouched, so the free surface b+d jumps by
- *  the bed delta. The NEXT flux pass then reads that jump as hydraulic head and shoves
- *  water outward (incl. UPSTREAM) — a backfiring impulse opposite the flow, the cause of
- *  river weirdness near deltas. Suspended sediment occupies volume in the column, so
- *  settling/lifting it must NOT move the surface. Compensate d by -(bNew-bOld) to hold
- *  b+d invariant across the bed exchange. Reads OLD bed (b) + NEW bed (bNext, erosion's
- *  scratch output) before the bed copy lands. Kept a separate 1-write pass so erosion
- *  stays at the 4-storage-texture-per-stage WebGPU baseline. */
+/** Deposition-only surface settle. When the erosion pass DEPOSITS, the bed rises by `dep`
+ *  but water depth is untouched, so the free surface b+d jumps up; the NEXT flux pass reads
+ *  that jump as hydraulic head and shoves water outward (incl. UPSTREAM) — a backfiring
+ *  impulse opposite the flow (river weirdness near deltas). The deposited sediment occupies
+ *  the volume it settled into, so drop d by the SAME rise to hold b+d invariant -> flux sees
+ *  no bump.
+ *
+ *  CRITICAL: only compensate the deposition RISE (delta>0), never the incision drop. The
+ *  earlier two-sided version (d -= (bNew-bOld)) ADDED water on every eroding river cell each
+ *  tick; with net incision that injects water faster than it drains -> rivers swell and the
+ *  ocean creeps over the whole map. Removal-only can never create water -> no flood. Reads
+ *  OLD bed (b) + NEW bed (bNext, erosion's scratch output) before the bed copy lands. Kept a
+ *  separate 1-write pass so erosion stays at the 4-storage-texture-per-stage WebGPU baseline. */
 function flatSurfaceSettle(b: StorageTexture, bNext: StorageTexture, d: StorageTexture, dOut: StorageTexture, w: number, h: number): CN {
   const fn = Fn(() => {
     const { x, y, ix, iy } = coords(w);
     const dc = textureLoad(d, ivec2(ix, iy)).x;
-    const delta = textureLoad(bNext, ivec2(ix, iy)).x.sub(textureLoad(b, ivec2(ix, iy)).x);
-    textureStore(dOut, uvec2(x, y), vec4(max(dc.sub(delta), float(0)), 0, 0, 1)).toWriteOnly();
+    const rise = max(float(0), textureLoad(bNext, ivec2(ix, iy)).x.sub(textureLoad(b, ivec2(ix, iy)).x));
+    textureStore(dOut, uvec2(x, y), vec4(max(dc.sub(rise), float(0)), 0, 0, 1)).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
 }
@@ -784,6 +788,7 @@ export class FlatSim {
   readonly source: GridField;
   readonly activity: GridField; // rg: recent erosion/deposition
   erosionEnabled = false;
+  settleEnabled = true; // DEBUG: surface-preserving water settle after erosion
   momentumSubsteps = 1;
   private tickCount = 0;
   private _waterSolver: FlatWaterSolver = 'pipe';
@@ -926,7 +931,7 @@ export class FlatSim {
       r.compute(n.eroN);
       // settle reads OLD bed (still in height.main) + NEW bed (height.scratch) -> must run
       // before bC overwrites height.main; wEC then lands the compensated water depth.
-      r.compute(n.settleN); r.compute(n.wEC);
+      if (this.settleEnabled) { r.compute(n.settleN); r.compute(n.wEC); }
       r.compute(n.bC); r.compute(n.loC); r.compute(n.sEC); r.compute(n.actC);
       r.compute(n.thN);
       // Thermal slumping changes the bed after the hydraulic settle above. Preserve

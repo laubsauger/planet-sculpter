@@ -7,7 +7,7 @@ import { FrontSide, type Texture } from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
 import {
   textureLoad, uv, mix, smoothstep, max, float, vec3, normalize,
-  mx_noise_float, cameraViewMatrix, transformDirection, sin, time,
+  mx_noise_float, cameraViewMatrix, transformDirection, sin, time, uniform,
 } from 'three/tsl';
 import {
   flatSurface, bilinear, flatSeaLevel, flatGridX, flatGridY, detailFreq, detailStrength,
@@ -26,6 +26,10 @@ const SNOW = vec3(0.95, 0.96, 0.98);
 const WET_EARTH = vec3(0.42, 0.3, 0.18);
 const FRESH_CUT = vec3(0.34, 0.2, 0.11);
 const FRESH_DEPOSIT = vec3(0.76, 0.58, 0.31);
+const SEABED_SHALLOW = vec3(0.46, 0.66, 0.6); // sandy-turquoise just under the surface
+const SEABED_DEEP = vec3(0.05, 0.1, 0.16);    // dark cool deep-ocean floor
+// Debug A/B toggle: 0 disables the animated lapping wet-sand darkening entirely.
+export const shoreWetEnabled = uniform(1);
 
 export function makeFlatTerrain(
   heightTex: Texture,
@@ -97,10 +101,44 @@ export function makeFlatTerrain(
   // fading back to dry over a few seconds after runoff.
   albedo = albedo.mul(mix(float(1), float(0.7), activity.z.min(float(1))));
 
-  // Coastal sand band at the waterline + darker wet just under it.
+  // Coastal sand band at the waterline.
   const above = h.sub(flatSeaLevel);
   albedo = mix(albedo, SAND, smoothstep(0.035, 0.0, above.abs()).mul(0.7));
-  albedo = albedo.mul(mix(float(1), float(0.55), smoothstep(0.0, -0.06, above)));
+
+  // Lapping wet sand: a THIN wash band right at the waterline whose wet line creeps up the
+  // sand and recedes on a slow tide (two rhythms). Driven by the height-above-sea CONTOUR
+  // so it stays shore-parallel and thin, with only a tiny STATIC spatial warp. Deliberately
+  // NO time-animated 3D noise here: that smeared wandering "wet cloud" blobs across the
+  // whole lower slope (the green band sits just above sea level, inside the old wide band).
+  // `nearShore` clamps the band tight so it can never reach the grassy mid-slope.
+  // Band hugs the waterline: top creeps only a few thousandths ABOVE sea level so the wet
+  // sand meets the wave/foam zone instead of floating a wide stripe up the dry beach.
+  const shoreNoise = mx_noise_float(p.mul(5.0)).mul(0.002);
+  const reachA = mix(float(0.0), float(0.004), sin(time.mul(0.9)).mul(0.5).add(0.5));
+  const reachB = mix(float(0.002), float(0.007), sin(time.mul(1.5).add(1.3)).mul(0.5).add(0.5));
+  const wetLine = max(
+    smoothstep(reachA.add(shoreNoise), reachA.sub(float(0.004)), above),
+    smoothstep(reachB.add(shoreNoise), reachB.sub(float(0.004)), above).mul(0.7),
+  );
+  const nearShore = smoothstep(float(-0.012), float(-0.002), above); // hug the waterline, fade up
+  const lapWet = wetLine.mul(nearShore).min(float(1)).mul(shoreWetEnabled);
+  albedo = albedo.mul(mix(float(1), float(0.74), lapWet));
+
+  // Submerged seabed: smooth blend from sandy-turquoise shallows to a dark cool deep floor
+  // as the bed descends — a gradual depth ramp, NO step at the waterline, so there is no
+  // hard color edge where land meets sea. The transparent water tint sits on top of this.
+  const sub = max(float(0), above.mul(-1));
+  const shallowBed = mix(SAND, SEABED_SHALLOW, smoothstep(0.0, 0.03, sub).mul(0.85));
+  const seabed: any = mix(shallowBed, SEABED_DEEP, smoothstep(0.03, 0.26, sub));
+  // Underwater texture: sand ripples + broad mottling so the seabed reads as a real bottom,
+  // not a flat color ramp. Strongest in the clear shallows (visible through the water),
+  // fading out with depth where it would be invisible anyway.
+  const bedRipple = sin(p.x.mul(7.0).add(p.z.mul(2.6)).add(mx_noise_float(p.mul(1.8)).mul(2.0))).mul(0.5).add(0.5);
+  const bedMottle = mx_noise_float(p.mul(2.6).add(vec3(5, 0, 5))).mul(0.5).add(0.5);
+  const rippleFade = float(1).sub(smoothstep(0.03, 0.13, sub));
+  const seabedTex = seabed.mul(float(1).add(bedRipple.sub(0.5).mul(0.14).add(bedMottle.sub(0.5).mul(0.1)).mul(rippleFade)));
+  const underwater = smoothstep(0.001, 0.012, sub);
+  albedo = mix(albedo, seabedTex, underwater);
 
   // Material-scale bump belongs in the fragment normal, separate from the large
   // heightfield normal. This gives rock/sand surface texture without changing the
@@ -122,6 +160,6 @@ export function makeFlatTerrain(
   mat.colorNode = albedo;
   const dryRoughness = mix(float(0.91), float(0.98), sandMask)
     .sub(fracture.mul(exposure).mul(0.06));
-  mat.roughnessNode = mix(dryRoughness, float(0.7), max(wet, activity.z).min(float(1)));
+  mat.roughnessNode = mix(dryRoughness, float(0.7), max(max(wet, activity.z), lapWet).min(float(1)));
   return mat;
 }
