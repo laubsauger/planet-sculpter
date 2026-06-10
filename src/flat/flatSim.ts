@@ -8,11 +8,12 @@ import { Vector2 } from 'three';
 import {
   Fn, instanceIndex, textureLoad, textureStore, ivec2, uvec2, uint, int,
   float, vec2, vec4, max, min, length, mix, smoothstep, If, uniform,
-  mx_fractal_noise_float, sqrt, vec3, time, clamp,
+  mx_fractal_noise_float, sqrt, vec3, time, clamp, exp,
 } from 'three/tsl';
 import { GridField, buildGridCopy, buildGridFill, buildGridSeed } from '../sim/gridStore';
 import { mudViscosityFactor, waterUniforms } from '../sim/passes/water';
 import { erosionUniforms } from '../sim/passes/erosion';
+import { SIM } from '../config';
 import {
   evapFlowReduce, evapSpeedRef, evapDeepReduce, evapDeepRef, evapShallowRef,
   rainOrographic, rainHighRef,
@@ -220,7 +221,10 @@ function flatUpdate(d: StorageTexture, f: StorageTexture, b: StorageTexture, sou
     const submerged = float(1).sub(smoothstep(flatSeaLevel.sub(0.01), flatSeaLevel, bc));
     const offshore = float(1).sub(smoothstep(flatSeaLevel.sub(0.14), flatSeaLevel.sub(0.06), bc));
     const reservoirCoupling = mix(float(0.12), float(1), offshore).mul(submerged);
-    const oceanRelax = smoothstep(float(0), float(0.9), p.dt.mul(8)).mul(reservoirCoupling);
+    // Rate-exact relaxation: per-tick factor 1-exp(-14·dt) gives the SAME
+    // per-second pull at any tick rate (equals the old smoothstep value 0.503
+    // exactly at the tuned dt=1/20; the smoothstep drifted with dt).
+    const oceanRelax = float(1).sub(exp(p.dt.mul(-14))).mul(reservoirCoupling);
     next = mix(next, need, oceanRelax);
     const edgeDistance = min(
       min(ix.toFloat(), float(w - 1).sub(ix.toFloat())),
@@ -602,11 +606,15 @@ function flatErosion(
       // Bedrock incision is slow, but recently deposited/mobile earth must be easy
       // for established flow to rework. A shared low cap made delta bars seal the
       // outlet faster than water could cut distributaries through them.
-      const ERODE_CAP = mix(float(0.00009), float(0.00034), looseFrac).mul(u.simSpeed);
+      // Per-invocation amounts × simSpeed × tickNorm: tickNorm keeps the
+      // per-SECOND rates at their tuned values when ticksPerSecond changes
+      // (erosion fires every 8th tick, so its cadence scales with tick rate).
+      const rate = u.simSpeed.mul(u.tickNorm);
+      const ERODE_CAP = mix(float(0.00009), float(0.00034), looseFrac).mul(rate);
       // A saturated depositional front must not advance by the exact same amount
       // in every cell. Persistent substrate resistance changes how readily loose
       // material anchors, so some bars survive while adjacent cells keep routing.
-      const DEPOSIT_CAP = float(0.00045).mul(u.simSpeed)
+      const DEPOSIT_CAP = float(0.00045).mul(rate)
         .mul(mix(float(0.35), float(1.35), carriedMaterial));
       const erodeGate = speed.greaterThan(u.erodeSpeedMin).select(float(1), float(0))
         .mul(notSource).mul(establishedFlow);
@@ -679,7 +687,7 @@ function flatErosion(
       const incisionDepth = max(float(0), bankMean.sub(bc));
       const incisionBrake = float(1).sub(smoothstep(float(0.003), float(0.016), incisionDepth));
       const erode = erodeBase.add(looseRework).mul(gradeBreakBrake).add(lateral.mul(incisionBrake))
-        .mul(depthSuppress).mul(incisionBrake).mul(u.simSpeed).min(ERODE_CAP).min(incisionLimit)
+        .mul(depthSuppress).mul(incisionBrake).mul(rate).min(ERODE_CAP).min(incisionLimit)
         .mul(hydraulicErosionEnabled);
       // ANTI-DAM: never deposit enough to raise the bed above the local water
       // surface. Excess sediment stays suspended -> advects on to deeper water ->
@@ -709,14 +717,14 @@ function flatErosion(
       // front from advancing as one row, while flow still decides where sediment
       // arrives and whether it has lost carrying power.
       const depositPreference = mix(float(0.42), float(1.28), carriedMaterial);
-      const settling = sc.mul(u.stillDeposit).mul(settlingOpportunity).mul(depositPreference);
+      const settling = sc.mul(u.stillDeposit).mul(u.tickNorm).mul(settlingOpportunity).mul(depositPreference);
       // Preserve a thin transport layer in high-throughflow routes. Low-discharge
       // neighbors can still aggrade into bars; the active route remains wet enough
       // to carry sediment, split around bars, and avulse naturally.
       const channelClearance = smoothstep(float(0.0002), float(0.0025), throughFlow).mul(0.016);
       const availableWaterColumn = max(float(0), dc.sub(channelClearance));
       const dep = max(
-        transportLoss.mul(u.deposit).mul(u.simSpeed).mul(depositOpportunity).mul(depositPreference),
+        transportLoss.mul(u.deposit).mul(rate).mul(depositOpportunity).mul(depositPreference),
         settling,
       ).min(DEPOSIT_CAP).min(dc.mul(0.22)).min(availableWaterColumn).mul(notSource).mul(depositionEnabled);
       bNew.assign(max(bc.sub(erode).add(dep), float(0)));
@@ -881,7 +889,7 @@ function flatThermal(
       const looseSpread = mix(float(1), mix(float(1.35), float(2.25), float(1).sub(cohesion)), looseFrac);
       const cohesionHold = mix(float(1), mix(float(0.38), float(0.9), float(1).sub(cohesion)), looseFrac);
       const rate = u.thermalRate.mul(wetMobility).mul(looseSpread)
-        .mul(cohesionHold).mul(u.simSpeed).mul(0.25);
+        .mul(cohesionHold).mul(u.simSpeed).mul(u.tickNorm).mul(0.25);
       const scale = min(rate, sourceLoose.div(max(total, float(EPS))));
       const amount = request(tx, ty, targetDistance).mul(scale);
       return vec2(amount, amount.mul(cohesion));
@@ -955,6 +963,14 @@ export class FlatSim {
     renderer.compute(buildGridFill(this.activity.main, w, h, 0));
     renderer.compute(flatLooseSeed(looseSeed, hardness, this.loose.main, w, h));
     renderer.compute(flatLooseSeed(looseSeed, hardness, this.loose.scratch, w, h));
+    // Tick-rate normalization (see config.tickRateRef): per-invocation erosion
+    // amounts scale by tickNorm so the per-second rates match the tuned ones;
+    // the per-invocation EXPONENTIAL decays (activity viz/wetness) need the
+    // matching root so decay-per-second is preserved too.
+    const tickNorm = SIM.tickRateRef / SIM.ticksPerSecond;
+    erosionUniforms.tickNorm.value = tickNorm;
+    erosionUniforms.vizDecay.value = Math.pow(erosionUniforms.vizDecay.value, tickNorm);
+    erosionUniforms.wetDecay.value = Math.pow(erosionUniforms.wetDecay.value, tickNorm);
     const b = height.main;
     this.nodes = {
       fluxN: flatFlux(b, this.water.main, this.sediment.main, this.source.main, this.flux.main, this.flux.scratch, w, h),

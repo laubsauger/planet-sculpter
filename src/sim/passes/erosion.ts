@@ -70,6 +70,12 @@ export const erosionUniforms = {
   /** faster-than-realtime erosion: scales per-tick erode/deposit amount + cap so
    *  terrain evolves quicker WITHOUT extra GPU work (⊥ more ticks). 1 = realtime. */
   simSpeed: uniform(1),
+  /** tick-rate normalization for PER-INVOCATION amounts (erode/deposit caps,
+   *  loose slump, still-water settling): SIM.tickRateRef / SIM.ticksPerSecond,
+   *  set by FlatSim. Keeps per-SECOND erosion identical when the tick rate
+   *  changes — more frequent, smaller doses (smoother sediment/turbidity), same
+   *  tuned dynamics. dt-scaled passes are invariant without it. */
+  tickNorm: uniform(1),
   /** incision feedback (V37): 0 = uniform sheet erosion, 1 = erosion strongly
    *  concentrated where discharge (depth*speed) is high -> channels self-deepen
    *  & capture flow -> emergent rivers instead of wide sheet flow. */

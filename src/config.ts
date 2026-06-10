@@ -39,8 +39,16 @@ export const FLAT = {
 export const SIM = {
   /** Fixed sim timestep (s). */
   dt: 1 / 60,
-  /** Target sim ticks/second (throttled below render; V10). */
-  ticksPerSecond: 20,
+  /** Target sim ticks/second (throttled below render; V10). 60 = one tick per
+   *  rendered frame -> water/sediment fields update every frame (no 20Hz visual
+   *  stepping). Per-second dynamics stay TUNED-RATE-equivalent: dt-scaled passes
+   *  are invariant automatically; per-invocation erosion amounts are normalized
+   *  by tickNorm = tickRateRef/ticksPerSecond (see FlatSim). */
+  ticksPerSecond: 60,
+  /** Tick rate the per-invocation erosion/deposit caps + decays were tuned at.
+   *  Changing ticksPerSecond keeps dynamics fixed by scaling those amounts with
+   *  tickRateRef/ticksPerSecond — do NOT retune constants when changing rate. */
+  tickRateRef: 20,
   /** Max sim substeps per frame (anti spiral-of-death; V10). */
   maxStepsPerFrame: 4,
 
