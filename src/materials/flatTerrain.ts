@@ -124,10 +124,14 @@ export function makeFlatTerrain(
   albedo = mix(albedo, FRESH_DEPOSIT, smoothstep(0.04, 0.65, activity.y).mul(0.72));
 
   // Water darkens the material already present instead of replacing it with a
-  // bright water-colored fringe. Sediment adds only a restrained warm earth tint.
-  const wet = smoothstep(0.0004, 0.018, water);
+  // bright water-colored fringe — at WET-SAND strength (the soaked read), not a
+  // faint tint: ANY covered ground must clearly read wet, whatever the material —
+  // river beds, rain films on sand or grass, sheet runoff. Onset at the thin-film
+  // floor (matches the water sheet's visibility/discard floor) so ground soaks
+  // the moment water exists on it; saturates well below typical river depth.
+  const wet = smoothstep(0.00003, 0.004, water);
   const muddy = smoothstep(0.002, 0.08, sediment);
-  albedo = albedo.mul(mix(float(1), float(0.68), wet.mul(0.72)));
+  albedo = albedo.mul(mix(float(1), float(0.62), wet.mul(0.85)));
   albedo = mix(albedo, WET_EARTH, muddy.mul(0.28));
   // Lingering wetness (activity.z): subtly darken ground that was recently under water,
   // fading back to dry over a few seconds after runoff.

@@ -78,11 +78,14 @@ export function makeFlatWater(
   const flowVector = vec2(flux.y.sub(flux.x), flux.z.sub(flux.w));
   const pipeDir = normalize(flowVector.add(vec2(1e-6, 0)));
   const velocityDir = normalize(vec2(vel.x, vel.y).add(vec2(1e-6, 0)));
-  // The direction overlay shows the neighborhood-reconstructed velocity, which can
-  // be clear even when a cell splits its outgoing flux among several pipes. Follow
-  // that clear route and use local pipe flux only to reject a real contradiction.
-  const fluxAgreement = smoothstep(-0.15, 0.3, dot(velocityDir, pipeDir));
-  const flowDir = velocityDir;
+  // The reconstructed velocity is smooth but can point UPSTREAM near confluences
+  // and obstacles. The net pipe discharge direction cannot (flux follows the head
+  // gradient), so where the two disagree the pattern must follow the PIPE
+  // direction — never advect against the flow. Fading alone (the old 0.35
+  // confidence floor) still let bands visibly crawl uphill, which breaks the
+  // whole read the moment it happens.
+  const fluxAgreement = smoothstep(0.0, 0.3, dot(velocityDir, pipeDir));
+  const flowDir = normalize(mix(pipeDir, velocityDir, fluxAgreement));
   const directionConfidence = oceanOnly ? float(0) : smoothstep(0.008, 0.12, speed)
     .mul(mix(float(0.35), float(1), fluxAgreement))
     .mul(smoothstep(0.00001, 0.001, outgoing));
@@ -199,7 +202,7 @@ export function makeFlatWater(
     // GRADED by speed so a lazy drift reads faint and a strong current bold.
     const alongSmear = (q: any) => {
       const sm = (o: number) => mx_fractal_noise_float(
-        vec3(q.sub(flowDir.mul(o)).mul(flowBandScale.mul(0.25)), time.mul(0.12)), 2,
+        vec3(q.sub(flowDir.mul(o)).mul(flowBandScale.mul(0.25)), time.mul(0.05)), 2,
       );
       return sm(0).add(sm(0.3)).add(sm(0.6)).mul(1 / 3);
     };
@@ -285,9 +288,12 @@ export function makeFlatWater(
     // offset along the perpendicular axis — at half the old frequency. Bands
     // travel downstream with the flow; still no sin-phase anywhere, so no moiré.
     const acrossDir = vec2(flowDir.y.negate(), flowDir.x);
+    // Slow z-evolution (0.12, was 0.45): the noise field's OWN drift reads as
+    // waves radiating 360° from a point once it rivals the advection speed —
+    // motion must come from the flow, the field itself only simmers.
     const crossSmear = (q: any) => {
       const cs = (o: number) => mx_fractal_noise_float(
-        vec3(q.sub(acrossDir.mul(o)).mul(0.9), time.mul(0.45)), 2,
+        vec3(q.sub(acrossDir.mul(o)).mul(0.9), time.mul(0.12)), 2,
       );
       return cs(0).add(cs(0.25)).add(cs(0.5)).mul(1 / 3);
     };

@@ -610,7 +610,14 @@ function flatErosion(
       // per-SECOND rates at their tuned values when ticksPerSecond changes
       // (erosion fires every 8th tick, so its cadence scales with tick rate).
       const rate = u.simSpeed.mul(u.tickNorm);
-      const ERODE_CAP = mix(float(0.00009), float(0.00034), looseFrac).mul(rate);
+      // The cap must keep the channel-focus differentiation (`conc`,
+      // discharge-weighted) or it erases it: wherever incision saturates the cap
+      // — i.e. every active river — all cells cut at the identical cap rate and
+      // the bed erodes FLAT. Graded cap: thalweg (deep, fast) cuts at full rate,
+      // shallow margins at ~a third, so a cross-channel profile + bend scour
+      // survive even at saturation, and hardness differences stay visible.
+      const ERODE_CAP = mix(float(0.00009), float(0.00034), looseFrac).mul(rate)
+        .mul(mix(float(0.3), float(1), conc));
       // A saturated depositional front must not advance by the exact same amount
       // in every cell. Persistent substrate resistance changes how readily loose
       // material anchors, so some bars survive while adjacent cells keep routing.
