@@ -7,10 +7,10 @@ import { FrontSide, type Texture } from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
 import {
   textureLoad, uv, mix, smoothstep, max, min, float, vec3, normalize, positionWorld, length, cameraPosition,
-  mx_noise_float, mx_fractal_noise_float, cameraViewMatrix, transformDirection, sin, time, uniform, fract,
+  mx_fractal_noise_float, cameraViewMatrix, transformDirection, sin, time, uniform, fract,
 } from 'three/tsl';
 import {
-  flatSurface, bilinearTex, bicubicTex, flatSeaLevel, flatGridX, flatGridY, detailFreq, detailStrength,
+  flatSurface, bilinearTex, bicubicTex, flatSeaLevel, flatGridX, flatGridY, detailStrength,
 } from '../tsl/flatSurface';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -50,6 +50,8 @@ export function makeFlatTerrain(
   sedimentTex: Texture,
   activityTex: Texture,
   velocityTex: Texture,
+  terrainVisualTex: Texture,
+  terrainSurfaceVisualTex: Texture,
 ): MeshStandardNodeMaterial {
   const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
   // hardware-filtered bilinear: one fetch per field instead of 4 loads + lerp ALU.
@@ -68,6 +70,8 @@ export function makeFlatTerrain(
   const water = bl(waterTex);
   const sediment = bl(sedimentTex);
   const activity = blVec(activityTex);
+  const terrainVisual = blVec(terrainVisualTex);
+  const terrainSurfaceVisual = blVec(terrainSurfaceVisualTex);
 
   // ground cover by moisture + elevation.
   const grass = mix(GRASS, GRASS_LUSH, smoothstep(0.4, 0.75, moisture));
@@ -88,17 +92,11 @@ export function makeFlatTerrain(
   // positionWorld = the rasterizer-interpolated displaced surface the pixel actually
   // sits on — same coordinates the old per-fragment re-evaluation of s.position
   // produced (sub-texel difference at most), without re-running the 16-tap bicubic.
-  const p = positionWorld;
-  const broadRock = mx_noise_float(p.mul(0.65)).mul(0.5).add(0.5);
-  const province = mx_noise_float(p.mul(1.3).add(vec3(4.3, 1.7, -2.8))).mul(0.5).add(0.5);
-  const rockStructure = broadRock.mul(0.18).sub(0.09).add(province.mul(0.1).sub(0.05));
-  albedo = albedo.mul(float(1).add(rockStructure.mul(exposure)));
+  albedo = albedo.mul(float(1).add(terrainVisual.w.mul(exposure)));
 
   const sandMask = looseRatio.mul(float(1).sub(exposure))
     .mul(float(1).sub(smoothstep(0.16, 0.42, h.sub(flatSeaLevel))));
-  const sandWarp = mx_noise_float(p.mul(1.4)).mul(1.2);
-  const sandMottle = mx_noise_float(p.mul(2.4).add(sandWarp)).mul(0.5).add(0.5);
-  albedo = albedo.mul(float(1).add(sandMottle.sub(0.5).mul(0.09).mul(sandMask)));
+  albedo = albedo.mul(float(1).add(terrainSurfaceVisual.x.sub(0.5).mul(0.09).mul(sandMask)));
 
   // Material weights that PARTITION the surface (sum to ~1, dirt fills the remainder) so
   // EVERY fragment gets the full detail of its dominant material — not a faint fraction.
@@ -130,9 +128,14 @@ export function makeFlatTerrain(
   // floor (matches the water sheet's visibility/discard floor) so ground soaks
   // the moment water exists on it; saturates well below typical river depth.
   const wet = smoothstep(0.00003, 0.004, water);
+  const submergedContact = smoothstep(0.0002, 0.018, water);
   const muddy = smoothstep(0.002, 0.08, sediment);
-  albedo = albedo.mul(mix(float(1), float(0.62), wet.mul(0.85)));
-  albedo = mix(albedo, WET_EARTH, muddy.mul(0.28));
+  // Water-contact darkening belongs to the ground material, not the transparent
+  // water tint. Even a thin routed film visibly soaks the surface; deeper river
+  // beds darken further while retaining their sand/grass/rock identity.
+  const contactDarkening = wet.mul(0.46).add(submergedContact.mul(0.28)).min(float(0.72));
+  albedo = albedo.mul(float(1).sub(contactDarkening));
+  albedo = mix(albedo, albedo.mul(0.72).add(WET_EARTH.mul(0.28)), muddy.mul(0.22));
   // Lingering wetness (activity.z): subtly darken ground that was recently under water,
   // fading back to dry over a few seconds after runoff.
   albedo = albedo.mul(mix(float(1), float(0.7), activity.z.min(float(1))));
@@ -149,12 +152,12 @@ export function makeFlatTerrain(
   // `nearShore` clamps the band tight so it can never reach the grassy mid-slope.
   // Band hugs the waterline: top creeps only a few thousandths ABOVE sea level so the wet
   // sand meets the wave/foam zone instead of floating a wide stripe up the dry beach.
-  const shoreNoise = mx_noise_float(p.mul(5.0)).mul(0.002);
+  const shoreNoise = terrainSurfaceVisual.z;
   // Band sits IN the wave-wash zone: from just under the waterline (where the foam laps) to
   // only a hair above it. Top barely clears sea level so the wet sand visually connects to
   // the approaching waves instead of floating a stripe up the dry beach.
   const reachA = mix(float(-0.006), float(-0.001), sin(time.mul(0.9)).mul(0.5).add(0.5));
-  const reachB = mix(float(-0.004), float(0.002), sin(time.mul(1.5).add(1.3)).mul(0.5).add(0.5));
+  const reachB = mix(float(-0.004), float(-0.0003), sin(time.mul(1.5).add(1.3)).mul(0.5).add(0.5));
   const wetLine = max(
     smoothstep(reachA.add(shoreNoise), reachA.sub(float(0.004)), above),
     smoothstep(reachB.add(shoreNoise), reachB.sub(float(0.004)), above).mul(0.7),
@@ -163,40 +166,32 @@ export function makeFlatTerrain(
   const lapWet = wetLine.mul(nearShore).min(float(1)).mul(shoreWetEnabled);
   albedo = albedo.mul(mix(float(1), float(0.74), lapWet));
 
-  // Submerged seabed: smooth blend from sandy-turquoise shallows to a dark cool deep floor
-  // as the bed descends — a gradual depth ramp, NO step at the waterline, so there is no
-  // hard color edge where land meets sea. The transparent water tint sits on top of this.
   const sub = max(float(0), above.mul(-1));
   const shallowBed = mix(SAND, SEABED_SHALLOW, smoothstep(0.0, 0.03, sub).mul(0.85));
   const seabed: any = mix(shallowBed, SEABED_DEEP, smoothstep(0.03, 0.26, sub));
-  // Underwater texture: sand ripples + broad mottling so the seabed reads as a real bottom,
-  // not a flat color ramp. Strongest in the clear shallows (visible through the water),
-  // fading out with depth where it would be invisible anyway.
-  const bedRipple = sin(p.x.mul(7.0).add(p.z.mul(2.6)).add(mx_noise_float(p.mul(1.8)).mul(2.0))).mul(0.5).add(0.5);
-  const bedMottle = mx_noise_float(p.mul(2.6).add(vec3(5, 0, 5))).mul(0.5).add(0.5);
   const rippleFade = float(1).sub(smoothstep(0.03, 0.13, sub));
-  const seabedTex: any = seabed.mul(float(1).add(bedRipple.sub(0.5).mul(0.14).add(bedMottle.sub(0.5).mul(0.1)).mul(rippleFade)));
-  // Caustics projected onto the ACTUAL seabed surface (correct from every angle, unlike the
-  // old water-sheet hack). Thin dancing grid (both axes) in the clear shallows, fading out
-  // with depth where light can't reach.
-  const cWarp = mx_fractal_noise_float(vec3(p.x.mul(1.6), p.z.mul(1.6), time.mul(0.12)), 2);
-  const cpA = p.x.mul(12.4).add(p.z.mul(7.4)).add(time.mul(0.8)).add(cWarp.mul(2.6)).add(sin(p.z.mul(4.0).sub(time.mul(0.3))).mul(1.4));
-  const cpB = p.x.mul(-7.6).add(p.z.mul(13.8)).sub(time.mul(0.62)).sub(cWarp.mul(2.2)).add(sin(p.x.mul(3.6).add(time.mul(0.24))).mul(1.3));
-  const caustics = max(float(1).sub(smoothstep(0.015, 0.1, sin(cpA).abs())), float(1).sub(smoothstep(0.015, 0.1, sin(cpB).abs())));
-  // Caustics need CALM water (a churned surface can't focus light) and a close
-  // enough camera that the thin lines resolve — under fast flows / from a
-  // distance they alias into white per-pixel static (the "TV noise" on rapids).
+  const seabedTex: any = seabed.mul(float(1).add(terrainSurfaceVisual.y.mul(rippleFade)));
+  const cWarp = mx_fractal_noise_float(vec3(positionWorld.x.mul(1.6), positionWorld.z.mul(1.6), time.mul(0.12)), 2);
+  const cpA = positionWorld.x.mul(12.4).add(positionWorld.z.mul(7.4)).add(time.mul(0.8)).add(cWarp.mul(2.6))
+    .add(sin(positionWorld.z.mul(4.0).sub(time.mul(0.3))).mul(1.4));
+  const cpB = positionWorld.x.mul(-7.6).add(positionWorld.z.mul(13.8)).sub(time.mul(0.62)).sub(cWarp.mul(2.2))
+    .add(sin(positionWorld.x.mul(3.6).add(time.mul(0.24))).mul(1.3));
+  const caustics = max(
+    float(1).sub(smoothstep(0.015, 0.1, sin(cpA).abs())),
+    float(1).sub(smoothstep(0.015, 0.1, sin(cpB).abs())),
+  );
   const flowSpeed = (bilinearTex(velocityTex, fx, fy) as any).xy;
   const causticCalm = float(1).sub(smoothstep(0.06, 0.22, length(flowSpeed)));
   const causticResolve = float(1).sub(smoothstep(10.0, 18.0, length(cameraPosition.sub(positionWorld))));
-  const causticZone = smoothstep(0.001, 0.012, sub).mul(float(1).sub(smoothstep(0.05, 0.16, sub)))
+  const causticZone = smoothstep(0.008, 0.022, sub).mul(float(1).sub(smoothstep(0.05, 0.16, sub)))
     .mul(causticCalm).mul(causticResolve);
-  // Broad, slowly DRIFTING noise mask so the caustic intensity isn't a uniform sheet at the
-  // same opacity everywhere — bright pools and dim patches move across the world like light
-  // filtering through a rippling surface.
-  const causticMask = mx_fractal_noise_float(vec3(p.x.mul(0.55), p.z.mul(0.55), time.mul(0.07)), 2).mul(0.5).add(0.5);
+  const causticMask = mx_fractal_noise_float(
+    vec3(positionWorld.x.mul(0.55), positionWorld.z.mul(0.55), time.mul(0.07)),
+    2,
+  ).mul(0.5).add(0.5);
   const causticGain = mix(float(0.15), float(1.0), smoothstep(0.25, 0.85, causticMask));
-  const litBed = seabedTex.add(vec3(0.32, 0.6, 0.55).mul(caustics).mul(causticZone).mul(causticsEnabled).mul(causticGain).mul(0.34));
+  const litBed = seabedTex.mul(0.8)
+    .add(vec3(0.32, 0.6, 0.55).mul(caustics).mul(causticZone).mul(causticsEnabled).mul(causticGain).mul(0.34));
   const underwater = smoothstep(0.001, 0.012, sub);
   albedo = mix(albedo, litBed, underwater);
 
@@ -207,24 +202,9 @@ export function makeFlatTerrain(
   // offsets) = ~9 noise taps (was ~80) feeding BOTH the fragment normal (relief) and the
   // albedo/roughness value structure. World-position driven -> tiles seamlessly across the
   // whole map, randomized by the fractal noise. detailFreq/detailStrength sliders still scale.
-  const detFreq = detailFreq.mul(0.4);
-  // One fractal sample, shaped DIFFERENTLY per material so types read distinctly (not one
-  // homogenous noise): sand = smooth directional dunes, grass = soft grain, rock = layered
-  // shale + sharp ridges, snow = very smooth sastrugi, dirt = rough grain.
-  const det = (q: any) => {
-    const grain = mx_fractal_noise_float(q.mul(detFreq), 3);
-    const dune = sin(q.x.mul(detFreq.mul(0.6)).add(q.z.mul(detFreq.mul(0.35))));
-    const strata = sin(q.y.mul(detFreq.mul(1.5)));
-    const ridge = float(0.4).sub(grain.abs()); // sharp angular ridges for rock
-    return wSand.mul(dune.mul(0.7).add(grain.mul(0.3)))
-      .add(wGrass.mul(grain.mul(0.85)))
-      .add(wRock.mul(strata.mul(0.55).add(ridge.mul(0.9))))
-      .add(wSnow.mul(grain.mul(0.35)))
-      .add(wDirt.mul(grain.mul(0.6)));
-  };
-  const structCenter = det(p);
-  const dX = det(p.add(vec3(0.04, 0, 0))).sub(structCenter);
-  const dZ = det(p.add(vec3(0, 0, 0.04))).sub(structCenter);
+  const structCenter = terrainVisual.x;
+  const dX = terrainVisual.y;
+  const dZ = terrainVisual.z;
   const detailAmp = wSand.mul(1.4).add(wGrass.mul(1.0)).add(wRock.mul(2.2)).add(wSnow.mul(0.6)).add(wDirt.mul(1.0)).add(0.3);
   const bumpedWorldNormal = normalize(s.worldNormal.sub(vec3(dX, 0, dZ).mul(detailStrength.mul(detailAmp).mul(6.0))));
   const structContrast = wSand.mul(0.1).add(wGrass.mul(0.16)).add(wRock.mul(0.2)).add(wSnow.mul(0.07)).add(wDirt.mul(0.13)).add(0.04);
@@ -257,7 +237,7 @@ export function makeFlatTerrain(
   // Structure modulates sheen too — crests/troughs of the per-type pattern catch the sun
   // slightly differently, giving specular life instead of a uniform matte field.
   rough = rough.add(structCenter.mul(0.07)).clamp(float(0.3), float(1));
-  rough = mix(rough, float(0.6), max(max(wet, activity.z), lapWet).min(float(1)));
+  rough = mix(rough, float(0.42), max(max(wet, activity.z), lapWet).min(float(1)));
   mat.roughnessNode = rough;
   return mat;
 }

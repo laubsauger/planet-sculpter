@@ -4,7 +4,7 @@
 // when you rotate). Animated wave + flow normals (calm, not noise-soup). Surface =
 // bedrock + depth; shallow = see-through turquoise, deep = blue; shoreline foam.
 
-import { DoubleSide, type Texture } from 'three';
+import { FrontSide, type Texture } from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import {
   textureLoad, uv, mix, smoothstep, max, clamp, float, vec2, vec3, length, Fn, Discard, fract,
@@ -21,12 +21,13 @@ const DEEP = vec3(0.015, 0.12, 0.3);
 const SKY_REFLECT = vec3(0.6, 0.78, 0.95);
 const FOAM = vec3(0.95, 0.98, 1.0);
 const SILT = vec3(0.27, 0.2, 0.11);
-export const flowBandStrength = uniform(0.38);
+export const flowBandStrength = uniform(0.44);
 export const flowBandScale = uniform(7.0);
 // Perf / A-B toggles for potentially heavy stylized effects (1 = on, 0 = off).
 // (causticsEnabled moved to flatTerrain — caustics now render on the seabed.)
 export const shoreFoamEnabled = uniform(1);
 export const oceanSwellEnabled = uniform(1);
+export type FlatWaterMode = 'dynamic' | 'oceanSkirt';
 
 /** `oceanOnly`: build the OPEN-OCEAN subset for the skirt. Outside the grid every
  * sampler clamps to the border ring, where sediment≡0, velocity≡0 and bed≡0
@@ -39,9 +40,10 @@ export function makeFlatWater(
   waterTex: Texture,
   fluxTex: Texture,
   velTex: Texture,
-  sedimentTex: Texture,
-  oceanOnly = false,
+  visualTex: Texture,
+  mode: FlatWaterMode = 'dynamic',
 ): MeshBasicNodeMaterial {
+  const oceanOnly = mode === 'oceanSkirt';
   const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
 
   const s = flatSurface((c: any) => textureLoad(heightTex, c).x.add(textureLoad(waterTex, c).x), true);
@@ -60,16 +62,14 @@ export function makeFlatWater(
   // draws a hard line right there. Averaging depth over a wide kernel spreads that transition
   // smoothly across the surface. `depthColor` stays CRISP in the shallows (clean waterline +
   // caustics + foam keep their sharp `depth`) and blends to the blurred field in deeper water.
-  const dW = (ox: number, oy: number) => bilinearTex(waterTex, fx.add(ox), fy.add(oy)).x;
-  const depthWide = dW(10, 10).add(dW(-10, 10)).add(dW(10, -10)).add(dW(-10, -10)).mul(1 / 4);
+  const visual = bilinearTex(visualTex, fx, fy);
+  const depthWide = visual.x;
   const depthColor = mix(depth, depthWide, smoothstep(0.02, 0.12, depth));
   const vel = oceanOnly ? vec2(0, 0) : bilinearTex(velTex, fx, fy).xy;
   const flux = oceanOnly ? vec3(0).xxxx : bilinearTex(fluxTex, fx, fy);
   // Center-weighted blur of sediment so muddy plumes have SOFT edges that merge into the
   // ocean, instead of hard-contrast shapes. (Turbidity ramp below is also widened.)
-  const sed = (ox: number, oy: number) => bilinearTex(sedimentTex, fx.add(ox), fy.add(oy)).x;
-  const sediment = oceanOnly ? float(0) : sed(0, 0).mul(0.5)
-    .add(sed(4, 0).add(sed(-4, 0)).add(sed(0, 4)).add(sed(0, -4)).mul(0.125));
+  const sediment = oceanOnly ? float(0) : visual.y;
   const speed = oceanOnly ? float(0) : length(vec2(vel.x, vel.y));
   // Use the production solver's actual outgoing discharge for visual direction.
   // Reconstructed velocity can point upstream around confluences and obstacles;
@@ -104,7 +104,6 @@ export function makeFlatWater(
   // each follows its own direction (not a shared global wave).
   // Full ripple on shallow flow; deep moving water keeps ~35% instead of cutting
   // to a dead-flat mirror at depth 0.08 (deep slow rivers looked static).
-  const shallowFlow = float(1).sub(smoothstep(0.025, 0.08, depth).mul(0.65));
   // FLOWMAP advection (bounded shear): naive `pos - flow·time` with a spatially
   // varying flow shears any pattern into ever-finer filaments as time grows —
   // after a minute every strong flow was fingerprint-fine static. Two advection
@@ -120,9 +119,7 @@ export function makeFlatWater(
   };
   // Ripples advect at ~the actual current speed (0.22 read as molasses — the
   // pattern crawled while the sim water clearly moved faster).
-  const flowR = oceanOnly ? vec3(0, 0, 0) : flowSampled((q: any) => grad(q, 1.5), 0.85, 3.0)
-    .mul(speed.min(float(1.2)).mul(0.11).add(0.012))
-    .mul(shallowFlow).mul(directionConfidence);
+  const flowR = oceanOnly ? vec3(0, 0, 0) : vec3(visual.z, 0, visual.w);
   // Ambient swell belongs to the OPEN OCEAN ONLY (bedrock below sea level). All water
   // on land — rivers, rain runoff, puddles — must read by its OWN flow (flowR), never
   // share one global wave. Gate the swell by an ocean-basin mask so it can't bleed onto
@@ -206,7 +203,7 @@ export function makeFlatWater(
       );
       return sm(0).add(sm(0.3)).add(sm(0.6)).mul(1 / 3);
     };
-    const elong = flowSampled(alongSmear, 2.2, 3.0).mul(0.5).add(0.5);
+    const elong = flowSampled(alongSmear, 2.7, 3.0).mul(0.5).add(0.5);
     const streak = smoothstep(0.55, 0.85, elong);
     const speedRamp = smoothstep(0.02, 0.5, speed);
     // Deep-river fade widened (was gone by depth 0.2): a deep slow river still
@@ -363,7 +360,10 @@ export function makeFlatWater(
     float(0), float(0.97),
   );
 
-  const mat = new MeshBasicNodeMaterial({ transparent: true, side: DoubleSide });
+  // The flat mesh winding is explicitly corrected upward in buildFlatMesh and
+  // the ocean skirt is wound upward too. Rendering the underside doubled costly
+  // transparent fragments at grazing views without contributing visible water.
+  const mat = new MeshBasicNodeMaterial({ transparent: true, side: FrontSide });
   const visualLift = smoothstep(0.0004, 0.006, depth).mul(0.006);
   mat.positionNode = vec3(s.position.x, s.position.y.add(visualLift), s.position.z);
   // Dry land: opacity is exactly 0 below the hasWater floor — discard those
@@ -371,6 +371,12 @@ export function makeFlatWater(
   // skip the noise/lighting work instead of blending an invisible result.
   // The skirt is always deep water, so it never discards (skip the test there).
   mat.colorNode = oceanOnly ? col : Fn(() => {
+    // One hardware-filtered sample rejects fully dry cells before the bicubic
+    // depth reconstruction and the expensive water FX graph. This is exact for
+    // dry interiors: a zero bilinear value means all four local depth samples
+    // are zero, so the clamped bicubic surface used below must also be zero.
+    const coarseDepth = bilinearTex(waterTex, fx, fy).x;
+    Discard(coarseDepth.lessThanEqual(float(0)));
     // Below the thin-film floor (matches hasWater's lowest onset) — truly dry.
     Discard(depth.lessThanEqual(float(0.00003)));
     return col;

@@ -84,35 +84,57 @@ export function buildFlatBenchmark(name: Exclude<FlatBenchmark, 'default'>, w: n
       }
 
       if (name === 'riverToSea' || name === 'delta') {
-        const center = 0.5 + Math.sin(v * Math.PI * 3.2) * 0.055 + Math.sin(v * Math.PI * 7.1) * 0.014;
-        const channel = Math.exp(-((u - center) * (u - center)) / (0.032 * 0.032));
-        const floodplain = Math.exp(-((u - center) * (u - center)) / (0.11 * 0.11));
-        // Steeper upper grade, then a broad shallow shelf for mouth flow and delta
-        // growth. Only the final offshore strip drops into the deep basin.
-        const land = 0.68 - v * 0.46 - channel * 0.04 - floodplain * 0.012;
+        // Three independent rivers expose grade-break handling side by side. Their
+        // progressively steeper upper catchments and different discharges make it
+        // obvious when impact erosion or sluggish routing only works for one slope.
+        const rivers = [
+          { x: 0.23, phase: 0.4, grade: 0.38, rate: 0.55, width: 0.025 },
+          { x: 0.5, phase: 2.1, grade: 0.49, rate: 0.75, width: 0.029 },
+          { x: 0.77, phase: 4.4, grade: 0.61, rate: 0.95, width: 0.033 },
+        ];
+        let channel = 0;
+        let floodplain = 0;
+        let weightedGrade = 0;
+        let gradeWeight = 0;
+        let sourceRate = 0;
+        let initialWater = 0;
+        let initialSediment = 0;
+        const srcV = 0.2;
+        for (const river of rivers) {
+          const center = river.x + Math.sin(v * Math.PI * 2.7 + river.phase) * 0.026
+            + Math.sin(v * Math.PI * 6.4 + river.phase * 0.7) * 0.008;
+          const localChannel = Math.exp(-((u - center) * (u - center)) / (river.width * river.width));
+          const localFloodplain = Math.exp(-((u - center) * (u - center)) / (0.075 * 0.075));
+          const slopeLane = Math.exp(-((u - river.x) * (u - river.x)) / (0.2 * 0.2));
+          channel = Math.max(channel, localChannel);
+          floodplain = Math.max(floodplain, localFloodplain);
+          weightedGrade += slopeLane * river.grade;
+          gradeWeight += slopeLane;
+
+          const sourceX = river.x + Math.sin(srcV * Math.PI * 2.7 + river.phase) * 0.026
+            + Math.sin(srcV * Math.PI * 6.4 + river.phase * 0.7) * 0.008;
+          sourceRate += normalizedGaussian(u, v, sourceX, srcV, 0.011, w, h, river.rate);
+          if (v >= srcV && v <= 0.84) initialWater += localChannel * 0.01;
+          if (name === 'delta') {
+            const sedimentV = srcV + 0.04;
+            const sedimentX = river.x + Math.sin(sedimentV * Math.PI * 2.7 + river.phase) * 0.026
+              + Math.sin(sedimentV * Math.PI * 6.4 + river.phase * 0.7) * 0.008;
+            initialSediment += normalizedGaussian(u, v, sedimentX, sedimentV, 0.02, w, h, river.rate * 38);
+          }
+        }
+        const grade = gradeWeight > 1e-5 ? weightedGrade / gradeWeight : 0.46;
+        // All rivers converge on the same broad shallow receiving shelf. Only the
+        // final offshore strip drops into the deep basin.
+        const land = 0.69 - v * grade - channel * 0.032 - floodplain * 0.009;
         const shelf = 0.215;
         const basin = 0.16;
         const toShelf = smoothstep(0.7, 0.94, v);
         const toBasin = smoothstep(0.96, 1, v);
         const coast = land * (1 - toShelf) + shelf * toShelf;
         height[k] = Math.max(0.12, coast * (1 - toBasin) + basin * toBasin);
-        // source sits well below the sealed top edge — against the wall it just pools
-        // upslope into the corner and evaporates instead of running downhill.
-        const srcV = 0.22;
-        const sourceX = 0.5 + Math.sin(srcV * Math.PI * 3.2) * 0.055 + Math.sin(srcV * Math.PI * 7.1) * 0.014;
-        // Match discharge to this narrow headwater's carrying capacity. The old
-        // 2.5-unit forcing necessarily formed a source-sized reservoir even with
-        // correct downhill routing; this benchmark is for a flowing river/delta.
-        source[k] = normalizedGaussian(u, v, sourceX, srcV, 0.013, w, h, 0.75);
-        // Warm-start the visual/routing benchmark with a shallow connected river.
-        // Spring-only routing from a dry bed remains a separate solver acceptance case.
-        if (v >= srcV && v <= 0.84) water[k] = channel * 0.012;
-        if (name === 'delta') {
-          const sedimentV = srcV + 0.04;
-          const sedimentX = 0.5 + Math.sin(sedimentV * Math.PI * 3.2) * 0.055
-            + Math.sin(sedimentV * Math.PI * 7.1) * 0.014;
-          sediment[k] = normalizedGaussian(u, v, sedimentX, sedimentV, 0.025, w, h, 35);
-        }
+        source[k] = sourceRate;
+        water[k] = initialWater;
+        sediment[k] = initialSediment;
       } else if (name === 'damBreak') {
         const ridge = gaussian(u, v, 0.5, 0.52, 0.035);
         height[k] = 0.28 + (0.72 - v) * 0.12 + ridge * 0.28;

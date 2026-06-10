@@ -18,11 +18,19 @@
         color: #9aa4b2; font: 12px/1.4 ui-monospace, monospace;
         pointer-events: none; white-space: pre;
       }
+      #perf-graph {
+        position: fixed; top: 50px; left: 8px;
+        width: 280px; height: 72px;
+        background: rgba(8, 14, 22, 0.62);
+        border: 1px solid rgba(160, 190, 215, 0.18);
+        pointer-events: none;
+      }
     </style>
   </head>
   <body>
     <canvas id="app"></canvas>
     <div id="hud"></div>
+    <canvas id="perf-graph" width="280" height="72"></canvas>
     <div id="gate">
       <div>
         <h2>WebGPU required</h2>

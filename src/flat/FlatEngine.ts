@@ -7,7 +7,7 @@ import {
   Vector2, Vector3, Raycaster, Mesh, TimestampQuery, DataTexture, RedFormat, FloatType, Object3D,
   PlaneGeometry, RingGeometry, MeshBasicMaterial, DoubleSide,
 } from 'three';
-import { WebGPURenderer } from 'three/webgpu';
+import { InspectorBase, WebGPURenderer } from 'three/webgpu';
 import GUI from 'lil-gui';
 import { OrbitController } from '../app/OrbitController';
 import { buildFlatSeed } from './flatSeed';
@@ -26,6 +26,8 @@ import { mudViscosityFactor, waterUniforms } from '../sim/passes/water';
 import { erosionUniforms } from '../sim/passes/erosion';
 import { FLAT, SIM, RENDER } from '../config';
 import type { BrushMode } from '../tools/BrushTool';
+
+type InspectorPanel = { init(): void; domElement: HTMLElement; profiler: { panel: HTMLElement; togglePanel(): void } };
 
 export class FlatEngine {
   private static readonly SCENE_BACKGROUND = 0x9ec4e0;
@@ -49,6 +51,13 @@ export class FlatEngine {
   private sky!: HemisphereLight;
   private ambient!: AmbientLight;
   private hud: HTMLElement | null;
+  private readonly perfGraph: HTMLCanvasElement | null;
+  private readonly perfGraphCtx: CanvasRenderingContext2D | null;
+  private readonly perfHistory = { fps: [] as number[], render: [] as number[], compute: [] as number[] };
+  private readonly renderSettings = { pixelRatio: Math.min(window.devicePixelRatio, 1.25) };
+  private lastHudUpdate = 0;
+  private inspectorActive = false;
+  private inspectorPanel: InspectorPanel | null = null;
   private fpsEma = RENDER.targetFps;
   private lastTime = 0;
   private simAccum = 0;
@@ -81,6 +90,7 @@ export class FlatEngine {
   // (full 262k-vert depth pass) was pure waste. Identical image, just not redrawn
   // when nothing moved.
   private shadowDirty = true;
+  private lastTerrainShadowTime = 0;
   private readonly brushSettings = { mode: 'raise' as BrushMode, radius: 0.035, strength: 0.012, rate: 0.4, target: 0.4 };
   private readonly water = { rainOn: false, rainRate: SIM.rainRate };
   private readonly river = { rate: 0.5, radius: 0.009 };
@@ -92,7 +102,14 @@ export class FlatEngine {
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
-    this.renderer = new WebGPURenderer({ canvas, antialias: true, trackTimestamp: true });
+    // Native high-DPI output already provides dense edge sampling. Layering 4x MSAA
+    // on top of DPR2 multiplies the cost of the water-heavy frame for very little
+    // visible benefit. Keep MSAA for ordinary-density displays where it matters.
+    this.renderer = new WebGPURenderer({
+      canvas,
+      antialias: window.devicePixelRatio < 1.5,
+      trackTimestamp: true,
+    });
     this.scene.background = new Color(FlatEngine.SCENE_BACKGROUND);
     this.scene.fog = new Fog(FlatEngine.SCENE_BACKGROUND, FLAT.worldSize * 1.5, FLAT.worldSize * 4.2);
     this.camera = new PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.05, 200);
@@ -100,6 +117,8 @@ export class FlatEngine {
     this.orbit = new OrbitController(this.camera, canvas);
     this.orbit.controls.target.set(0, 0, 0);
     this.hud = document.getElementById('hud');
+    this.perfGraph = document.getElementById('perf-graph') as HTMLCanvasElement | null;
+    this.perfGraphCtx = this.perfGraph?.getContext('2d') ?? null;
 
     this.sun = new DirectionalLight(0xfff7e8, 3.2);
     this.sun.position.set(6, 9, 4);
@@ -152,8 +171,8 @@ export class FlatEngine {
     await this.renderer.init();
     this.renderer.shadowMap.enabled = true;
     this.sun.shadow.autoUpdate = false; // re-rendered only when shadowDirty (sim tick/brush)
+    this.renderer.setPixelRatio(this.renderSettings.pixelRatio);
     this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 
     const W = FLAT.gridW, H = FLAT.gridH;
     const seed = buildFlatSeed(W, H);
@@ -171,7 +190,15 @@ export class FlatEngine {
     this.brush = new FlatBrush(this.heightField.main, this.heightField.scratch, W, H);
     this.heightMirror = new Float32Array((seed.height.texture.image as { data: Float32Array }).data);
 
-    this.sim = new FlatSim(this.renderer, this.heightField, seed.loose.texture as never, seed.hardness.texture as never, W, H);
+    this.sim = new FlatSim(
+      this.renderer,
+      this.heightField,
+      seed.loose.texture as never,
+      seed.moisture.texture as never,
+      seed.hardness.texture as never,
+      W,
+      H,
+    );
 
     // render mesh denser than the sim grid (bicubic smooths between texels).
     const mW = Math.round(W * FLAT.meshDetail), mH = Math.round(H * FLAT.meshDetail);
@@ -184,6 +211,8 @@ export class FlatEngine {
       this.sim.sediment.main,
       this.sim.activity.main,
       this.sim.velocity.main,
+      this.sim.terrainVisual.main,
+      this.sim.terrainSurfaceVisual.main,
     );
     this.debugMaterial = makeFlatDebug(
       this.heightField.main,
@@ -205,7 +234,7 @@ export class FlatEngine {
       this.sim.water.main,
       this.sim.flux.main,
       this.sim.velocity.main,
-      this.sim.sediment.main,
+      this.sim.waterVisual.main,
     );
     const wW = Math.round(W * FLAT.waterMeshDetail), wH = Math.round(H * FLAT.waterMeshDetail);
     this.waterMesh = buildFlatMesh(wW, wH, water);
@@ -221,8 +250,8 @@ export class FlatEngine {
       this.sim.water.main,
       this.sim.flux.main,
       this.sim.velocity.main,
-      this.sim.sediment.main,
-      true,
+      this.sim.waterVisual.main,
+      'oceanSkirt',
     );
     const skirt = buildOceanSkirt(oceanWater, FLAT.worldSize, FLAT.worldSize * 4);
     this.scene.add(skirt);
@@ -266,10 +295,13 @@ export class FlatEngine {
     b.add(this.brushSettings, 'strength', 0, 0.1, 0.001);
     b.add({ sculpt: () => { this.sculptMode = !this.sculptMode; this.orbit.controls.enableRotate = !this.sculptMode; if (!this.sculptMode) this.cursor.visible = false; } }, 'sculpt').name('toggle sculpt [g]');
     const t = gui.addFolder('Terrain');
-    t.add(flatHeightScale, 'value', 0.5, 5, 0.05).name('height scale').onChange(() => { this.shadowDirty = true; });
-    t.add(flatSeaLevel, 'value', 0, 0.7, 0.01).name('sea level');
+    t.add(flatHeightScale, 'value', 0.5, 5, 0.05).name('height scale').onChange(() => {
+      this.shadowDirty = true;
+      this.sim.refreshTerrainVisual();
+    });
+    t.add(flatSeaLevel, 'value', 0, 0.7, 0.01).name('sea level').onChange(() => this.sim.refreshTerrainVisual());
     t.add(detailStrength, 'value', 0, 1.5, 0.02).name('detail strength');
-    t.add(detailFreq, 'value', 1, 24, 0.5).name('detail freq');
+    t.add(detailFreq, 'value', 1, 24, 0.5).name('detail freq').onChange(() => this.sim.refreshTerrainVisual());
     t.add({ matGrid: false }, 'matGrid').name('material debug grid').onChange((v: boolean) => { materialDebugGrid.value = v ? 1 : 0; });
     t.add({ contours: true }, 'contours').name('contour lines').onChange((v: boolean) => { contourOverlay.value = v ? 1 : 0; });
     t.add(contourCount, 'value', 8, 120, 1).name('contour count');
@@ -305,6 +337,35 @@ export class FlatEngine {
     diagnostics.add({ load: () => this.loadBenchmark(this.diagnostics.benchmark) }, 'load').name('load benchmark');
     diagnostics.add({ snapshot: () => { void this.snapshotConservation(); } }, 'snapshot').name('conservation snapshot');
     diagnostics.add({ cycleDebug: () => this.cycleDebug() }, 'cycleDebug').name('cycle debug [v]');
+    diagnostics.add({ inspector: () => { void this.toggleInspector(); } }, 'inspector').name('toggle WebGPU inspector');
+    diagnostics.add(this.renderSettings, 'pixelRatio', 0.75, Math.min(window.devicePixelRatio, 2), 0.05)
+      .name('render pixel ratio')
+      .onChange((ratio: number) => {
+        this.renderer.setPixelRatio(ratio);
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+  }
+
+  private async toggleInspector(): Promise<void> {
+    if (this.inspectorPanel) {
+      this.inspectorPanel.domElement.remove();
+      this.renderer.inspector = new InspectorBase();
+      this.inspectorPanel = null;
+      this.inspectorActive = false;
+      return;
+    }
+    if (!this.inspectorPanel) {
+      const { Inspector } = await import('three/addons/inspector/Inspector.js');
+      const inspector = new Inspector();
+      this.renderer.inspector = inspector;
+      // The renderer is already initialized, so its normal startup hook will not
+      // mount a newly assigned Inspector. Initialize and mount it explicitly.
+      inspector.init();
+      if (!inspector.domElement.parentElement) document.body.appendChild(inspector.domElement);
+      this.inspectorPanel = inspector as unknown as InspectorPanel;
+      this.inspectorActive = true;
+    }
+    this.inspectorPanel?.profiler.togglePanel();
   }
 
   private zeroTexture(w: number, h: number) {
@@ -471,6 +532,7 @@ export class FlatEngine {
     if (this.riverMode) { this.sim.placeSource(p.u, p.v, this.river.rate, this.river.radius); return; }
     this.brushing = true;
     this.brush.stamp(this.renderer, p.u, p.v, this.brushSettings);
+    this.sim.refreshTerrainVisual();
     this.shadowDirty = true;
   };
   private onMove = (e: PointerEvent): void => {
@@ -479,7 +541,11 @@ export class FlatEngine {
     const p = this.pickUv(); // also sets this.hit to the surface point
     if (!p) { this.cursor.visible = false; return; }
     this.updateCursor();
-    if (this.brushing) { this.brush.stamp(this.renderer, p.u, p.v, this.brushSettings); this.shadowDirty = true; }
+    if (this.brushing) {
+      this.brush.stamp(this.renderer, p.u, p.v, this.brushSettings);
+      this.sim.refreshTerrainVisual();
+      this.shadowDirty = true;
+    }
   };
   private onUp = (): void => { this.brushing = false; };
   private onKey = (e: KeyboardEvent): void => {
@@ -506,12 +572,20 @@ export class FlatEngine {
     const simStart = performance.now();
     this.simAccum += dt;
     let steps = 0;
+    let terrainChanged = false;
     while (this.simAccum >= this.simInterval && steps < SIM.maxStepsPerFrame) {
-      this.sim.tick(this.simInterval); this.simAccum -= this.simInterval; steps++;
+      terrainChanged = this.sim.tick(this.simInterval) || terrainChanged;
+      this.simAccum -= this.simInterval; steps++;
     }
     if (this.simAccum > this.simInterval * SIM.maxStepsPerFrame) this.simAccum = 0;
-    if (steps > 0 || this.shadowDirty) {
+    // Direct edits refresh immediately. Continuous erosion changes the terrain by
+    // tiny amounts at 15Hz; rebuilding the 2048² shadow map for every one of those
+    // frames creates a render-time feedback loop under load. Four updates/second
+    // tracks the evolving terrain smoothly without repeatedly paying the full pass.
+    const terrainShadowDue = terrainChanged && time - this.lastTerrainShadowTime >= 250;
+    if (terrainShadowDue || this.shadowDirty) {
       this.sun.shadow.needsUpdate = true;
+      this.lastTerrainShadowTime = time;
       this.shadowDirty = false;
     }
     const simCpuMs = performance.now() - simStart;
@@ -532,18 +606,59 @@ export class FlatEngine {
     if (triangleDelta > 0) this.trianglesFrame = triangleDelta;
     this.lastRenderCalls = renderCalls;
     this.lastTriangles = triangles;
-    if (time - this.lastTimingResolve > 1000) {
+    if (!this.inspectorActive && time - this.lastTimingResolve > 1000) {
       this.lastTimingResolve = time;
       this.resolveGpuTimings();
     }
-    if (this.hud) {
-      this.fpsEma += (1000 / Math.max(dt * 1000, 0.001) - this.fpsEma) * 0.1;
+    this.fpsEma += (1000 / Math.max(dt * 1000, 0.001) - this.fpsEma) * 0.1;
+    // Text/layout updates are intentionally throttled; GPU rendering continues
+    // independently at full rate. The graph is a tiny 2D canvas updated alongside it.
+    if (time - this.lastHudUpdate >= 250) {
+      this.lastHudUpdate = time;
+      this.updatePerfGraph();
+    }
+    if (this.hud && time === this.lastHudUpdate) {
       this.hud.textContent =
-        `fps ${this.fpsEma.toFixed(0)}  FLAT ${FLAT.gridW}x${FLAT.gridH}  cpu-sim ${this.simCpuMsEma.toFixed(2)}ms  gpu compute/render ${this.gpuComputeMs.toFixed(2)}/${this.gpuRenderMs.toFixed(2)}ms  dispatch ${this.computeCallsFrame}  draw ${this.renderCallsFrame}  tris ${Math.round(this.trianglesFrame / 1000)}k\n` +
+        `fps ${this.fpsEma.toFixed(0)}  FLAT ${FLAT.gridW}x${FLAT.gridH}  ${this.renderSettings.pixelRatio.toFixed(2)}x  cpu-sim ${this.simCpuMsEma.toFixed(2)}ms  gpu compute/render ${this.gpuComputeMs.toFixed(2)}/${this.gpuRenderMs.toFixed(2)}ms  dispatch ${this.computeCallsFrame}  draw ${this.renderCallsFrame}  tris ${Math.round(this.trianglesFrame / 1000)}k\n` +
         `benchmark:${this.diagnostics.benchmark}  solver:${this.sim.waterSolver}${this.sim.waterSolver === 'momentum' ? ` x${this.sim.momentumSubsteps}` : ''}  debug:${FLAT_DEBUG_MODES[this.debugMode]} [v]  [g]${this.sculptMode ? 'SCULPT' : 'orbit'} ${this.riverMode ? 'RIVER' : this.brushSettings.mode} [r]rain:${this.water.rainOn ? 'on' : 'off'}\n` +
         this.snapshotText;
     }
   };
+
+  private updatePerfGraph(): void {
+    const ctx = this.perfGraphCtx, canvas = this.perfGraph;
+    if (!ctx || !canvas) return;
+    const push = (values: number[], value: number) => {
+      values.push(value);
+      if (values.length > canvas.width) values.shift();
+    };
+    push(this.perfHistory.fps, this.fpsEma);
+    push(this.perfHistory.render, this.gpuRenderMs);
+    push(this.perfHistory.compute, this.gpuComputeMs);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = 'rgba(8, 14, 22, 0.78)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = 'rgba(160, 190, 215, 0.18)';
+    ctx.beginPath();
+    ctx.moveTo(0, canvas.height / 2); ctx.lineTo(canvas.width, canvas.height / 2); ctx.stroke();
+    const line = (values: number[], color: string, maxValue: number) => {
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      values.forEach((value, i) => {
+        const x = canvas.width - values.length + i;
+        const y = canvas.height - Math.min(1, value / maxValue) * canvas.height;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    };
+    line(this.perfHistory.fps, '#67e8f9', 120);
+    line(this.perfHistory.render, '#fbbf24', 50);
+    line(this.perfHistory.compute, '#a7f3d0', 10);
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.fillStyle = '#67e8f9'; ctx.fillText('fps', 5, 11);
+    ctx.fillStyle = '#fbbf24'; ctx.fillText('render', 32, 11);
+    ctx.fillStyle = '#a7f3d0'; ctx.fillText('compute', 78, 11);
+  }
 
   private onResize = (): void => {
     this.camera.aspect = window.innerWidth / window.innerHeight;

@@ -28,8 +28,8 @@ export function buildFlatMesh(w: number, h: number, material: Material): Mesh {
  *  `extent` world units. Uses the SAME water material — its positionNode maps uv -> world XZ
  *  and the texture samplers CLAMP, so uv beyond [0,1] reproduces the deep border ocean at the
  *  sea surface. Gives a dynamic (swell/colour) ocean continuing seamlessly to the horizon,
- *  with NO separate static plane and NO seabed occlusion. Material is DoubleSide so winding is
- *  irrelevant; the surface normal is forced upward in flatSurface. */
+ *  with NO separate static plane and NO seabed occlusion. Quads are wound upward so the
+ *  water material can cull its invisible underside. */
 export function buildOceanSkirt(material: Material, size: number, extent: number): Mesh {
   const half = size * 0.5;
   const toUv = (c: number) => c / size + 0.5; // inverse of position = (uv-0.5)*size

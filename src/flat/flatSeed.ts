@@ -115,6 +115,14 @@ export function buildFlatSeed(w: number, h: number) {
       const seaDelta = e - FLAT.seaLevel;
       const coastFlatten = smooth(0.018, 0.16, Math.abs(seaDelta));
       e = FLAT.seaLevel + seaDelta * (0.38 + coastFlatten * 0.62);
+      if (seaDelta < 0) {
+        // Keep most submerged terrain on a broad, gently descending shelf. The
+        // organically warped edge distance then transitions it into the deep
+        // reservoir, avoiding a near-continuous cliff immediately off the beach.
+        const deepOcean = 1 - smooth(0.035, 0.16, coast);
+        const shelfScale = 0.2 + deepOcean * 0.8;
+        e = FLAT.seaLevel + (e - FLAT.seaLevel) * shelfScale;
+      }
       height[j * w + i] = Math.min(1, Math.max(0, e));
       const mst = (fbm(u * 2.3 + 31, v * 2.3 + 19, 5) - 0.5) * 2.2 + 0.5;
       moisture[j * w + i] = Math.min(1, Math.max(0, mst));

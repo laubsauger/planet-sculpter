@@ -8,17 +8,17 @@ import { Vector2 } from 'three';
 import {
   Fn, instanceIndex, textureLoad, textureStore, ivec2, uvec2, uint, int,
   float, vec2, vec4, max, min, length, mix, smoothstep, If, uniform,
-  mx_fractal_noise_float, sqrt, vec3, time, clamp, exp,
+  mx_fractal_noise_float, mx_noise_float, sqrt, vec3, time, clamp, exp, sin, dot, normalize, fract,
 } from 'three/tsl';
 import { GridField, buildGridCopy, buildGridFill, buildGridSeed } from '../sim/gridStore';
 import { mudViscosityFactor, waterUniforms } from '../sim/passes/water';
 import { erosionUniforms } from '../sim/passes/erosion';
-import { SIM } from '../config';
+import { FLAT, SIM } from '../config';
 import {
   evapFlowReduce, evapSpeedRef, evapDeepReduce, evapDeepRef, evapShallowRef,
   rainOrographic, rainHighRef,
 } from '../sim/gridWater';
-import { flatSeaLevel } from '../tsl/flatSurface';
+import { detailFreq, flatHeightScale, flatSeaLevel } from '../tsl/flatSurface';
 import { momentumSubstepCount } from './momentumCfl';
 
 type CN = Parameters<WebGPURenderer['compute']>[0];
@@ -60,10 +60,6 @@ function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture
     const hc = surf(ix, iy).add(emit.mul(0.04));
     const dc = textureLoad(d, ivec2(ix, iy)).x;
     const prev = textureLoad(fPrev, ivec2(ix, iy));
-    const prevL = textureLoad(fPrev, ivec2(cX(ix.sub(1), w), iy));
-    const prevR = textureLoad(fPrev, ivec2(cX(ix.add(1), w), iy));
-    const prevT = textureLoad(fPrev, ivec2(ix, cY(iy.add(1), h)));
-    const prevB = textureLoad(fPrev, ivec2(ix, cY(iy.sub(1), h)));
     const concentration = textureLoad(sediment, ivec2(ix, iy)).x.div(max(dc, float(EPS)));
     const viscosity = float(1).add(concentration.mul(mudViscosityFactor)).min(float(8));
     const k: any = p.dt.mul(p.pipeArea).mul(p.gravity).div(p.pipeLength).div(viscosity);
@@ -71,30 +67,11 @@ function flatFlux(b: StorageTexture, d: StorageTexture, sediment: StorageTexture
     let fR = max(float(0), prev.y.mul(p.damping).add(k.mul(hc.sub(surf(ix.add(1), iy)))));
     let fT = max(float(0), prev.z.mul(p.damping).add(k.mul(hc.sub(surf(ix, iy.add(1))))));
     let fB = max(float(0), prev.w.mul(p.damping).add(k.mul(hc.sub(surf(ix, iy.sub(1))))));
-    // A pipe cell normally forgets the direction of water entering from its
-    // neighbors. At a grade break that makes discharge stop until a pressure mound
-    // grows high enough to restart it. Transfer the coherent part of incoming flux
-    // into the forward outlet; the volume clamp below keeps the update conservative.
-    const inL = prevL.y, inR = prevR.x, inT = prevT.w, inB = prevB.z;
-    const incoming = inL.add(inR).add(inT).add(inB);
-    const incomingDir = vec2(inL.sub(inR), inB.sub(inT));
-    const coherence = length(incomingDir).div(max(incoming, float(EPS)));
-    const bedC = textureLoad(b, ivec2(ix, iy)).x;
-    const landToShelf = smoothstep(flatSeaLevel.sub(0.1), flatSeaLevel.add(0.01), bedC);
     const edgeDistance = min(
       min(ix.toFloat(), float(w - 1).sub(ix.toFloat())),
       min(iy.toFloat(), float(h - 1).sub(iy.toFloat())),
     );
     const edgeAbsorb = smoothstep(float(1), float(14), edgeDistance);
-    // Retain enough direction to cross a grade break, but deliberately lose it
-    // through the ocean mixing band. The previous stronger continuation made pipe
-    // water slosh and sent narrow sediment jets all the way offshore.
-    const continuation = coherence.mul(0.28).mul(edgeAbsorb)
-      .mul(mix(float(0.18), float(1), landToShelf));
-    fL = fL.add(max(float(0), incomingDir.x.mul(-1)).mul(continuation));
-    fR = fR.add(max(float(0), incomingDir.x).mul(continuation));
-    fT = fT.add(max(float(0), incomingDir.y).mul(continuation));
-    fB = fB.add(max(float(0), incomingDir.y.mul(-1)).mul(continuation));
     // Absorb directional pipe memory before it can reflect from the clamped edge.
     fL = fL.mul(edgeAbsorb);
     fR = fR.mul(edgeAbsorb);
@@ -134,6 +111,140 @@ function flatVelocity(f: StorageTexture, d: StorageTexture, velPrev: StorageText
       out.assign(vec4(mix(vx, prev.x, erosionUniforms.flowInertia), mix(vy, prev.y, erosionUniforms.flowInertia), 0, 1));
     });
     textureStore(velOut, uvec2(x, y), out).toWriteOnly();
+  });
+  return fn().compute(w * h) as CN;
+}
+
+/** Cache linear filters used by every water fragment. Computing these once per
+ * sim texel is far cheaper than repeating them for every high-DPI screen pixel.
+ * R = wide depth blur, G = center-weighted sediment blur. */
+function flatWaterVisual(
+  d: StorageTexture,
+  sediment: StorageTexture,
+  velocity: StorageTexture,
+  flux: StorageTexture,
+  out: StorageTexture,
+  w: number,
+  h: number,
+): CN {
+  const fn = Fn(() => {
+    const { x, y, ix, iy } = coords(w);
+    const dAt = (ox: number, oy: number) =>
+      textureLoad(d, ivec2(cX(ix.add(ox), w), cY(iy.add(oy), h))).x;
+    const sAt = (ox: number, oy: number) =>
+      textureLoad(sediment, ivec2(cX(ix.add(ox), w), cY(iy.add(oy), h))).x;
+    const depthWide = dAt(10, 10).add(dAt(-10, 10)).add(dAt(10, -10)).add(dAt(-10, -10)).mul(0.25);
+    const sedimentBlur = sAt(0, 0).mul(0.5)
+      .add(sAt(4, 0).add(sAt(-4, 0)).add(sAt(0, 4)).add(sAt(0, -4)).mul(0.125));
+    const vel = textureLoad(velocity, ivec2(ix, iy)).xy;
+    const fluxC = textureLoad(flux, ivec2(ix, iy));
+    const speed = length(vel);
+    const outgoing = fluxC.x.add(fluxC.y).add(fluxC.z).add(fluxC.w);
+    const pipeDir = normalize(vec2(fluxC.y.sub(fluxC.x), fluxC.z.sub(fluxC.w)).add(vec2(1e-6, 0)));
+    const velocityDir = normalize(vel.add(vec2(1e-6, 0)));
+    const agreement = smoothstep(0.0, 0.3, dot(velocityDir, pipeDir));
+    const flowDir = normalize(mix(pipeDir, velocityDir, agreement));
+    const confidence = smoothstep(0.008, 0.12, speed)
+      .mul(mix(float(0.35), float(1), agreement))
+      .mul(smoothstep(0.00001, 0.001, outgoing));
+    const visualFlow = flowDir.mul(speed).mul(confidence);
+    const pos = vec2(
+      ix.toFloat().div(float(w - 1)).sub(0.5).mul(FLAT.worldSize),
+      iy.toFloat().div(float(h - 1)).sub(0.5).mul(FLAT.worldSize),
+    );
+    const phaseA = fract(time.div(3.0));
+    const phaseB = fract(time.div(3.0).add(0.5));
+    const phaseWeight = float(1).sub(phaseA.sub(0.5).abs().mul(2));
+    const grad = (q: any) => {
+      const e = float(0.06);
+      const nz = (p: any) => mx_fractal_noise_float(vec3(p.x, p.y, 0).mul(1.5), 2);
+      return vec2(
+        nz(q.add(vec2(e, 0))).sub(nz(q.sub(vec2(e, 0)))),
+        nz(q.add(vec2(0, e))).sub(nz(q.sub(vec2(0, e)))),
+      );
+    };
+    const qA = pos.sub(visualFlow.mul(phaseA.mul(3.0 * 1.05)));
+    const qB = pos.sub(visualFlow.mul(phaseB.mul(3.0 * 1.05)));
+    const flowGrad = grad(qA).mul(phaseWeight).add(grad(qB).mul(float(1).sub(phaseWeight)));
+    const shallowFlow = float(1).sub(smoothstep(0.025, 0.08, dAt(0, 0)).mul(0.65));
+    const flowNormal = flowGrad.mul(speed.min(float(1.2)).mul(0.14).add(0.014))
+      .mul(shallowFlow).mul(confidence);
+    textureStore(out, uvec2(x, y), vec4(depthWide, sedimentBlur, flowNormal.x, flowNormal.y)).toWriteOnly();
+  });
+  return fn().compute(w * h) as CN;
+}
+
+/** Cache terrain material structure that was previously rebuilt from procedural
+ * noise for every screen pixel. RGB = structure center/dX/dZ, A = broad rock
+ * mottling. Material weights still follow the live sim fields. */
+function flatTerrainVisual(
+  b: StorageTexture,
+  loose: StorageTexture,
+  moisture: any,
+  out: StorageTexture,
+  surfaceOut: StorageTexture,
+  w: number,
+  h: number,
+): CN {
+  const fn = Fn(() => {
+    const { x, y, ix, iy } = coords(w);
+    const at = (tex: any, cx: any, cy: any) => textureLoad(tex, ivec2(cX(cx, w), cY(cy, h))).x;
+    const height = at(b, ix, iy);
+    const px = ix.toFloat().div(float(w - 1)).sub(0.5).mul(FLAT.worldSize);
+    const pz = iy.toFloat().div(float(h - 1)).sub(0.5).mul(FLAT.worldSize);
+    const p = vec3(px, height.mul(flatHeightScale), pz);
+    const dx = at(b, ix.add(1), iy).sub(at(b, ix.sub(1), iy))
+      .mul(flatHeightScale).mul((w - 1) / FLAT.worldSize * 0.5);
+    const dz = at(b, ix, iy.add(1)).sub(at(b, ix, iy.sub(1)))
+      .mul(flatHeightScale).mul((h - 1) / FLAT.worldSize * 0.5);
+    const slope = float(1).sub(float(1).div(sqrt(dx.mul(dx).add(dz.mul(dz)).add(1))));
+    const looseRatio = at(loose, ix, iy).div(0.022).min(float(1));
+    const exposure = max(
+      smoothstep(0.32, 0.55, slope),
+      float(1).sub(looseRatio),
+    ).min(float(1));
+    const sandMask = looseRatio.mul(float(1).sub(exposure))
+      .mul(float(1).sub(smoothstep(0.16, 0.42, height.sub(flatSeaLevel))));
+    const wSnow = smoothstep(0.55, 0.72, height);
+    const wRock = exposure.mul(float(1).sub(wSnow));
+    const wSand = sandMask.mul(float(1).sub(wSnow)).mul(float(1).sub(wRock));
+    const wGrass = smoothstep(0.28, 0.5, at(moisture, ix, iy))
+      .mul(float(1).sub(exposure)).mul(float(1).sub(wSnow)).mul(float(1).sub(wSand));
+    const wDirt = max(float(0), float(1).sub(wSnow).sub(wRock).sub(wSand).sub(wGrass));
+    const det = (q: any) => {
+      const freq = detailFreq.mul(0.4);
+      const grain = mx_fractal_noise_float(q.mul(freq), 3);
+      const dune = sin(q.x.mul(freq.mul(0.6)).add(q.z.mul(freq.mul(0.35))));
+      const strata = sin(q.y.mul(freq.mul(1.5)));
+      const ridge = float(0.4).sub(grain.abs());
+      return wSand.mul(dune.mul(0.7).add(grain.mul(0.3)))
+        .add(wGrass.mul(grain.mul(0.85)))
+        .add(wRock.mul(strata.mul(0.55).add(ridge.mul(0.9))))
+        .add(wSnow.mul(grain.mul(0.35)))
+        .add(wDirt.mul(grain.mul(0.6)));
+    };
+    const center = det(p);
+    const broadRock = mx_noise_float(p.mul(0.65)).mul(0.5).add(0.5);
+    const province = mx_noise_float(p.mul(1.3).add(vec3(4.3, 1.7, -2.8))).mul(0.5).add(0.5);
+    const rockStructure = broadRock.mul(0.18).sub(0.09).add(province.mul(0.1).sub(0.05));
+    textureStore(out, uvec2(x, y), vec4(
+      center,
+      det(p.add(vec3(0.04, 0, 0))).sub(center),
+      det(p.add(vec3(0, 0, 0.04))).sub(center),
+      rockStructure,
+    )).toWriteOnly();
+    const sandWarp = mx_noise_float(p.mul(1.4)).mul(1.2);
+    const sandMottle = mx_noise_float(p.mul(2.4).add(sandWarp)).mul(0.5).add(0.5);
+    const bedRipple = sin(p.x.mul(7.0).add(p.z.mul(2.6)).add(mx_noise_float(p.mul(1.8)).mul(2.0)))
+      .mul(0.5).add(0.5);
+    const bedMottle = mx_noise_float(p.mul(2.6).add(vec3(5, 0, 5))).mul(0.5).add(0.5);
+    const bedStructure = bedRipple.sub(0.5).mul(0.14).add(bedMottle.sub(0.5).mul(0.1));
+    textureStore(surfaceOut, uvec2(x, y), vec4(
+      sandMottle,
+      bedStructure,
+      mx_noise_float(p.mul(5.0)).mul(0.0012),
+      0,
+    )).toWriteOnly();
   });
   return fn().compute(w * h) as CN;
 }
@@ -681,7 +792,7 @@ function flatErosion(
         float(0.025),
         incomingDrop.sub(outgoingDrop.mul(1.35)),
       ).mul(directionalFlow);
-      const gradeBreakBrake = float(1).sub(gradeBreak.mul(0.98));
+      const gradeBreakBrake = float(1).sub(gradeBreak.mul(0.999));
       const looseChannelAllowance = max(float(0), bc.sub(routedBed)).add(float(0.0012))
         .mul(looseFrac).mul(directionalFlow)
         .mul(smoothstep(float(0.0002), float(0.004), outgoingDrop));
@@ -693,7 +804,7 @@ function flatErosion(
         .add(bAt(ix, iy.add(1))).add(bAt(ix, iy.sub(1))).mul(0.25);
       const incisionDepth = max(float(0), bankMean.sub(bc));
       const incisionBrake = float(1).sub(smoothstep(float(0.003), float(0.016), incisionDepth));
-      const erode = erodeBase.add(looseRework).mul(gradeBreakBrake).add(lateral.mul(incisionBrake))
+      const erode = erodeBase.add(looseRework).add(lateral.mul(incisionBrake)).mul(gradeBreakBrake)
         .mul(depthSuppress).mul(incisionBrake).mul(rate).min(ERODE_CAP).min(incisionLimit)
         .mul(hydraulicErosionEnabled);
       // ANTI-DAM: never deposit enough to raise the bed above the local water
@@ -940,20 +1051,23 @@ export class FlatSim {
   readonly loose: GridField;
   readonly source: GridField;
   readonly activity: GridField; // rg: recent erosion/deposition
+  readonly waterVisual: GridField; // r: wide depth, g: blurred sediment
+  readonly terrainVisual: GridField; // rgb: material structure + gradient, a: rock mottle
+  readonly terrainSurfaceVisual: GridField; // r: sand mottle, g: seabed structure, b: shore warp
   erosionEnabled = true;
   thermalEnabled = true;
   settleEnabled = true; // DEBUG: surface-preserving water settle after erosion
   momentumSubsteps = 1;
   private tickCount = 0;
   private _waterSolver: FlatWaterSolver = 'pipe';
-  private readonly nodes: { fluxN: CN; fluxC: CN; velN: CN; velC: CN; sedN: CN; sFlowC: CN; updN: CN; watC: CN; momN: CN; momC: CN; momSedN: CN; momSedC: CN; momVelN: CN; momVelC: CN; eroN: CN; settleN: CN; wEC: CN; bC: CN; loC: CN; sEC: CN; actC: CN; thN: CN; bTC: CN; loTC: CN };
+  private readonly nodes: { fluxN: CN; fluxC: CN; velN: CN; velC: CN; sedN: CN; sFlowC: CN; updN: CN; watC: CN; momN: CN; momC: CN; momSedN: CN; momSedC: CN; momVelN: CN; momVelC: CN; eroN: CN; settleN: CN; wEC: CN; bC: CN; loC: CN; sEC: CN; actC: CN; thN: CN; bTC: CN; loTC: CN; visualN: CN; terrainVisualN: CN };
   private readonly srcCenter = uniform(new Vector2(0.5, 0.5));
   private readonly srcRadius = uniform(0.04);
   private readonly srcRate = uniform(0);
   private readonly srcN: CN;
   private readonly srcC: CN;
 
-  constructor(private readonly renderer: WebGPURenderer, private readonly height: GridField, looseSeed: any, private readonly hardness: any, readonly w: number, readonly h: number) {
+  constructor(private readonly renderer: WebGPURenderer, private readonly height: GridField, looseSeed: any, private readonly moisture: any, private readonly hardness: any, readonly w: number, readonly h: number) {
     this.water = new GridField(w, h);
     this.flux = new GridField(w, h, true);
     this.momentum = new GridField(w, h, true);
@@ -962,12 +1076,18 @@ export class FlatSim {
     this.loose = new GridField(w, h, true);
     this.source = new GridField(w, h);
     this.activity = new GridField(w, h, true);
+    this.waterVisual = new GridField(w, h, true);
+    this.terrainVisual = new GridField(w, h, true);
+    this.terrainSurfaceVisual = new GridField(w, h, true);
     renderer.compute(buildGridFill(this.water.main, w, h, 0));
     renderer.compute(buildGridFill(this.momentum.main, w, h, 0));
     renderer.compute(buildGridFill(this.velocity.main, w, h, 0));
     renderer.compute(buildGridFill(this.sediment.main, w, h, 0));
     renderer.compute(buildGridFill(this.source.main, w, h, 0));
     renderer.compute(buildGridFill(this.activity.main, w, h, 0));
+    renderer.compute(buildGridFill(this.waterVisual.main, w, h, 0));
+    renderer.compute(buildGridFill(this.terrainVisual.main, w, h, 0));
+    renderer.compute(buildGridFill(this.terrainSurfaceVisual.main, w, h, 0));
     renderer.compute(flatLooseSeed(looseSeed, hardness, this.loose.main, w, h));
     renderer.compute(flatLooseSeed(looseSeed, hardness, this.loose.scratch, w, h));
     // Cadence normalization: per-invocation erosion amounts scale by
@@ -990,8 +1110,9 @@ export class FlatSim {
     // land. 0.78 is the tuned middle AT 60 ticks/s: pooled water pushes over
     // bars, no visible slosh. RETUNE this value if ticksPerSecond changes.
     // 0.78 read as superfluid live ("liquid nitrogen" — never calms, jumps bars
-    // effortlessly); 0.72 keeps pressure-driven drainage with believable settling.
-    if ((SIM.ticksPerSecond as number) !== SIM.tickRateRef) waterUniforms.damping.value = 0.72;
+    // effortlessly). 0.75 retains a restrained amount of valid pressure-generated
+    // motion without the unstable neighbor-direction continuation experiment.
+    if ((SIM.ticksPerSecond as number) !== SIM.tickRateRef) waterUniforms.damping.value = 0.75;
     const b = height.main;
     this.nodes = {
       fluxN: flatFlux(b, this.water.main, this.sediment.main, this.source.main, this.flux.main, this.flux.scratch, w, h),
@@ -1020,6 +1141,24 @@ export class FlatSim {
       thN: flatThermal(b, this.loose.main, this.water.main, this.hardness, height.scratch, this.loose.scratch, w, h),
       bTC: buildGridCopy(height.scratch, b, w, h),
       loTC: buildGridCopy(this.loose.scratch, this.loose.main, w, h),
+      visualN: flatWaterVisual(
+        this.water.main,
+        this.sediment.main,
+        this.velocity.main,
+        this.flux.main,
+        this.waterVisual.main,
+        w,
+        h,
+      ),
+      terrainVisualN: flatTerrainVisual(
+        b,
+        this.loose.main,
+        this.moisture,
+        this.terrainVisual.main,
+        this.terrainSurfaceVisual.main,
+        w,
+        h,
+      ),
     };
     const stamp = Fn(() => {
       const x = instanceIndex.mod(uint(w)), yy = instanceIndex.div(uint(w));
@@ -1059,6 +1198,7 @@ export class FlatSim {
     }
   }
   clearSources() { this.renderer.compute(buildGridFill(this.source.main, this.w, this.h, 0)); }
+  refreshTerrainVisual() { this.renderer.compute(this.nodes.terrainVisualN); }
   loadState(state: { height: any; loose: any; water: any; sediment: any; source: any }) {
     const r = this.renderer;
     this.tickCount = 0;
@@ -1077,14 +1217,17 @@ export class FlatSim {
       r.compute(buildGridFill(field.main, this.w, this.h, 0));
       r.compute(buildGridFill(field.scratch, this.w, this.h, 0));
     }
+    r.compute(this.nodes.visualN);
+    r.compute(this.nodes.terrainVisualN);
   }
   placeSource(u: number, v: number, rate: number, radius = 0.04) {
     this.srcCenter.value.set(u, v); this.srcRate.value = rate; this.srcRadius.value = radius;
     this.renderer.compute(this.srcN); this.renderer.compute(this.srcC);
   }
 
-  tick(dt: number) {
+  tick(dt: number): boolean {
     const r = this.renderer, n = this.nodes;
+    let terrainChanged = false;
     this.tickCount++;
     if (this._waterSolver === 'momentum') {
       this.momentumSubsteps = momentumSubstepCount(dt, waterUniforms.gravity.value);
@@ -1107,6 +1250,7 @@ export class FlatSim {
     // between terrain mutations. Faster bed edits make rivers repeatedly lose
     // their route at grade breaks before discharge can adjust.
     if (this.erosionEnabled && this.tickCount % SIM.erosionTickInterval === 0) {
+      terrainChanged = true;
       r.compute(n.eroN);
       // settle reads OLD bed (still in height.main) + NEW bed (height.scratch) -> must run
       // before bC overwrites height.main; wEC then lands the compensated water depth.
@@ -1121,5 +1265,8 @@ export class FlatSim {
         r.compute(n.bTC); r.compute(n.loTC);
       }
     }
+    r.compute(n.visualN);
+    if (terrainChanged) r.compute(n.terrainVisualN);
+    return terrainChanged;
   }
 }
