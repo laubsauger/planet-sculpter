@@ -76,6 +76,11 @@ export class FlatEngine {
   private sculptMode = false;
   private brushing = false;
   private riverMode = false;
+  // Shadow map renders ON DEMAND: terrain geometry only changes on sim ticks /
+  // brush stamps / height-scale edits, so re-rendering the 2048² map every frame
+  // (full 262k-vert depth pass) was pure waste. Identical image, just not redrawn
+  // when nothing moved.
+  private shadowDirty = true;
   private readonly brushSettings = { mode: 'raise' as BrushMode, radius: 0.035, strength: 0.012, rate: 0.4, target: 0.4 };
   private readonly water = { rainOn: false, rainRate: SIM.rainRate };
   private readonly river = { rate: 0.5, radius: 0.009 };
@@ -146,6 +151,7 @@ export class FlatEngine {
   async init(): Promise<void> {
     await this.renderer.init();
     this.renderer.shadowMap.enabled = true;
+    this.sun.shadow.autoUpdate = false; // re-rendered only when shadowDirty (sim tick/brush)
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 
@@ -247,7 +253,7 @@ export class FlatEngine {
     b.add(this.brushSettings, 'strength', 0, 0.1, 0.001);
     b.add({ sculpt: () => { this.sculptMode = !this.sculptMode; this.orbit.controls.enableRotate = !this.sculptMode; if (!this.sculptMode) this.cursor.visible = false; } }, 'sculpt').name('toggle sculpt [g]');
     const t = gui.addFolder('Terrain');
-    t.add(flatHeightScale, 'value', 0.5, 5, 0.05).name('height scale');
+    t.add(flatHeightScale, 'value', 0.5, 5, 0.05).name('height scale').onChange(() => { this.shadowDirty = true; });
     t.add(flatSeaLevel, 'value', 0, 0.7, 0.01).name('sea level');
     t.add(detailStrength, 'value', 0, 1.5, 0.02).name('detail strength');
     t.add(detailFreq, 'value', 1, 24, 0.5).name('detail freq');
@@ -303,6 +309,7 @@ export class FlatEngine {
     this.simAccum = 0;
     this.snapshotText = '';
     this.previousEarthMass = null;
+    this.shadowDirty = true;
     this.sidebar?.sync();
   }
 
@@ -451,6 +458,7 @@ export class FlatEngine {
     if (this.riverMode) { this.sim.placeSource(p.u, p.v, this.river.rate, this.river.radius); return; }
     this.brushing = true;
     this.brush.stamp(this.renderer, p.u, p.v, this.brushSettings);
+    this.shadowDirty = true;
   };
   private onMove = (e: PointerEvent): void => {
     if (!this.sculptMode) { this.cursor.visible = false; return; }
@@ -458,7 +466,7 @@ export class FlatEngine {
     const p = this.pickUv(); // also sets this.hit to the surface point
     if (!p) { this.cursor.visible = false; return; }
     this.updateCursor();
-    if (this.brushing) this.brush.stamp(this.renderer, p.u, p.v, this.brushSettings);
+    if (this.brushing) { this.brush.stamp(this.renderer, p.u, p.v, this.brushSettings); this.shadowDirty = true; }
   };
   private onUp = (): void => { this.brushing = false; };
   private onKey = (e: KeyboardEvent): void => {
@@ -489,6 +497,10 @@ export class FlatEngine {
       this.sim.tick(this.simInterval); this.simAccum -= this.simInterval; steps++;
     }
     if (this.simAccum > this.simInterval * SIM.maxStepsPerFrame) this.simAccum = 0;
+    if (steps > 0 || this.shadowDirty) {
+      this.sun.shadow.needsUpdate = true;
+      this.shadowDirty = false;
+    }
     const simCpuMs = performance.now() - simStart;
     this.simCpuMsEma += (simCpuMs - this.simCpuMsEma) * 0.1;
 

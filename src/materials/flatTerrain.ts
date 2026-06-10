@@ -6,11 +6,11 @@
 import { FrontSide, type Texture } from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
 import {
-  textureLoad, uv, mix, smoothstep, max, min, float, vec3, normalize,
+  textureLoad, uv, mix, smoothstep, max, min, float, vec3, normalize, positionWorld,
   mx_noise_float, mx_fractal_noise_float, cameraViewMatrix, transformDirection, sin, time, uniform, fract,
 } from 'three/tsl';
 import {
-  flatSurface, bilinear, flatSeaLevel, flatGridX, flatGridY, detailFreq, detailStrength,
+  flatSurface, bilinearTex, bicubicTex, flatSeaLevel, flatGridX, flatGridY, detailFreq, detailStrength,
 } from '../tsl/flatSurface';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -51,11 +51,15 @@ export function makeFlatTerrain(
   activityTex: Texture,
 ): MeshStandardNodeMaterial {
   const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
-  const bl = (t: Texture) => bilinear((c: any) => textureLoad(t, c).x, fx, fy);
-  const blVec = (t: Texture) => bilinear((c: any) => textureLoad(t, c), fx, fy);
+  // hardware-filtered bilinear: one fetch per field instead of 4 loads + lerp ALU.
+  const bl = (t: Texture) => bilinearTex(t, fx, fy).x;
+  const blVec = (t: Texture) => bilinearTex(t, fx, fy);
 
   const s = flatSurface((c: any) => textureLoad(heightTex, c).x);
-  const h = s.height;
+  // Same Catmull-Rom surface the vertex stage displaces by, evaluated in the
+  // fragment via 9 hardware-bilinear fetches instead of re-running the 16-load
+  // bicubic per pixel.
+  const h = bicubicTex(heightTex, fx, fy);
   const slope = s.slope;
   const moisture = bl(moistureTex);
   const erod = bl(hardnessTex);
@@ -80,7 +84,10 @@ export function makeFlatTerrain(
   // and `fracture` painted flat contour/crack LINES (the "squiggly line" artifact). Rock
   // layering/shale now lives in the per-type detail NORMAL below, where it reads as lit
   // relief instead of a painted line.
-  const p = s.position;
+  // positionWorld = the rasterizer-interpolated displaced surface the pixel actually
+  // sits on — same coordinates the old per-fragment re-evaluation of s.position
+  // produced (sub-texel difference at most), without re-running the 16-tap bicubic.
+  const p = positionWorld;
   const broadRock = mx_noise_float(p.mul(0.65)).mul(0.5).add(0.5);
   const province = mx_noise_float(p.mul(1.3).add(vec3(4.3, 1.7, -2.8))).mul(0.5).add(0.5);
   const rockStructure = broadRock.mul(0.18).sub(0.09).add(province.mul(0.1).sub(0.05));

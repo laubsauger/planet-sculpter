@@ -1,9 +1,11 @@
 // W×H storage-texture helpers for the equirect single grid (replaces the 6-face
-// FieldSet). r32float / rgba32float, NearestFilter (sim reads exact texels;
-// the material does its own bilinear). Longitude wraps in-shader via mod, so the
-// texture itself just clamps.
+// FieldSet). r32float / rgba32float, LinearFilter so materials can use ONE
+// hardware-filtered fetch instead of a manual 4-tap bilinear (needs the
+// float32-filterable WebGPU feature, which three requests when available).
+// The sim is unaffected: compute passes read via textureLoad, which addresses
+// exact texels and bypasses the sampler entirely.
 
-import { DataTexture, RedFormat, RGBAFormat, FloatType, NearestFilter, ClampToEdgeWrapping } from 'three';
+import { DataTexture, RedFormat, RGBAFormat, FloatType, LinearFilter, ClampToEdgeWrapping } from 'three';
 import { StorageTexture } from 'three/webgpu';
 import { Fn, instanceIndex, textureLoad, textureStore, ivec2, uvec2, uint, int, vec4 } from 'three/tsl';
 
@@ -11,8 +13,8 @@ export function makeGridStorage(w: number, h: number, rgba = false): StorageText
   const t = new StorageTexture(w, h);
   t.format = rgba ? RGBAFormat : RedFormat;
   t.type = FloatType;
-  t.magFilter = NearestFilter;
-  t.minFilter = NearestFilter;
+  t.magFilter = LinearFilter;
+  t.minFilter = LinearFilter;
   t.wrapS = ClampToEdgeWrapping;
   t.wrapT = ClampToEdgeWrapping;
   return t;

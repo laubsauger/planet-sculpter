@@ -8,9 +8,9 @@ import { DoubleSide, type Texture } from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import {
   textureLoad, uv, mix, smoothstep, max, clamp, float, vec2, vec3, length,
-  normalize, dot, pow, sin, cos, time, cameraPosition, mx_fractal_noise_float, uniform,
+  normalize, dot, pow, sin, cos, time, cameraPosition, positionWorld, mx_fractal_noise_float, uniform,
 } from 'three/tsl';
-import { flatSurface, bilinear, bicubicClamped, flatGridX, flatGridY, flatSeaLevel } from '../tsl/flatSurface';
+import { flatSurface, bilinearTex, bicubicClampedTex, flatGridX, flatGridY, flatSeaLevel } from '../tsl/flatSurface';
 import { sunDirUniform, sunIntensityU } from '../tsl/lighting';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -40,27 +40,28 @@ export function makeFlatWater(
   const s = flatSurface((c: any) => textureLoad(heightTex, c).x.add(textureLoad(waterTex, c).x), true);
   // bicubic depth -> smooth (C1) color + alpha edge instead of grid-aligned bilinear
   // stair-steps that read as pixelation along the waterline.
-  const depth = bicubicClamped((c: any) => textureLoad(waterTex, c).x, fx, fy);
-  // Gradient neighbours use cheap BILINEAR (not bicubic) — 4 taps each vs 16. The waterline
-  // smoothness comes from the bicubic `depth`; the gradient only needs an approximate slope.
-  const depthL = bilinear((c: any) => textureLoad(waterTex, c).x, fx.sub(2), fy);
-  const depthR = bilinear((c: any) => textureLoad(waterTex, c).x, fx.add(2), fy);
-  const depthB = bilinear((c: any) => textureLoad(waterTex, c).x, fx, fy.sub(2));
-  const depthT = bilinear((c: any) => textureLoad(waterTex, c).x, fx, fy.add(2));
+  const depth = bicubicClampedTex(waterTex, fx, fy);
+  // Gradient neighbours use cheap BILINEAR (not bicubic) — hardware-filtered, 1 fetch each.
+  // The waterline smoothness comes from the bicubic `depth`; the gradient only needs an
+  // approximate slope.
+  const depthL = bilinearTex(waterTex, fx.sub(2), fy).x;
+  const depthR = bilinearTex(waterTex, fx.add(2), fy).x;
+  const depthB = bilinearTex(waterTex, fx, fy.sub(2)).x;
+  const depthT = bilinearTex(waterTex, fx, fy.add(2)).x;
   const depthGradient = length(vec2(depthR.sub(depthL), depthT.sub(depthB)));
   // Wide spatial blur of depth, used ONLY for the deep color/opacity cues. The bathymetric
   // shelf is steep (depth jumps over a few cells), so any sharp depth->color/opacity ramp
   // draws a hard line right there. Averaging depth over a wide kernel spreads that transition
   // smoothly across the surface. `depthColor` stays CRISP in the shallows (clean waterline +
   // caustics + foam keep their sharp `depth`) and blends to the blurred field in deeper water.
-  const dW = (ox: number, oy: number) => bilinear((c: any) => textureLoad(waterTex, c).x, fx.add(ox), fy.add(oy));
+  const dW = (ox: number, oy: number) => bilinearTex(waterTex, fx.add(ox), fy.add(oy)).x;
   const depthWide = dW(10, 10).add(dW(-10, 10)).add(dW(10, -10)).add(dW(-10, -10)).mul(1 / 4);
   const depthColor = mix(depth, depthWide, smoothstep(0.02, 0.12, depth));
-  const vel = bilinear((c: any) => textureLoad(velTex, c).xy, fx, fy);
-  const flux = bilinear((c: any) => textureLoad(fluxTex, c), fx, fy);
+  const vel = bilinearTex(velTex, fx, fy).xy;
+  const flux = bilinearTex(fluxTex, fx, fy);
   // Center-weighted blur of sediment so muddy plumes have SOFT edges that merge into the
   // ocean, instead of hard-contrast shapes. (Turbidity ramp below is also widened.)
-  const sed = (ox: number, oy: number) => bilinear((c: any) => textureLoad(sedimentTex, c).x, fx.add(ox), fy.add(oy));
+  const sed = (ox: number, oy: number) => bilinearTex(sedimentTex, fx.add(ox), fy.add(oy)).x;
   const sediment = sed(0, 0).mul(0.5)
     .add(sed(4, 0).add(sed(-4, 0)).add(sed(0, 4)).add(sed(0, -4)).mul(0.125));
   const speed = length(vec2(vel.x, vel.y));
@@ -81,8 +82,10 @@ export function makeFlatWater(
     .mul(smoothstep(0.00001, 0.001, outgoing));
   const visualFlow = flowDir.mul(speed).mul(directionConfidence);
 
-  // calm wave + flow normals (subtle ripple, not noise soup).
-  const posXZ = vec2(s.position.x, s.position.z);
+  // calm wave + flow normals (subtle ripple, not noise soup). positionWorld is the
+  // rasterizer-interpolated displaced surface — identical to re-deriving from uv
+  // (x/z are linear in uv), with zero fragment recomputation.
+  const posXZ = vec2(positionWorld.x, positionWorld.z);
   const e = float(0.06);
   const grad = (q: any, freq: number) => {
     const nz = (p: any) => mx_fractal_noise_float(vec3(p.x, p.y, 0).mul(freq), 2);
@@ -98,7 +101,7 @@ export function makeFlatWater(
   // on land — rivers, rain runoff, puddles — must read by its OWN flow (flowR), never
   // share one global wave. Gate the swell by an ocean-basin mask so it can't bleed onto
   // land water and produce that homogeneous diagonal pattern when it rains / on rivers.
-  const bed = bilinear((c: any) => textureLoad(heightTex, c).x, fx, fy);
+  const bed = bilinearTex(heightTex, fx, fy).x;
   const oceanMask = float(1).sub(smoothstep(flatSeaLevel.sub(0.03), flatSeaLevel, bed));
   const still = float(1).sub(smoothstep(0.03, 0.3, speed));
   // Open-ocean stylized swell: long rolling crest lines along a fixed wind direction,
@@ -175,7 +178,7 @@ export function makeFlatWater(
   col = mix(col, SKY_REFLECT, streakStrength.mul(flowBandStrength));
 
   // world-space lighting: gentle sun diffuse keeps base bright + readable any angle.
-  const viewW = normalize(cameraPosition.sub(s.position));
+  const viewW = normalize(cameraPosition.sub(positionWorld));
   const ndl = max(float(0), dot(nW, sunDirUniform));
   col = col.mul(ndl.mul(0.35).add(0.75));
   // fresnel sky reflection (rim, additive bonus). DEPTH-GATED: deep water must NOT get
