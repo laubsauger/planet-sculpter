@@ -183,6 +183,7 @@ export class FlatEngine {
       this.sim.water.main,
       this.sim.sediment.main,
       this.sim.activity.main,
+      this.sim.velocity.main,
     );
     this.debugMaterial = makeFlatDebug(
       this.heightField.main,

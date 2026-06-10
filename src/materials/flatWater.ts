@@ -7,7 +7,7 @@
 import { DoubleSide, type Texture } from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import {
-  textureLoad, uv, mix, smoothstep, max, clamp, float, vec2, vec3, length, Fn, Discard,
+  textureLoad, uv, mix, smoothstep, max, clamp, float, vec2, vec3, length, Fn, Discard, fract,
   normalize, dot, pow, sin, cos, time, cameraPosition, positionWorld, mx_fractal_noise_float, uniform,
 } from 'three/tsl';
 import { flatSurface, bilinearTex, bicubicClampedTex, flatGridX, flatGridY, flatSeaLevel } from '../tsl/flatSurface';
@@ -102,9 +102,22 @@ export function makeFlatWater(
   // Full ripple on shallow flow; deep moving water keeps ~35% instead of cutting
   // to a dead-flat mirror at depth 0.08 (deep slow rivers looked static).
   const shallowFlow = float(1).sub(smoothstep(0.025, 0.08, depth).mul(0.65));
+  // FLOWMAP advection (bounded shear): naive `pos - flow·time` with a spatially
+  // varying flow shears any pattern into ever-finer filaments as time grows —
+  // after a minute every strong flow was fingerprint-fine static. Two advection
+  // windows half a period apart, triangle cross-faded, keep the pattern moving
+  // with the current while resetting the shear every `period` seconds.
+  const flowSampled = (fnq: (q: any) => any, rate: number, period: number) => {
+    const ph1 = fract(time.div(period));
+    const ph2 = fract(time.div(period).add(0.5));
+    const w1 = float(1).sub(ph1.sub(0.5).abs().mul(2));
+    const q1 = posXZ.sub(visualFlow.mul(ph1.mul(period * rate)));
+    const q2 = posXZ.sub(visualFlow.mul(ph2.mul(period * rate)));
+    return fnq(q1).mul(w1).add(fnq(q2).mul(float(1).sub(w1)));
+  };
   // Ripples advect at ~the actual current speed (0.22 read as molasses — the
   // pattern crawled while the sim water clearly moved faster).
-  const flowR = oceanOnly ? vec3(0, 0, 0) : grad(posXZ.sub(visualFlow.mul(time.mul(0.85))), 1.5)
+  const flowR = oceanOnly ? vec3(0, 0, 0) : flowSampled((q: any) => grad(q, 1.5), 0.85, 3.0)
     .mul(speed.min(float(1.2)).mul(0.11).add(0.012))
     .mul(shallowFlow).mul(directionConfidence);
   // Ambient swell belongs to the OPEN OCEAN ONLY (bedrock below sea level). All water
@@ -184,11 +197,13 @@ export function makeFlatWater(
     // wherever flowDir rotates (eddies/confluences) and flickers at distance.
     // LOW frequency (shore-wave register, a notch smaller) — band strength is
     // GRADED by speed so a lazy drift reads faint and a strong current bold.
-    const flowQ = posXZ.sub(visualFlow.mul(time.mul(2.2)));
-    const smear = (o: number) => mx_fractal_noise_float(
-      vec3(flowQ.sub(flowDir.mul(o)).mul(flowBandScale.mul(0.25)), time.mul(0.12)), 2,
-    );
-    const elong = smear(0).add(smear(0.3)).add(smear(0.6)).mul(1 / 3).mul(0.5).add(0.5);
+    const alongSmear = (q: any) => {
+      const sm = (o: number) => mx_fractal_noise_float(
+        vec3(q.sub(flowDir.mul(o)).mul(flowBandScale.mul(0.25)), time.mul(0.12)), 2,
+      );
+      return sm(0).add(sm(0.3)).add(sm(0.6)).mul(1 / 3);
+    };
+    const elong = flowSampled(alongSmear, 2.2, 3.0).mul(0.5).add(0.5);
     const streak = smoothstep(0.55, 0.85, elong);
     const speedRamp = smoothstep(0.02, 0.5, speed);
     // Deep-river fade widened (was gone by depth 0.2): a deep slow river still
@@ -270,11 +285,13 @@ export function makeFlatWater(
     // offset along the perpendicular axis — at half the old frequency. Bands
     // travel downstream with the flow; still no sin-phase anywhere, so no moiré.
     const acrossDir = vec2(flowDir.y.negate(), flowDir.x);
-    const churnQ = posXZ.sub(visualFlow.mul(time.mul(1.4)));
-    const cs = (o: number) => mx_fractal_noise_float(
-      vec3(churnQ.sub(acrossDir.mul(o)).mul(0.9), time.mul(0.45)), 2,
-    );
-    const churn = cs(0).add(cs(0.25)).add(cs(0.5)).mul(1 / 3).mul(0.5).add(0.5);
+    const crossSmear = (q: any) => {
+      const cs = (o: number) => mx_fractal_noise_float(
+        vec3(q.sub(acrossDir.mul(o)).mul(0.9), time.mul(0.45)), 2,
+      );
+      return cs(0).add(cs(0.25)).add(cs(0.5)).mul(1 / 3);
+    };
+    const churn = flowSampled(crossSmear, 1.4, 3.5).mul(0.5).add(0.5);
     const patches = smoothstep(float(0.62).sub(power.mul(0.4)), float(0.82).sub(power.mul(0.18)), churn);
     const whitewater = power.mul(float(0.3).add(patches.mul(0.7)))
       .mul(smoothstep(0.00008, 0.0015, depth))

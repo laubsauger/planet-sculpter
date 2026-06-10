@@ -6,7 +6,7 @@
 import { FrontSide, type Texture } from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
 import {
-  textureLoad, uv, mix, smoothstep, max, min, float, vec3, normalize, positionWorld,
+  textureLoad, uv, mix, smoothstep, max, min, float, vec3, normalize, positionWorld, length, cameraPosition,
   mx_noise_float, mx_fractal_noise_float, cameraViewMatrix, transformDirection, sin, time, uniform, fract,
 } from 'three/tsl';
 import {
@@ -49,6 +49,7 @@ export function makeFlatTerrain(
   waterTex: Texture,
   sedimentTex: Texture,
   activityTex: Texture,
+  velocityTex: Texture,
 ): MeshStandardNodeMaterial {
   const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
   // hardware-filtered bilinear: one fetch per field instead of 4 loads + lerp ALU.
@@ -178,7 +179,14 @@ export function makeFlatTerrain(
   const cpA = p.x.mul(12.4).add(p.z.mul(7.4)).add(time.mul(0.8)).add(cWarp.mul(2.6)).add(sin(p.z.mul(4.0).sub(time.mul(0.3))).mul(1.4));
   const cpB = p.x.mul(-7.6).add(p.z.mul(13.8)).sub(time.mul(0.62)).sub(cWarp.mul(2.2)).add(sin(p.x.mul(3.6).add(time.mul(0.24))).mul(1.3));
   const caustics = max(float(1).sub(smoothstep(0.015, 0.1, sin(cpA).abs())), float(1).sub(smoothstep(0.015, 0.1, sin(cpB).abs())));
-  const causticZone = smoothstep(0.001, 0.012, sub).mul(float(1).sub(smoothstep(0.05, 0.16, sub)));
+  // Caustics need CALM water (a churned surface can't focus light) and a close
+  // enough camera that the thin lines resolve — under fast flows / from a
+  // distance they alias into white per-pixel static (the "TV noise" on rapids).
+  const flowSpeed = (bilinearTex(velocityTex, fx, fy) as any).xy;
+  const causticCalm = float(1).sub(smoothstep(0.06, 0.22, length(flowSpeed)));
+  const causticResolve = float(1).sub(smoothstep(10.0, 18.0, length(cameraPosition.sub(positionWorld))));
+  const causticZone = smoothstep(0.001, 0.012, sub).mul(float(1).sub(smoothstep(0.05, 0.16, sub)))
+    .mul(causticCalm).mul(causticResolve);
   // Broad, slowly DRIFTING noise mask so the caustic intensity isn't a uniform sheet at the
   // same opacity everywhere — bright pools and dim patches move across the world like light
   // filtering through a rippling surface.
