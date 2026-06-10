@@ -4,8 +4,8 @@
 
 import {
   Scene, PerspectiveCamera, DirectionalLight, HemisphereLight, AmbientLight, Color, Fog,
-  Vector2, Vector3, Raycaster, Plane, Mesh, TimestampQuery, DataTexture, RedFormat, FloatType, Object3D,
-  PlaneGeometry, MeshBasicMaterial, DoubleSide,
+  Vector2, Vector3, Raycaster, Mesh, TimestampQuery, DataTexture, RedFormat, FloatType, Object3D,
+  PlaneGeometry, RingGeometry, MeshBasicMaterial, DoubleSide,
 } from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import GUI from 'lil-gui';
@@ -72,14 +72,18 @@ export class FlatEngine {
 
   private readonly ndc = new Vector2();
   private readonly raycaster = new Raycaster();
-  private readonly plane = new Plane(new Vector3(0, 1, 0), 0);
   private readonly hit = new Vector3();
   private sculptMode = false;
   private brushing = false;
   private riverMode = false;
-  private readonly brushSettings = { mode: 'raise' as BrushMode, radius: 0.06, strength: 0.02, rate: 0.4, target: 0.4 };
+  private readonly brushSettings = { mode: 'raise' as BrushMode, radius: 0.035, strength: 0.012, rate: 0.4, target: 0.4 };
   private readonly water = { rainOn: false, rainRate: SIM.rainRate };
   private readonly river = { rate: 0.5, radius: 0.009 };
+  // CPU mirror of the height field for accurate ray->surface picking (throttled readback).
+  private heightMirror: Float32Array | null = null;
+  private mirrorPending = false;
+  private lastMirrorTime = 0;
+  private cursor!: Mesh;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -159,6 +163,7 @@ export class FlatEngine {
     this.heightField = new GridField(W, H);
     this.renderer.compute(buildGridSeed(seed.height.texture as never, this.heightField.main, W, H));
     this.brush = new FlatBrush(this.heightField.main, this.heightField.scratch, W, H);
+    this.heightMirror = new Float32Array((seed.height.texture.image as { data: Float32Array }).data);
 
     this.sim = new FlatSim(this.renderer, this.heightField, seed.loose.texture as never, seed.hardness.texture as never, W, H);
 
@@ -203,11 +208,23 @@ export class FlatEngine {
     const skirt = buildOceanSkirt(water, FLAT.worldSize, FLAT.worldSize * 4);
     this.scene.add(skirt);
 
+    // Brush cursor: a thin ring laid on the terrain at the picked surface point, drawn on top
+    // (depthTest off) so it's always visible. Scaled to the brush radius, tinted per tool.
+    this.cursor = new Mesh(
+      new RingGeometry(0.82, 1.0, 56),
+      new MeshBasicMaterial({ color: 0x4ad6a0, transparent: true, opacity: 0.85, side: DoubleSide, depthTest: false, depthWrite: false }),
+    );
+    this.cursor.rotation.x = -Math.PI / 2;
+    this.cursor.renderOrder = 20;
+    this.cursor.frustumCulled = false;
+    this.cursor.visible = false;
+    this.scene.add(this.cursor);
+
     this.buildGui();
     this.sidebar = new Sidebar({
       brush: this.brushSettings,
       isSculpt: () => this.sculptMode,
-      setSculpt: (on) => { this.sculptMode = on; this.orbit.controls.enableRotate = !on; },
+      setSculpt: (on) => { this.sculptMode = on; this.orbit.controls.enableRotate = !on; if (!on) this.cursor.visible = false; },
       isRiver: () => this.riverMode,
       setRiver: (on) => { this.riverMode = on; },
       isVolcano: () => false,
@@ -228,7 +245,7 @@ export class FlatEngine {
     b.add(this.brushSettings, 'mode', ['raise', 'lower', 'smooth', 'flatten']);
     b.add(this.brushSettings, 'radius', 0.01, 0.25, 0.005);
     b.add(this.brushSettings, 'strength', 0, 0.1, 0.001);
-    b.add({ sculpt: () => { this.sculptMode = !this.sculptMode; this.orbit.controls.enableRotate = !this.sculptMode; } }, 'sculpt').name('toggle sculpt [g]');
+    b.add({ sculpt: () => { this.sculptMode = !this.sculptMode; this.orbit.controls.enableRotate = !this.sculptMode; if (!this.sculptMode) this.cursor.visible = false; } }, 'sculpt').name('toggle sculpt [g]');
     const t = gui.addFolder('Terrain');
     t.add(flatHeightScale, 'value', 0.5, 5, 0.05).name('height scale');
     t.add(flatSeaLevel, 'value', 0, 0.7, 0.01).name('sea level');
@@ -337,14 +354,89 @@ export class FlatEngine {
     });
   }
 
-  /** ndc -> world plane (y=0) -> uv in [0,1]. */
+  /** Bilinear height (0..1) from the CPU mirror at uv. */
+  private sampleHeight(u: number, v: number): number {
+    const m = this.heightMirror;
+    if (!m) return FLAT.seaLevel;
+    const W = FLAT.gridW, H = FLAT.gridH;
+    const fx = Math.min(W - 1, Math.max(0, u * (W - 1)));
+    const fy = Math.min(H - 1, Math.max(0, v * (H - 1)));
+    const x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const x1 = Math.min(W - 1, x0 + 1), y1 = Math.min(H - 1, y0 + 1);
+    const tx = fx - x0, ty = fy - y0;
+    const h0 = m[y0 * W + x0] * (1 - tx) + m[y0 * W + x1] * tx;
+    const h1 = m[y1 * W + x0] * (1 - tx) + m[y1 * W + x1] * tx;
+    return h0 * (1 - ty) + h1 * ty;
+  }
+
+  /** ndc -> RAYMARCH against the displaced heightfield -> uv of the FIRST (nearest) hit. A
+   *  naive "intersect horizontal plane at the sampled height" iteration converges to where the
+   *  ray exits to sea level BEHIND a peak, not the near face under the cursor — so we march
+   *  forward from the camera and take the first step where the ray drops below the surface,
+   *  then binary-refine. Sets `this.hit` to the surface world point (used by the cursor). */
   private pickUv(): { u: number; v: number } | null {
     this.raycaster.setFromCamera(this.ndc, this.camera);
-    if (!this.raycaster.ray.intersectPlane(this.plane, this.hit)) return null;
-    const u = this.hit.x / FLAT.worldSize + 0.5;
-    const v = this.hit.z / FLAT.worldSize + 0.5;
+    const o = this.raycaster.ray.origin, d = this.raycaster.ray.direction;
+    const scale = flatHeightScale.value, size = FLAT.worldSize;
+    const terrainAt = (t: number): number => {
+      const u = (o.x + d.x * t) / size + 0.5, v = (o.z + d.z * t) / size + 0.5;
+      if (u < 0 || u > 1 || v < 0 || v > 1) return -Infinity; // off-grid: nothing to hit
+      return this.sampleHeight(u, v) * scale;
+    };
+    const maxT = size * 4, steps = 192;
+    let tPrev = 0, hitT = -1;
+    for (let i = 1; i <= steps; i++) {
+      const t = (i / steps) * maxT;
+      if (o.y + d.y * t < terrainAt(t)) { // dropped below surface -> crossed between tPrev..t
+        let a = tPrev, b = t;
+        for (let k = 0; k < 10; k++) {
+          const m = (a + b) * 0.5;
+          if (o.y + d.y * m < terrainAt(m)) b = m; else a = m;
+        }
+        hitT = (a + b) * 0.5; break;
+      }
+      tPrev = t;
+    }
+    if (hitT < 0) return null;
+    this.hit.set(o.x + d.x * hitT, o.y + d.y * hitT, o.z + d.z * hitT);
+    const u = this.hit.x / size + 0.5, v = this.hit.z / size + 0.5;
     if (u < 0 || u > 1 || v < 0 || v > 1) return null;
     return { u, v };
+  }
+
+  /** Throttled async readback to keep the CPU height mirror roughly in sync with the GPU
+   *  field (which erosion mutates each tick). One pixel-perfect picking source, no hot-loop. */
+  private resyncHeightMirror(time: number): void {
+    if (this.mirrorPending || time - this.lastMirrorTime < 120) return;
+    this.mirrorPending = true;
+    this.lastMirrorTime = time;
+    type RB = { copyTextureToBuffer(t: unknown, x: number, y: number, w: number, h: number, f: number): Promise<{ length: number;[i: number]: number }> };
+    const backend = this.renderer.backend as unknown as RB;
+    backend.copyTextureToBuffer(this.heightField.main, 0, 0, FLAT.gridW, FLAT.gridH, 0)
+      .then((data) => {
+        if (!this.heightMirror || this.heightMirror.length !== data.length) this.heightMirror = new Float32Array(data.length);
+        for (let i = 0; i < data.length; i++) this.heightMirror[i] = Number(data[i]);
+        this.mirrorPending = false;
+      })
+      .catch(() => { this.mirrorPending = false; });
+  }
+
+  private cursorColor(): number {
+    if (this.riverMode) return 0x46c8ff;
+    switch (this.brushSettings.mode) {
+      case 'lower': return 0xff6b6b;
+      case 'smooth': return 0x6ba8ff;
+      case 'flatten': return 0xffd24a;
+      default: return 0x4ad6a0; // raise
+    }
+  }
+
+  private updateCursor(): void {
+    const r = (this.riverMode ? this.river.radius : this.brushSettings.radius) * FLAT.worldSize;
+    this.cursor.position.set(this.hit.x, this.hit.y + 0.04, this.hit.z);
+    this.cursor.scale.set(r, r, r);
+    (this.cursor.material as MeshBasicMaterial).color.setHex(this.cursorColor());
+    this.cursor.visible = true;
   }
   private setNdc(e: PointerEvent): void {
     this.ndc.set((e.clientX / window.innerWidth) * 2 - 1, -(e.clientY / window.innerHeight) * 2 + 1);
@@ -355,20 +447,23 @@ export class FlatEngine {
     this.setNdc(e);
     const p = this.pickUv();
     if (!p) return;
+    this.updateCursor();
     if (this.riverMode) { this.sim.placeSource(p.u, p.v, this.river.rate, this.river.radius); return; }
     this.brushing = true;
     this.brush.stamp(this.renderer, p.u, p.v, this.brushSettings);
   };
   private onMove = (e: PointerEvent): void => {
-    if (!this.brushing) return;
+    if (!this.sculptMode) { this.cursor.visible = false; return; }
     this.setNdc(e);
-    const p = this.pickUv();
-    if (p) this.brush.stamp(this.renderer, p.u, p.v, this.brushSettings);
+    const p = this.pickUv(); // also sets this.hit to the surface point
+    if (!p) { this.cursor.visible = false; return; }
+    this.updateCursor();
+    if (this.brushing) this.brush.stamp(this.renderer, p.u, p.v, this.brushSettings);
   };
   private onUp = (): void => { this.brushing = false; };
   private onKey = (e: KeyboardEvent): void => {
     switch (e.key) {
-      case 'g': this.sculptMode = !this.sculptMode; this.orbit.controls.enableRotate = !this.sculptMode; break;
+      case 'g': this.sculptMode = !this.sculptMode; this.orbit.controls.enableRotate = !this.sculptMode; if (!this.sculptMode) this.cursor.visible = false; break;
       case '1': this.brushSettings.mode = 'raise'; this.riverMode = false; break;
       case '2': this.brushSettings.mode = 'lower'; this.riverMode = false; break;
       case '3': this.brushSettings.mode = 'smooth'; this.riverMode = false; break;
@@ -397,6 +492,7 @@ export class FlatEngine {
     const simCpuMs = performance.now() - simStart;
     this.simCpuMsEma += (simCpuMs - this.simCpuMsEma) * 0.1;
 
+    this.resyncHeightMirror(time);
     this.orbit.update();
     const computeCalls = this.renderer.info.compute.calls;
     const computeDelta = computeCalls - this.lastComputeCalls;
