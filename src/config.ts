@@ -27,6 +27,13 @@ export const FLAT = {
   heightScale: 3.8, // max Y displacement of height=1 (steep mountains)
   seaLevel: 0.26, // normalized height of the sea surface (~80% land above)
   meshDetail: 1, // reconstruction/shading smooth the sim grid without multiplying triangles
+  /** Water sheet tessellation relative to the sim grid. The liquid surface is C1-smooth
+   *  (bicubic) and ALL its shading (depth color, opacity, foam, waterline) is per-PIXEL
+   *  from the full-res sim textures — only the sheet's geometric elevation coarsens.
+   *  0.5 measured pixel-equivalent to 1.0 (diff at/below the animation noise floor in
+   *  overview, grid-edge and river close-up A/B) while cutting ~9ms GPU: the 512² sheet
+   *  was ~0.7px/triangle = pure raster/quad-overdraw waste. */
+  waterMeshDetail: 0.5,
 } as const;
 
 export const SIM = {

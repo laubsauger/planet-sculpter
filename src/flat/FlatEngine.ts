@@ -206,12 +206,24 @@ export class FlatEngine {
       this.sim.velocity.main,
       this.sim.sediment.main,
     );
-    this.waterMesh = buildFlatMesh(mW, mH, water);
+    const wW = Math.round(W * FLAT.waterMeshDetail), wH = Math.round(H * FLAT.waterMeshDetail);
+    this.waterMesh = buildFlatMesh(wW, wH, water);
     this.waterMesh.renderOrder = 1;
     this.scene.add(this.waterMesh);
-    // Same water material, extended to the horizon as a frame around the grid -> seamless
-    // dynamic ocean (swell/colour) continuing past the sim, no static plane, no seam.
-    const skirt = buildOceanSkirt(water, FLAT.worldSize, FLAT.worldSize * 4);
+    // Open-ocean variant of the water material, extended to the horizon as a frame around
+    // the grid -> seamless dynamic ocean (swell/colour) continuing past the sim. All samplers
+    // clamp to the border ring out there (sediment/velocity≡0, deep pinned water), so the
+    // skipped river/foam/turbidity terms are exactly zero — pixel-identical at the seam,
+    // ~half the per-fragment work.
+    const oceanWater = makeFlatWater(
+      this.heightField.main,
+      this.sim.water.main,
+      this.sim.flux.main,
+      this.sim.velocity.main,
+      this.sim.sediment.main,
+      true,
+    );
+    const skirt = buildOceanSkirt(oceanWater, FLAT.worldSize, FLAT.worldSize * 4);
     this.scene.add(skirt);
 
     // Brush cursor: a thin ring laid on the terrain at the picked surface point, drawn on top

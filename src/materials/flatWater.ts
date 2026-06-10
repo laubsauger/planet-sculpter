@@ -7,7 +7,7 @@
 import { DoubleSide, type Texture } from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import {
-  textureLoad, uv, mix, smoothstep, max, clamp, float, vec2, vec3, length,
+  textureLoad, uv, mix, smoothstep, max, clamp, float, vec2, vec3, length, Fn, Discard,
   normalize, dot, pow, sin, cos, time, cameraPosition, positionWorld, mx_fractal_noise_float, uniform,
 } from 'three/tsl';
 import { flatSurface, bilinearTex, bicubicClampedTex, flatGridX, flatGridY, flatSeaLevel } from '../tsl/flatSurface';
@@ -28,12 +28,19 @@ export const flowBandScale = uniform(7.0);
 export const shoreFoamEnabled = uniform(1);
 export const oceanSwellEnabled = uniform(1);
 
+/** `oceanOnly`: build the OPEN-OCEAN subset for the skirt. Outside the grid every
+ * sampler clamps to the border ring, where sediment≡0, velocity≡0 and bed≡0
+ * (deep-ocean pin) — so the river/flow/turbidity/foam terms are EXACTLY zero
+ * there and can be skipped at graph level (verified by border readback). The
+ * kept terms run the identical formulas, so the skirt matches the grid edge
+ * pixel-for-pixel while skipping ~half the per-fragment noise/sample work. */
 export function makeFlatWater(
   heightTex: Texture,
   waterTex: Texture,
   fluxTex: Texture,
   velTex: Texture,
   sedimentTex: Texture,
+  oceanOnly = false,
 ): MeshBasicNodeMaterial {
   const fx = uv().x.mul(flatGridX), fy = uv().y.mul(flatGridY);
 
@@ -44,11 +51,10 @@ export function makeFlatWater(
   // Gradient neighbours use cheap BILINEAR (not bicubic) — hardware-filtered, 1 fetch each.
   // The waterline smoothness comes from the bicubic `depth`; the gradient only needs an
   // approximate slope.
-  const depthL = bilinearTex(waterTex, fx.sub(2), fy).x;
-  const depthR = bilinearTex(waterTex, fx.add(2), fy).x;
-  const depthB = bilinearTex(waterTex, fx, fy.sub(2)).x;
-  const depthT = bilinearTex(waterTex, fx, fy.add(2)).x;
-  const depthGradient = length(vec2(depthR.sub(depthL), depthT.sub(depthB)));
+  const depthGradient = oceanOnly ? float(0) : length(vec2(
+    bilinearTex(waterTex, fx.add(2), fy).x.sub(bilinearTex(waterTex, fx.sub(2), fy).x),
+    bilinearTex(waterTex, fx, fy.add(2)).x.sub(bilinearTex(waterTex, fx, fy.sub(2)).x),
+  ));
   // Wide spatial blur of depth, used ONLY for the deep color/opacity cues. The bathymetric
   // shelf is steep (depth jumps over a few cells), so any sharp depth->color/opacity ramp
   // draws a hard line right there. Averaging depth over a wide kernel spreads that transition
@@ -57,14 +63,14 @@ export function makeFlatWater(
   const dW = (ox: number, oy: number) => bilinearTex(waterTex, fx.add(ox), fy.add(oy)).x;
   const depthWide = dW(10, 10).add(dW(-10, 10)).add(dW(10, -10)).add(dW(-10, -10)).mul(1 / 4);
   const depthColor = mix(depth, depthWide, smoothstep(0.02, 0.12, depth));
-  const vel = bilinearTex(velTex, fx, fy).xy;
-  const flux = bilinearTex(fluxTex, fx, fy);
+  const vel = oceanOnly ? vec2(0, 0) : bilinearTex(velTex, fx, fy).xy;
+  const flux = oceanOnly ? vec3(0).xxxx : bilinearTex(fluxTex, fx, fy);
   // Center-weighted blur of sediment so muddy plumes have SOFT edges that merge into the
   // ocean, instead of hard-contrast shapes. (Turbidity ramp below is also widened.)
   const sed = (ox: number, oy: number) => bilinearTex(sedimentTex, fx.add(ox), fy.add(oy)).x;
-  const sediment = sed(0, 0).mul(0.5)
+  const sediment = oceanOnly ? float(0) : sed(0, 0).mul(0.5)
     .add(sed(4, 0).add(sed(-4, 0)).add(sed(0, 4)).add(sed(0, -4)).mul(0.125));
-  const speed = length(vec2(vel.x, vel.y));
+  const speed = oceanOnly ? float(0) : length(vec2(vel.x, vel.y));
   // Use the production solver's actual outgoing discharge for visual direction.
   // Reconstructed velocity can point upstream around confluences and obstacles;
   // ambiguous pipe discharge should fade out instead of drawing a confident lie.
@@ -77,7 +83,7 @@ export function makeFlatWater(
   // that clear route and use local pipe flux only to reject a real contradiction.
   const fluxAgreement = smoothstep(-0.15, 0.3, dot(velocityDir, pipeDir));
   const flowDir = velocityDir;
-  const directionConfidence = smoothstep(0.008, 0.12, speed)
+  const directionConfidence = oceanOnly ? float(0) : smoothstep(0.008, 0.12, speed)
     .mul(mix(float(0.35), float(1), fluxAgreement))
     .mul(smoothstep(0.00001, 0.001, outgoing));
   const visualFlow = flowDir.mul(speed).mul(directionConfidence);
@@ -94,7 +100,7 @@ export function makeFlatWater(
   // Flow ripples: noise advected ALONG the local flow -> rivers ripple downstream,
   // each follows its own direction (not a shared global wave).
   const shallowFlow = float(1).sub(smoothstep(0.025, 0.08, depth));
-  const flowR = grad(posXZ.sub(visualFlow.mul(time.mul(0.22))), 1.5)
+  const flowR = oceanOnly ? vec3(0, 0, 0) : grad(posXZ.sub(visualFlow.mul(time.mul(0.22))), 1.5)
     .mul(speed.min(float(1.2)).mul(0.11).add(0.012))
     .mul(shallowFlow).mul(directionConfidence);
   // Ambient swell belongs to the OPEN OCEAN ONLY (bedrock below sea level). All water
@@ -113,7 +119,9 @@ export function makeFlatWater(
   // past the bathymetric shelf -> a visible line where "deep ocean starts". oceanMask already
   // restricts to real ocean, so the flatWater(depth-gradient) gate is dropped here — at the
   // steep shelf that gate notched to 0 and helped draw the very edge we're trying to remove.
-  const deepOcean = oceanMask.mul(smoothstep(0.015, 0.32, depthColor)).mul(still).mul(oceanSwellEnabled);
+  const deepOcean = oceanOnly
+    ? oceanMask.mul(smoothstep(0.015, 0.32, depthColor)).mul(oceanSwellEnabled) // still≡1 (speed≡0)
+    : oceanMask.mul(smoothstep(0.015, 0.32, depthColor)).mul(still).mul(oceanSwellEnabled);
   const swellDir = normalize(vec2(0.82, 0.57));
   const swellPhase = dot(posXZ, swellDir).mul(1.05).sub(time.mul(0.5));
   // crest slope tilts the normal along the wave direction -> specular/fresnel travel.
@@ -150,32 +158,36 @@ export function makeFlatWater(
   // and toggled on/off frame to frame -> visible flicker. Gradual ramps + lower-contrast
   // noise mean a cell fades smoothly through partial turbidity instead of blinking.
   const sedimentLoad = smoothstep(0.008, 0.3, concentration);
-  const plumeNoise = mx_fractal_noise_float(
-    vec3(posXZ.sub(visualFlow.mul(time.mul(0.12))).mul(2.4), time.mul(0.035)), 3,
-  ).mul(0.5).add(0.5);
   // Suspended sediment forms warm plumes within still-readable blue-green water,
   // rather than replacing the entire surface with a flat brown sheet.
-  const turbidity = smoothstep(0.12, 0.82, sedimentLoad.mul(plumeNoise.mul(0.5).add(0.55)));
-  col = mix(col, SILT, turbidity.mul(0.66));
+  const turbidity = oceanOnly ? float(0) : smoothstep(0.12, 0.82, sedimentLoad.mul(
+    mx_fractal_noise_float(
+      vec3(posXZ.sub(visualFlow.mul(time.mul(0.12))).mul(2.4), time.mul(0.035)), 3,
+    ).mul(0.5).add(0.5).mul(0.5).add(0.55),
+  ));
+  col = oceanOnly ? col : mix(col, SILT, turbidity.mul(0.66));
 
   // Long, narrow streaks run ALONG the validated downhill flow and their phase
   // travels downstream. Avoid transverse contour bands: those read as uphill
   // waves even when the velocity vector itself is correct.
-  const acrossDir = vec2(flowDir.y.mul(-1), flowDir.x);
-  const along = dot(posXZ, flowDir);
-  const across = dot(posXZ, acrossDir);
-  const travel = time.mul(speed.mul(1.7).add(0.25));
-  const laneWarp = sin(along.mul(1.15).sub(travel.mul(0.35))).mul(0.55);
-  const lanes = sin(across.mul(flowBandScale).add(laneWarp)).mul(0.5).add(0.5);
-  const movingSegments = sin(along.mul(3.4).sub(travel.mul(2.0))
-    .add(sin(across.mul(1.8)).mul(0.5))).mul(0.5).add(0.5);
-  const streak = smoothstep(0.58, 0.9, lanes).mul(smoothstep(0.22, 0.72, movingSegments));
-  const movingWater = smoothstep(0.008, 0.32, speed);
   const riverMask = float(1).sub(oceanMask);
-  const streakStrength = streak.mul(movingWater).mul(directionConfidence).mul(riverMask)
-    .mul(smoothstep(0.00006, 0.05, depth))
-    .mul(float(1).sub(smoothstep(0.04, 0.2, depth)));
-  col = mix(col, SKY_REFLECT, streakStrength.mul(flowBandStrength));
+  let streakStrength: any = float(0);
+  if (!oceanOnly) {
+    const acrossDir = vec2(flowDir.y.mul(-1), flowDir.x);
+    const along = dot(posXZ, flowDir);
+    const across = dot(posXZ, acrossDir);
+    const travel = time.mul(speed.mul(1.7).add(0.25));
+    const laneWarp = sin(along.mul(1.15).sub(travel.mul(0.35))).mul(0.55);
+    const lanes = sin(across.mul(flowBandScale).add(laneWarp)).mul(0.5).add(0.5);
+    const movingSegments = sin(along.mul(3.4).sub(travel.mul(2.0))
+      .add(sin(across.mul(1.8)).mul(0.5))).mul(0.5).add(0.5);
+    const streak = smoothstep(0.58, 0.9, lanes).mul(smoothstep(0.22, 0.72, movingSegments));
+    const movingWater = smoothstep(0.008, 0.32, speed);
+    streakStrength = streak.mul(movingWater).mul(directionConfidence).mul(riverMask)
+      .mul(smoothstep(0.00006, 0.05, depth))
+      .mul(float(1).sub(smoothstep(0.04, 0.2, depth)));
+    col = mix(col, SKY_REFLECT, streakStrength.mul(flowBandStrength));
+  }
 
   // world-space lighting: gentle sun diffuse keeps base bright + readable any angle.
   const viewW = normalize(cameraPosition.sub(positionWorld));
@@ -195,57 +207,64 @@ export function makeFlatWater(
   // speeds (MULTIPLE patterns, not one ring), warped by noise so each lap is irregular.
   // Hugs the shore (very shallow band) and fades before open water. Mixed to FOAM (white)
   // with its own opacity below so it reads as white foam, not tinted sand.
-  const shoreWarp = mx_fractal_noise_float(vec3(posXZ.mul(2.6), time.mul(0.09)), 2).mul(2.0);
-  const shoreWarp2 = mx_fractal_noise_float(vec3(posXZ.mul(5.0).add(11.0), time.mul(0.13)), 2).mul(1.4);
-  // + time (not -): constant-phase contour has depth DECREASING with time -> crests run
-  // shoreward (up onto the shore), not out to sea.
-  const lapA = sin(depth.mul(180).add(time.mul(1.9)).add(shoreWarp)).mul(0.5).add(0.5);
-  const lapB = sin(depth.mul(360).add(time.mul(3.1)).add(shoreWarp2)).mul(0.5).add(0.5);
-  const lapC = sin(depth.mul(640).add(time.mul(4.6)).add(shoreWarp.mul(1.7))).mul(0.5).add(0.5);
-  const lapField = max(
-    max(smoothstep(0.55, 0.9, lapA), smoothstep(0.6, 0.92, lapB).mul(0.75)),
-    smoothstep(0.66, 0.95, lapC).mul(0.5),
-  );
-  // band hugging the shore (very shallow -> closer to shore than before).
-  const shoreBand = smoothstep(0.0006, 0.0035, depth)
-    .mul(float(1).sub(smoothstep(0.016, 0.05, depth)));
-  const breakers = shoreBand.mul(oceanMask).mul(lapField).mul(shoreFoamEnabled);
-  // Swash sheet: the thinnest film right at the waterline gets a translucent white wash
-  // that pulses up/down the sand (lapping) on its own slow cycle, independent of breakers.
-  const swashPulse = sin(time.mul(1.3).add(shoreWarp.mul(0.6))).mul(0.5).add(0.5);
-  const swash = smoothstep(0.0004, 0.0014, depth)
-    .mul(float(1).sub(smoothstep(0.0035, 0.012, depth)))
-    .mul(oceanMask).mul(mix(float(0.35), float(1), swashPulse)).mul(shoreFoamEnabled);
+  let foamAmt: any = float(0);
+  if (!oceanOnly) {
+    const shoreWarp = mx_fractal_noise_float(vec3(posXZ.mul(2.6), time.mul(0.09)), 2).mul(2.0);
+    const shoreWarp2 = mx_fractal_noise_float(vec3(posXZ.mul(5.0).add(11.0), time.mul(0.13)), 2).mul(1.4);
+    // + time (not -): constant-phase contour has depth DECREASING with time -> crests run
+    // shoreward (up onto the shore), not out to sea.
+    const lapA = sin(depth.mul(180).add(time.mul(1.9)).add(shoreWarp)).mul(0.5).add(0.5);
+    const lapB = sin(depth.mul(360).add(time.mul(3.1)).add(shoreWarp2)).mul(0.5).add(0.5);
+    const lapC = sin(depth.mul(640).add(time.mul(4.6)).add(shoreWarp.mul(1.7))).mul(0.5).add(0.5);
+    const lapField = max(
+      max(smoothstep(0.55, 0.9, lapA), smoothstep(0.6, 0.92, lapB).mul(0.75)),
+      smoothstep(0.66, 0.95, lapC).mul(0.5),
+    );
+    // band hugging the shore (very shallow -> closer to shore than before).
+    const shoreBand = smoothstep(0.0006, 0.0035, depth)
+      .mul(float(1).sub(smoothstep(0.016, 0.05, depth)));
+    const breakers = shoreBand.mul(oceanMask).mul(lapField).mul(shoreFoamEnabled);
+    // Swash sheet: the thinnest film right at the waterline gets a translucent white wash
+    // that pulses up/down the sand (lapping) on its own slow cycle, independent of breakers.
+    const swashPulse = sin(time.mul(1.3).add(shoreWarp.mul(0.6))).mul(0.5).add(0.5);
+    const swash = smoothstep(0.0004, 0.0014, depth)
+      .mul(float(1).sub(smoothstep(0.0035, 0.012, depth)))
+      .mul(oceanMask).mul(mix(float(0.35), float(1), swashPulse)).mul(shoreFoamEnabled);
 
-  // Rapids are a moving-land-water effect. Steep depth changes and speed produce
-  // broken highlights, without painting every flowing cell white.
-  const rapids = smoothstep(0.4, 1.4, speed)
-    .mul(smoothstep(0.005, 0.055, depthGradient))
-    .mul(smoothstep(0.0004, 0.025, depth))
-    .mul(riverMask);
-  const foamAmt = max(max(breakers, swash.mul(0.8)), rapids.mul(0.32))
-    .mul(float(1).sub(turbidity.mul(0.7))).min(float(1));
-  col = mix(col, FOAM, foamAmt);
+    // Rapids are a moving-land-water effect. Steep depth changes and speed produce
+    // broken highlights, without painting every flowing cell white.
+    const rapids = smoothstep(0.4, 1.4, speed)
+      .mul(smoothstep(0.005, 0.055, depthGradient))
+      .mul(smoothstep(0.0004, 0.025, depth))
+      .mul(riverMask);
+    foamAmt = max(max(breakers, swash.mul(0.8)), rapids.mul(0.32))
+      .mul(float(1).sub(turbidity.mul(0.7))).min(float(1));
+    col = mix(col, FOAM, foamAmt);
+  }
 
   // LAND water (rivers/puddles): stay readable even thin (depth + flow floor).
-  const steepRunoff = smoothstep(0.12, 0.5, s.slope);
-  const depthOpacity = smoothstep(0.00015, 0.0015, depth).mul(0.62)
-    .add(smoothstep(0.0012, 0.05, depth).mul(0.35));
-  const flowOpacity = smoothstep(0.04, 0.45, speed).mul(0.36)
-    .mul(smoothstep(0.00015, 0.001, depth));
-  const channelOrPool = max(
-    smoothstep(0.00045, 0.004, depth.mul(speed)),
-    smoothstep(0.012, 0.045, depth),
-  );
-  // A thin but connected pipe route is still valid flowing water. Give it a
-  // restrained visibility floor so low-discharge channels can be inspected
-  // without making the simulation physically deeper or more viscous.
-  const connectedFlow = smoothstep(0.00001, 0.0007, outgoing)
-    .mul(smoothstep(0.00012, 0.0012, depth));
-  const landOpacity = max(
-    depthOpacity.mul(max(channelOrPool, connectedFlow.mul(0.62))).mul(mix(float(1), float(0.12), steepRunoff)),
-    flowOpacity.mul(max(channelOrPool, connectedFlow)),
-  );
+  // Skipped for the open-ocean skirt — it's multiplied by (1-oceanMask)≡0 there.
+  let landOpacity: any = float(0);
+  if (!oceanOnly) {
+    const steepRunoff = smoothstep(0.12, 0.5, s.slope);
+    const depthOpacity = smoothstep(0.00015, 0.0015, depth).mul(0.62)
+      .add(smoothstep(0.0012, 0.05, depth).mul(0.35));
+    const flowOpacity = smoothstep(0.04, 0.45, speed).mul(0.36)
+      .mul(smoothstep(0.00015, 0.001, depth));
+    const channelOrPool = max(
+      smoothstep(0.00045, 0.004, depth.mul(speed)),
+      smoothstep(0.012, 0.045, depth),
+    );
+    // A thin but connected pipe route is still valid flowing water. Give it a
+    // restrained visibility floor so low-discharge channels can be inspected
+    // without making the simulation physically deeper or more viscous.
+    const connectedFlow = smoothstep(0.00001, 0.0007, outgoing)
+      .mul(smoothstep(0.00012, 0.0012, depth));
+    landOpacity = max(
+      depthOpacity.mul(max(channelOrPool, connectedFlow.mul(0.62))).mul(mix(float(1), float(0.12), steepRunoff)),
+      flowOpacity.mul(max(channelOrPool, connectedFlow)),
+    );
+  }
   const waterBodyOpacity = smoothstep(0.0005, 0.018, depth).mul(0.22);
   const muddyOpacity = turbidity.mul(smoothstep(0.0005, 0.018, depth)).mul(0.82);
   // OCEAN: clear shallows reveal the sandy seabed + caustics, deepening gradually. WIDE
@@ -272,7 +291,14 @@ export function makeFlatWater(
   const mat = new MeshBasicNodeMaterial({ transparent: true, side: DoubleSide });
   const visualLift = smoothstep(0.0004, 0.006, depth).mul(0.006);
   mat.positionNode = vec3(s.position.x, s.position.y.add(visualLift), s.position.z);
-  mat.colorNode = col;
+  // Dry land: opacity is exactly 0 below the hasWater floor — discard those
+  // fragments up front so spatially-coherent dry regions (most of the island)
+  // skip the noise/lighting work instead of blending an invisible result.
+  // The skirt is always deep water, so it never discards (skip the test there).
+  mat.colorNode = oceanOnly ? col : Fn(() => {
+    Discard(depth.lessThanEqual(float(0.00015)));
+    return col;
+  })();
   mat.opacityNode = opacity;
   mat.depthWrite = false;
   return mat;
