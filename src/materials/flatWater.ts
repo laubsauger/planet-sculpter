@@ -265,10 +265,17 @@ export function makeFlatWater(
     // frequencies → moiré rings, flicker, uncoupled from the real flow.
     const streamPower = s.slope.mul(speed);
     const power = smoothstep(0.0008, 0.01, streamPower);
-    const churn = mx_fractal_noise_float(
-      vec3(posXZ.sub(visualFlow.mul(time.mul(1.4))).mul(1.6), time.mul(0.5)), 2,
-    ).mul(0.5).add(0.5);
-    const patches = smoothstep(float(0.68).sub(power.mul(0.45)), float(0.88).sub(power.mul(0.2)), churn);
+    // Big bands PERPENDICULAR to the flow (standing-wave read, visible from a
+    // distance): the advected noise is smeared ACROSS the current — 3 samples
+    // offset along the perpendicular axis — at half the old frequency. Bands
+    // travel downstream with the flow; still no sin-phase anywhere, so no moiré.
+    const acrossDir = vec2(flowDir.y.negate(), flowDir.x);
+    const churnQ = posXZ.sub(visualFlow.mul(time.mul(1.4)));
+    const cs = (o: number) => mx_fractal_noise_float(
+      vec3(churnQ.sub(acrossDir.mul(o)).mul(0.9), time.mul(0.45)), 2,
+    );
+    const churn = cs(0).add(cs(0.25)).add(cs(0.5)).mul(1 / 3).mul(0.5).add(0.5);
+    const patches = smoothstep(float(0.62).sub(power.mul(0.4)), float(0.82).sub(power.mul(0.18)), churn);
     const whitewater = power.mul(float(0.3).add(patches.mul(0.7)))
       .mul(smoothstep(0.00008, 0.0015, depth))
       .mul(riverMask);

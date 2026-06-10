@@ -974,6 +974,17 @@ export class FlatSim {
     erosionUniforms.tickNorm.value = tickNorm;
     erosionUniforms.vizDecay.value = Math.pow(erosionUniforms.vizDecay.value, tickNorm);
     erosionUniforms.wetDecay.value = Math.pow(erosionUniforms.wetDecay.value, tickNorm);
+    // Pipe-flux DAMPING is a per-TICK exponential (every tick, not erosion-gated).
+    // Unrebased at 60Hz the tuned 0.65 became 0.65^60/s — all momentum erased,
+    // water couldn't build pressure over bars and pooled behind tiny lips. The
+    // EXACT per-second rebase (0.65^(1/3)≈0.87) overshot the other way: pipe
+    // stability depends on the per-tick damping↔gradient-integration interplay,
+    // not just per-second memory, and the ocean sloshed chaotically back onto
+    // land. 0.78 is the tuned middle AT 60 ticks/s: pooled water pushes over
+    // bars, no visible slosh. RETUNE this value if ticksPerSecond changes.
+    // 0.78 read as superfluid live ("liquid nitrogen" — never calms, jumps bars
+    // effortlessly); 0.72 keeps pressure-driven drainage with believable settling.
+    if ((SIM.ticksPerSecond as number) !== SIM.tickRateRef) waterUniforms.damping.value = 0.72;
     const b = height.main;
     this.nodes = {
       fluxN: flatFlux(b, this.water.main, this.sediment.main, this.source.main, this.flux.main, this.flux.scratch, w, h),
