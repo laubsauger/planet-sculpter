@@ -21,7 +21,7 @@ const DEEP = vec3(0.015, 0.12, 0.3);
 const SKY_REFLECT = vec3(0.6, 0.78, 0.95);
 const FOAM = vec3(0.95, 0.98, 1.0);
 const SILT = vec3(0.27, 0.2, 0.11);
-export const flowBandStrength = uniform(0.24);
+export const flowBandStrength = uniform(0.38);
 export const flowBandScale = uniform(7.0);
 // Perf / A-B toggles for potentially heavy stylized effects (1 = on, 0 = off).
 // (causticsEnabled moved to flatTerrain — caustics now render on the seabed.)
@@ -99,8 +99,12 @@ export function makeFlatWater(
   };
   // Flow ripples: noise advected ALONG the local flow -> rivers ripple downstream,
   // each follows its own direction (not a shared global wave).
-  const shallowFlow = float(1).sub(smoothstep(0.025, 0.08, depth));
-  const flowR = oceanOnly ? vec3(0, 0, 0) : grad(posXZ.sub(visualFlow.mul(time.mul(0.22))), 1.5)
+  // Full ripple on shallow flow; deep moving water keeps ~35% instead of cutting
+  // to a dead-flat mirror at depth 0.08 (deep slow rivers looked static).
+  const shallowFlow = float(1).sub(smoothstep(0.025, 0.08, depth).mul(0.65));
+  // Ripples advect at ~the actual current speed (0.22 read as molasses — the
+  // pattern crawled while the sim water clearly moved faster).
+  const flowR = oceanOnly ? vec3(0, 0, 0) : grad(posXZ.sub(visualFlow.mul(time.mul(0.85))), 1.5)
     .mul(speed.min(float(1.2)).mul(0.11).add(0.012))
     .mul(shallowFlow).mul(directionConfidence);
   // Ambient swell belongs to the OPEN OCEAN ONLY (bedrock below sea level). All water
@@ -173,19 +177,25 @@ export function makeFlatWater(
   const riverMask = float(1).sub(oceanMask);
   let streakStrength: any = float(0);
   if (!oceanOnly) {
-    const acrossDir = vec2(flowDir.y.mul(-1), flowDir.x);
-    const along = dot(posXZ, flowDir);
-    const across = dot(posXZ, acrossDir);
-    const travel = time.mul(speed.mul(1.7).add(0.25));
-    const laneWarp = sin(along.mul(1.15).sub(travel.mul(0.35))).mul(0.55);
-    const lanes = sin(across.mul(flowBandScale).add(laneWarp)).mul(0.5).add(0.5);
-    const movingSegments = sin(along.mul(3.4).sub(travel.mul(2.0))
-      .add(sin(across.mul(1.8)).mul(0.5))).mul(0.5).add(0.5);
-    const streak = smoothstep(0.58, 0.9, lanes).mul(smoothstep(0.22, 0.72, movingSegments));
-    const movingWater = smoothstep(0.008, 0.32, speed);
-    streakStrength = streak.mul(movingWater).mul(directionConfidence).mul(riverMask)
+    // Flow read = noise ADVECTED with the current and SMEARED along the local flow
+    // direction (3 samples offset downstream → long soft bands). The pattern moves
+    // at the simulated speed, stretches along the gravity-driven route, and cannot
+    // moiré: no sin(dot(pos, flowDir)) phase — that fringes into fine rings
+    // wherever flowDir rotates (eddies/confluences) and flickers at distance.
+    // LOW frequency (shore-wave register, a notch smaller) — band strength is
+    // GRADED by speed so a lazy drift reads faint and a strong current bold.
+    const flowQ = posXZ.sub(visualFlow.mul(time.mul(2.2)));
+    const smear = (o: number) => mx_fractal_noise_float(
+      vec3(flowQ.sub(flowDir.mul(o)).mul(flowBandScale.mul(0.25)), time.mul(0.12)), 2,
+    );
+    const elong = smear(0).add(smear(0.3)).add(smear(0.6)).mul(1 / 3).mul(0.5).add(0.5);
+    const streak = smoothstep(0.55, 0.85, elong);
+    const speedRamp = smoothstep(0.02, 0.5, speed);
+    // Deep-river fade widened (was gone by depth 0.2): a deep slow river still
+    // reads as MOVING water, not a static mirror.
+    streakStrength = streak.mul(speedRamp).mul(directionConfidence).mul(riverMask)
       .mul(smoothstep(0.00006, 0.05, depth))
-      .mul(float(1).sub(smoothstep(0.04, 0.2, depth)));
+      .mul(float(1).sub(smoothstep(0.12, 0.45, depth)));
     col = mix(col, SKY_REFLECT, streakStrength.mul(flowBandStrength));
   }
 
@@ -237,7 +247,32 @@ export function makeFlatWater(
       .mul(smoothstep(0.005, 0.055, depthGradient))
       .mul(smoothstep(0.0004, 0.025, depth))
       .mul(riverMask);
-    foamAmt = max(max(breakers, swash.mul(0.8)), rapids.mul(0.32))
+    // WHITEWATER on steep falls: where the BED is steep and the current fast, the
+    // water aerates — broad churning white masses streaking downslope, readable
+    // from a distance (the masks are low-frequency; churn/rush only modulate).
+    // This also replaces the old "steep runoff goes transparent" read: a fall now
+    // shows as opaque rushing white instead of breaking up into invisible film.
+    // STREAM POWER (bed slope × current speed) drives aeration — an 8° grade with a
+    // fast current froths (measured river core: slope ~0.009, speed 0.3-0.8 → power
+    // 0.003-0.007); a steep fall at any real speed saturates. Separate slope/speed
+    // gates multiplied to ~0 here even when both were individually significant.
+    // STYLIZED like the shore waves: broad SMOOTH froth patches (low-frequency
+    // advected noise through a wide smoothstep), not fine grain — high-freq churn
+    // read as TV static from any distance. Patch COVERAGE grows with stream power
+    // (light rapids = sparse white tufts, strong falls = near-solid froth) so
+    // weak vs strong whitewater read differently. NO sin(dot(pos, flowDir))
+    // stripes: a rotating flowDir sweeps that phase through arbitrary
+    // frequencies → moiré rings, flicker, uncoupled from the real flow.
+    const streamPower = s.slope.mul(speed);
+    const power = smoothstep(0.0008, 0.01, streamPower);
+    const churn = mx_fractal_noise_float(
+      vec3(posXZ.sub(visualFlow.mul(time.mul(1.4))).mul(1.6), time.mul(0.5)), 2,
+    ).mul(0.5).add(0.5);
+    const patches = smoothstep(float(0.68).sub(power.mul(0.45)), float(0.88).sub(power.mul(0.2)), churn);
+    const whitewater = power.mul(float(0.3).add(patches.mul(0.7)))
+      .mul(smoothstep(0.00008, 0.0015, depth))
+      .mul(riverMask);
+    foamAmt = max(max(max(breakers, swash.mul(0.8)), rapids.mul(0.32)), whitewater.mul(0.9))
       .mul(float(1).sub(turbidity.mul(0.7))).min(float(1));
     col = mix(col, FOAM, foamAmt);
   }
@@ -258,12 +293,17 @@ export function makeFlatWater(
     // A thin but connected pipe route is still valid flowing water. Give it a
     // restrained visibility floor so low-discharge channels can be inspected
     // without making the simulation physically deeper or more viscous.
+    // Depth floor lowered (was 0.00012): an ultra-thin ROUTED film is exactly the
+    // "flow breaks up on the flats" gap — moving water must stay readable.
     const connectedFlow = smoothstep(0.00001, 0.0007, outgoing)
-      .mul(smoothstep(0.00012, 0.0012, depth));
+      .mul(smoothstep(0.00003, 0.0004, depth));
     landOpacity = max(
       depthOpacity.mul(max(channelOrPool, connectedFlow.mul(0.62))).mul(mix(float(1), float(0.12), steepRunoff)),
       flowOpacity.mul(max(channelOrPool, connectedFlow)),
     );
+    // Thin-film floor: a connected MOVING film keeps a modest constant opacity even
+    // where depthOpacity/flowOpacity (deeper-water ramps) are still ~0.
+    landOpacity = max(landOpacity, connectedFlow.mul(smoothstep(0.02, 0.3, speed)).mul(0.38));
   }
   const waterBodyOpacity = smoothstep(0.0005, 0.018, depth).mul(0.22);
   const muddyOpacity = turbidity.mul(smoothstep(0.0005, 0.018, depth)).mul(0.82);
@@ -279,7 +319,12 @@ export function makeFlatWater(
   // foam (shoreline + rapids) stays opaque even over transparent shallows so it reads.
   // Gate EVERYTHING by water presence so dry land is fully transparent (no phantom
   // water/foam painted over terrain).
-  const hasWater = smoothstep(0.00015, 0.001, depth);
+  // Flowing films count as water below the still-water depth floor — the routed
+  // thin sheet crossing a flat must not vanish (matches the discard threshold).
+  const hasWater = oceanOnly
+    ? smoothstep(0.00015, 0.001, depth)
+    : max(smoothstep(0.00015, 0.001, depth),
+        smoothstep(0.00001, 0.0007, outgoing).mul(smoothstep(0.00003, 0.0004, depth)).mul(0.9));
   const opacity = clamp(
     max(
       max(max(max(mix(landOpacity, oceanOpacity, oceanMask), waterBodyOpacity), muddyOpacity), foamAmt.mul(0.96)),
@@ -296,7 +341,8 @@ export function makeFlatWater(
   // skip the noise/lighting work instead of blending an invisible result.
   // The skirt is always deep water, so it never discards (skip the test there).
   mat.colorNode = oceanOnly ? col : Fn(() => {
-    Discard(depth.lessThanEqual(float(0.00015)));
+    // Below the thin-film floor (matches hasWater's lowest onset) — truly dry.
+    Discard(depth.lessThanEqual(float(0.00003)));
     return col;
   })();
   mat.opacityNode = opacity;

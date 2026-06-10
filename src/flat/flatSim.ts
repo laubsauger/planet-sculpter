@@ -963,11 +963,14 @@ export class FlatSim {
     renderer.compute(buildGridFill(this.activity.main, w, h, 0));
     renderer.compute(flatLooseSeed(looseSeed, hardness, this.loose.main, w, h));
     renderer.compute(flatLooseSeed(looseSeed, hardness, this.loose.scratch, w, h));
-    // Tick-rate normalization (see config.tickRateRef): per-invocation erosion
-    // amounts scale by tickNorm so the per-second rates match the tuned ones;
-    // the per-invocation EXPONENTIAL decays (activity viz/wetness) need the
-    // matching root so decay-per-second is preserved too.
-    const tickNorm = SIM.tickRateRef / SIM.ticksPerSecond;
+    // Cadence normalization: per-invocation erosion amounts scale by
+    // tunedInvocationsPerSec / actualInvocationsPerSec so the per-SECOND rates
+    // match the tuned ones at any tick rate AND any erosion gate interval; the
+    // per-invocation EXPONENTIAL decays (activity viz/wetness) need the matching
+    // root so decay-per-second is preserved too.
+    const tunedPerSec = SIM.tickRateRef / SIM.erosionTickIntervalRef;
+    const actualPerSec = SIM.ticksPerSecond / SIM.erosionTickInterval;
+    const tickNorm = tunedPerSec / actualPerSec;
     erosionUniforms.tickNorm.value = tickNorm;
     erosionUniforms.vizDecay.value = Math.pow(erosionUniforms.vizDecay.value, tickNorm);
     erosionUniforms.wetDecay.value = Math.pow(erosionUniforms.wetDecay.value, tickNorm);
@@ -1085,7 +1088,7 @@ export class FlatSim {
     // Give the water solver several steps to re-establish pressure and routing
     // between terrain mutations. Faster bed edits make rivers repeatedly lose
     // their route at grade breaks before discharge can adjust.
-    if (this.erosionEnabled && this.tickCount % 8 === 0) {
+    if (this.erosionEnabled && this.tickCount % SIM.erosionTickInterval === 0) {
       r.compute(n.eroN);
       // settle reads OLD bed (still in height.main) + NEW bed (height.scratch) -> must run
       // before bC overwrites height.main; wEC then lands the compensated water depth.

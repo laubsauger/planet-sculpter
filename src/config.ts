@@ -47,8 +47,16 @@ export const SIM = {
   ticksPerSecond: 60,
   /** Tick rate the per-invocation erosion/deposit caps + decays were tuned at.
    *  Changing ticksPerSecond keeps dynamics fixed by scaling those amounts with
-   *  tickRateRef/ticksPerSecond — do NOT retune constants when changing rate. */
+   *  tickNorm (see FlatSim) — do NOT retune constants when changing rate. */
   tickRateRef: 20,
+  /** Erosion/thermal/activity fire every Nth tick (water needs solver steps
+   *  between bed mutations to re-establish routing). 4 @ 60 ticks/s = 15Hz
+   *  erosion — smooth turbidity. Per-second erosion stays tuned-rate: tickNorm
+   *  divides amounts by the cadence change (constants tuned at 20 ticks/s with
+   *  interval 8 = 2.5 invocations/s; see erosionTickIntervalRef). */
+  erosionTickInterval: 4,
+  /** Erosion gate interval the constants were tuned at (with tickRateRef). */
+  erosionTickIntervalRef: 8,
   /** Max sim substeps per frame (anti spiral-of-death; V10). */
   maxStepsPerFrame: 4,
 
